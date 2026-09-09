@@ -35,6 +35,13 @@ def main() -> int:
         for video in videos:
             print(f"  {video}")
 
+        press_share = (
+            sum(sample.target_pressed for sample in items) / len(items)
+            if items
+            else 0.0
+        )
+        print(f"  target state: PRESS={press_share:.1%}, RELEASE={1 - press_share:.1%}")
+
         summary = sampling_summary(items, sampling)
         print(
             "  raw mix: "

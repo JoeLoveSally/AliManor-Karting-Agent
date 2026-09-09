@@ -17,6 +17,8 @@ def test_binary_metric_accumulator() -> None:
     assert result.precision == 0.5
     assert result.recall == 0.5
     assert result.f1 == 0.5
+    assert result.target_positive_rate == 0.5
+    assert result.predicted_positive_rate == 0.5
 
 
 def test_empty_metric_accumulator_returns_zero_metrics() -> None:
@@ -25,3 +27,5 @@ def test_empty_metric_accumulator_returns_zero_metrics() -> None:
     assert result.samples == 0
     assert result.accuracy == 0.0
     assert result.f1 == 0.0
+    assert result.target_positive_rate == 0.0
+    assert result.predicted_positive_rate == 0.0

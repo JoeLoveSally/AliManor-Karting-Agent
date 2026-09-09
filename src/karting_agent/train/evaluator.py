@@ -14,6 +14,8 @@ class BinaryMetrics:
     precision: float
     recall: float
     f1: float
+    target_positive_rate: float
+    predicted_positive_rate: float
 
     def to_dict(self) -> dict[str, float | int]:
         return asdict(self)
@@ -29,6 +31,8 @@ class BinaryMetricAccumulator:
         self.true_positive = 0
         self.false_positive = 0
         self.false_negative = 0
+        self.target_positive = 0
+        self.predicted_positive = 0
 
     def update(
         self,
@@ -48,6 +52,8 @@ class BinaryMetricAccumulator:
         self.true_positive += int(np.logical_and(predicted, expected).sum())
         self.false_positive += int(np.logical_and(predicted, ~expected).sum())
         self.false_negative += int(np.logical_and(~predicted, expected).sum())
+        self.target_positive += int(expected.sum())
+        self.predicted_positive += int(predicted.sum())
 
     def result(self) -> BinaryMetrics:
         def ratio(numerator: int, denominator: int) -> float:
@@ -72,4 +78,6 @@ class BinaryMetricAccumulator:
             precision=precision,
             recall=recall,
             f1=f1,
+            target_positive_rate=ratio(self.target_positive, self.samples),
+            predicted_positive_rate=ratio(self.predicted_positive, self.samples),
         )

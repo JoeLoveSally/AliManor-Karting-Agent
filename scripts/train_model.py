@@ -94,6 +94,8 @@ def print_summary(prefix: str, summary: dict[str, object]) -> None:
         f"{prefix}: loss={summary['loss']:.4f}, "
         f"acc={all_metrics['accuracy']:.3f}, "
         f"f1={all_metrics['f1']:.3f}, "
+        f"gt_press={all_metrics['target_positive_rate']:.3f}, "
+        f"pred_press={all_metrics['predicted_positive_rate']:.3f}, "
         f"transition_f1={transition['f1']:.3f}, "
         f"short_f1={short['f1']:.3f}"
     )

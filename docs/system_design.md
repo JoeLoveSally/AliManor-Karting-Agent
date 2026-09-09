@@ -40,7 +40,7 @@ Android Phone
 系统分为离线训练与在线 Runtime：
 
 ```text
-Raw Videos → Label → Dataset → Trainer → Model Artifact
+Raw Videos → Label → Dataset Manifest → Frame Cache → Trainer → Model Artifact
 ```
 
 ```text
@@ -55,6 +55,7 @@ Input → Vision → Model → Control → Execute
 - Input 与 Execute 可替换
 - Control 与 Execute 分离
 - Train 与 Runtime 共享 Vision Preprocess
+- Frame Cache 只是训练侧 Derived Data，不改变模型输入语义
 - Logging / Replay 不参与核心控制决策
 - 高频 Short Correction 不默认平滑掉
 
@@ -72,7 +73,7 @@ Input → Vision → Model → Control → Execute
 
 ### Vision
 
-处理链路：
+在线处理链路：
 
 ```text
 Raw Frame
@@ -81,7 +82,9 @@ Perspective Correction
     ↓
 Fixed Touch Area Mask
     ↓
-Resize / Normalize
+Resize / RGB
+    ↓
+Normalize
     ↓
 Temporal Frame Stack
     ↓
@@ -93,6 +96,8 @@ Touch Marker 是 Label 来源，但不能进入模型输入。
 Mask 必须对 PRESS / RELEASE 所有帧无条件应用同一个固定区域。只在检测到 Touch Marker 时 Mask 会让“是否出现 Mask”本身成为标签泄漏。
 
 第一版标准输入大小为 `224×224`。
+
+训练侧 Frame Cache 会预计算其中确定性的 `Fixed Touch Area Mask + Resize + RGB`，以 `uint8` 保存；Normalize 和 Temporal Stack 仍在 Dataset 读取时执行。这样训练与 Runtime 保持同一预处理语义，同时避免每个 epoch 重复随机 seek MP4 和重复做空间预处理。
 
 ### Model
 
@@ -233,7 +238,45 @@ Short Correction  3.0
 
 不同时叠加 Weighted Loss。
 
-Dataset 必须按完整 Video 划分 Train / Validation / Test，禁止 Frame-level random split。
+### Frame Cache
+
+本机 CPU benchmark 显示，直接从 MP4 随机 seek 3 帧时 DataLoader I/O 是主要瓶颈之一；GPU 训练时该问题会更明显。因此正式训练优先使用 Memory-mapped Frame Cache：
+
+```text
+samples.jsonl
+    ↓
+收集每个视频实际需要的 unique frame indices
+    ↓
+顺序 decode Raw MP4 一次
+    ↓
+Fixed Touch Mask + Resize + RGB
+    ↓
+data/processed/frame_cache/<video>/
+    ├── frames.npy   # uint8, mmap
+    └── index.json   # original frame index → cache row
+```
+
+原则：
+
+- 只缓存当前 Dataset Manifest 实际使用的输入帧
+- Cache 为 Derived Data，不提交 Git
+- Cache 缺失时 Dataset 可回退 MP4，正式训练可要求 `require_cache`
+- Input Size、Touch Mask 或 Dataset Temporal Sampling 改变后需要重建 Cache
+- Mean / Std Normalization 改变不需要重建 Cache
+
+### Split
+
+第一版固定 Video-level Split：
+
+```text
+Train       11 videos / 14,678 samples
+Validation   2 videos /  2,546 samples
+Test         2 videos /  2,755 samples
+```
+
+策略：`video_holdout_visual_theme_stratified`。
+
+验证和测试使用未见过的赛道，同时尽量保证其视觉主题在 Train 中有相近代表，先测新赛道几何上的控制泛化，再单独做 unseen-style stress test。
 
 ---
 
@@ -279,12 +322,15 @@ runtime.yaml
 train.yaml
 ```
 
+`train.yaml` 同时记录 Frame Cache 开关和路径；不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
+
 Model Artifact：
 
 ```text
 artifacts/models/<model_name>/
 ├── model.pt
-└── metadata.json
+├── metadata.json
+└── history.json
 ```
 
 Metadata 至少记录：
@@ -298,6 +344,7 @@ history_ms
 prediction_horizon_ms
 normalization
 touch_mask_roi
+split
 ```
 
 Runtime 从 Artifact Metadata 读取模型输入约束。
@@ -317,6 +364,7 @@ Runtime 从 Artifact Metadata 读取模型输入约束。
 - 100~300ms Short Correction 保留
 - Controller v1 无 minimum duration
 - Dataset 按 Video 隔离
+- 正式训练优先使用 Frame Cache，避免 MP4 Random Seek 成为 GPU 饥饿瓶颈
 - 离开 RUNNING 尝试 RELEASE
 
 开发顺序：
@@ -328,7 +376,9 @@ Temporal Preprocess + CNN
     ↓
 Video-level Split
     ↓
-Trainer / Evaluator
+Frame Cache + Trainer / Evaluator
+    ↓
+GPU Baseline Training
     ↓
 Replay Runtime
     ↓

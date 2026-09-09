@@ -8,6 +8,9 @@ train:
   batch_size: 64
   epochs: 30
   learning_rate: 0.001
+  weight_decay: 0.0001
+  num_workers: 0
+  seed: 42
 
 sampling:
   stable_weight: 1.0
@@ -50,3 +53,6 @@ split:
   test:
     - data/raw/video_20260130_173426.mp4
     - data/raw/video_20260130_173835.mp4
+
+artifact:
+  name: mobilenet_v3_small_v1

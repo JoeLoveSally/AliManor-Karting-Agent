@@ -1,4 +1,4 @@
-"""Training-sample selection, splitting, and weighting utilities."""
+"""Training-sample selection, splitting, weighting, and epoch utilities."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Iterable, Sequence
 import yaml
 
 from karting_agent.train.dataset import DatasetSample
+from karting_agent.train.evaluator import BinaryMetricAccumulator
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,28 @@ class SamplingConfig:
             raise ValueError(
                 "short_correction_weight must be >= transition_weight"
             )
+
+
+@dataclass(frozen=True)
+class TrainLoopConfig:
+    batch_size: int = 64
+    epochs: int = 30
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    num_workers: int = 0
+    seed: int = 42
+
+    def validate(self) -> None:
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if self.epochs < 1:
+            raise ValueError("epochs must be >= 1")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0")
+        if self.weight_decay < 0:
+            raise ValueError("weight_decay must be >= 0")
+        if self.num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -75,6 +98,20 @@ def _load_yaml(path: Path) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"config root must be a mapping: {path}")
     return raw
+
+
+def load_train_loop_config(path: Path) -> TrainLoopConfig:
+    raw = _load_yaml(path).get("train", {})
+    config = TrainLoopConfig(
+        batch_size=int(raw.get("batch_size", 64)),
+        epochs=int(raw.get("epochs", 30)),
+        learning_rate=float(raw.get("learning_rate", 1e-3)),
+        weight_decay=float(raw.get("weight_decay", 1e-4)),
+        num_workers=int(raw.get("num_workers", 0)),
+        seed=int(raw.get("seed", 42)),
+    )
+    config.validate()
+    return config
 
 
 def load_sampling_config(path: Path) -> SamplingConfig:
@@ -268,3 +305,83 @@ def make_weighted_sampler(
         replacement=config.replacement,
         generator=generator,
     )
+
+
+def run_epoch(
+    model,
+    data_loader,
+    device,
+    *,
+    optimizer=None,
+    threshold: float = 0.5,
+    max_batches: int | None = None,
+) -> dict[str, object]:
+    """Run one train or evaluation epoch and return loss plus subset metrics."""
+    try:
+        import torch
+        from torch.nn import functional as F
+    except ImportError as exc:
+        raise RuntimeError(
+            'PyTorch is required; install with: pip install -e ".[train]"'
+        ) from exc
+
+    training = optimizer is not None
+    model.train(training)
+
+    all_metrics = BinaryMetricAccumulator(threshold)
+    transition_metrics = BinaryMetricAccumulator(threshold)
+    short_metrics = BinaryMetricAccumulator(threshold)
+    total_loss = 0.0
+    total_samples = 0
+
+    context = torch.enable_grad() if training else torch.inference_mode()
+    with context:
+        for batch_index, batch in enumerate(data_loader):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+
+            inputs = batch["input"].to(device=device, dtype=torch.float32)
+            targets = batch["target"].to(device=device, dtype=torch.float32)
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+
+            logits = model(inputs)
+            loss = F.binary_cross_entropy_with_logits(logits, targets)
+
+            if training:
+                loss.backward()
+                optimizer.step()
+
+            batch_size = int(targets.numel())
+            total_loss += float(loss.detach().item()) * batch_size
+            total_samples += batch_size
+
+            probabilities = torch.sigmoid(logits).detach().cpu().numpy()
+            target_values = targets.detach().cpu().numpy()
+            transition_mask = (
+                batch["near_transition"].detach().cpu().numpy().astype(bool)
+            )
+            short_mask = (
+                batch["near_short_correction"].detach().cpu().numpy().astype(bool)
+            )
+
+            all_metrics.update(probabilities, target_values)
+            transition_metrics.update(
+                probabilities[transition_mask],
+                target_values[transition_mask],
+            )
+            short_metrics.update(
+                probabilities[short_mask],
+                target_values[short_mask],
+            )
+
+    if total_samples == 0:
+        raise ValueError("data loader produced no samples")
+
+    return {
+        "loss": total_loss / total_samples,
+        "all": all_metrics.result().to_dict(),
+        "transition": transition_metrics.result().to_dict(),
+        "short_correction": short_metrics.result().to_dict(),
+    }

@@ -4,10 +4,10 @@
 
 AliManor Karting Agent 用于自动控制支付宝小鸡卡丁车小游戏。
 
-游戏实际控制状态只有两种：
+游戏只有两种实际控制状态：
 
-- `PRESS`：按住屏幕
-- `RELEASE`：松开屏幕
+- `PRESS`
+- `RELEASE`
 
 最终链路：
 
@@ -37,35 +37,16 @@ Android Phone
 
 ## 2. 总体架构
 
-系统分为离线训练和在线运行两条链路。
-
-### Offline Train
+系统分为离线训练与在线 Runtime：
 
 ```text
-Raw Videos
-    ↓
-Label Extraction
-    ↓
-Dataset
-    ↓
-Trainer
-    ↓
-Evaluator
-    ↓
-Model Artifact
+Raw Videos → Label → Dataset → Trainer → Model Artifact
 ```
 
-### Online Runtime
-
 ```text
-                         RuntimeEngine
-                              │
-                              ▼
-Input ───▶ Vision ───▶ Model ───▶ Control ───▶ Execute
-  │                                              │
-  ├── ADB                                        ├── ADB
-  ├── Camera                                     └── bleOTG
-  └── Video
+Input → Vision → Model → Control → Execute
+           ↑        ↑
+        RuntimeEngine orchestration
 ```
 
 核心原则：
@@ -73,9 +54,9 @@ Input ───▶ Vision ───▶ Model ───▶ Control ───▶ E
 - Train 与 Runtime 分离
 - Input 与 Execute 可替换
 - Control 与 Execute 分离
-- Runtime 只负责编排和生命周期
+- Train 与 Runtime 共享 Vision Preprocess
 - Logging / Replay 不参与核心控制决策
-- 高频短时修正属于有效控制行为，不在 Runtime 中默认平滑掉
+- 高频 Short Correction 不默认平滑掉
 
 ---
 
@@ -83,24 +64,22 @@ Input ───▶ Vision ───▶ Model ───▶ Control ───▶ E
 
 ### Input
 
-负责获取画面并输出统一 `Frame`。
+统一输出 `Frame`：
 
-- `ADB`：开发 / POC
-- `Camera`：最终实时输入
-- `Video`：历史视频与 Replay
-
-Input 不负责图像预处理。
+- ADB：开发 / POC
+- Camera：最终实时输入
+- Video：历史视频 / Replay
 
 ### Vision
 
-负责将原始画面转换为模型输入：
+处理链路：
 
 ```text
 Raw Frame
     ↓
 Perspective Correction
     ↓
-ROI / Touch Marker Mask
+Fixed Touch Area Mask
     ↓
 Resize / Normalize
     ↓
@@ -109,42 +88,41 @@ Temporal Frame Stack
 Model Input
 ```
 
-Camera 模式需要透视校正；ADB 和原始录屏通常可以跳过。Train 与 Runtime 必须共享同一套核心预处理规则。
+Touch Marker 是 Label 来源，但不能进入模型输入。
+
+Mask 必须对 PRESS / RELEASE 所有帧无条件应用同一个固定区域。只在检测到 Touch Marker 时 Mask 会让“是否出现 Mask”本身成为标签泄漏。
+
+第一版标准输入大小为 `224×224`。
 
 ### Model
 
-模型输出：
-
-```text
-turn_probability ∈ [0, 1]
-```
-
-不同地图车速不同，单帧无法可靠表达速度和运动趋势，因此第一版直接采用时序输入，而不是单帧 baseline 作为正式方案：
+第一版正式 baseline：
 
 ```text
 frame(t-100ms)
 frame(t-50ms)
 frame(t)
       ↓
-    CNN
+9-channel CNN
       ↓
-action(t + Δt)
+PRESS logit / probability
 ```
 
-初始设计：
+参数：
 
 - 3 个 RGB Frame
-- History Window 约 `100 ms`
-- Frame Interval 约 `50 ms`
-- 通过 Channel Stack 输入 CNN
-- `prediction_horizon_ms` 初始在 `50~100 ms` 范围实验确定
-- 第一阶段模型候选：ResNet18、MobileNetV3-Small
+- History Window：100ms
+- Frame Interval：50ms
+- 主模型：MobileNetV3-Small
+- 对照模型：ResNet18
+- ImageNet pretrained weights
+- `prediction_horizon_ms=100` 作为第一组实验值
 
-3 帧是否足够仍需通过 Replay 和实机结果验证。后续可以对比更长 History Window、5-frame stack 或其他时序模型。
+预训练模型第一层从 3 channels 扩展为 9 channels；RGB filter 按 frame stack 重复并除以 3，以尽量保持原始激活尺度。
+
+3 帧是否足够通过 Ablation 和实机结果判断。
 
 ### Control
-
-负责：
 
 ```text
 turn_probability
@@ -152,7 +130,7 @@ turn_probability
 PRESS / RELEASE / HOLD
 ```
 
-第一版使用双阈值 Hysteresis：
+第一版使用 Hysteresis：
 
 ```text
 P >= press_threshold   → PRESS
@@ -160,13 +138,9 @@ P <= release_threshold → RELEASE
 otherwise              → HOLD
 ```
 
-当前**不设置** `min_press_ms` / `min_release_ms`。已有数据表明 100~300ms 的短时 RELEASE 是常见的人工位置修正行为，不能通过 minimum duration 强行过滤。
-
-如果后续出现输出抖动，优先从 Label Noise、模型预测、概率校准和 Hysteresis 阈值处理。
+当前不设置 `min_press_ms` / `min_release_ms`，避免删除真实 100~300ms 高频修正。
 
 ### Execute
-
-负责把 ControlDecision 转换为真实设备操作。
 
 统一语义：
 
@@ -180,25 +154,15 @@ executor.set_pressed(False)
 - `AdbExecutor`
 - `BleOtgExecutor`
 
-最终链路：
+最终：
 
 ```text
-BleOtgExecutor
-    ↓
-USB Serial
-    ↓
-bleOTG
-    ↓
-Bluetooth HID
-    ↓
-Android Phone
+BleOtgExecutor → USB Serial → bleOTG → Bluetooth HID → Android
 ```
-
-Control 不感知 ADB、Serial 或 Bluetooth 的具体实现。
 
 ---
 
-## 4. Runtime 与状态机
+## 4. Runtime
 
 RuntimeEngine 核心循环：
 
@@ -211,49 +175,35 @@ while state == RUNNING:
     executor.execute(decision)
 ```
 
-第一版 Runtime 目标控制频率为 **30 Hz**，主要原因是需要表达 100~300ms 的短时修正。30Hz 下 100ms 操作约有 3 个控制 Tick，20Hz 只有约 2 个。
+第一版目标频率：**30Hz**。
 
-状态机初始状态：
+状态：
 
 ```text
-IDLE
-  ↓
-READY
-  ↓
-RUNNING ───▶ ERROR
-  │
-  ▼
-PAUSED
+IDLE → READY → RUNNING → PAUSED
+                    └──→ ERROR
 ```
 
-Camera 需要独立校准流程时增加 `CALIBRATING`。
-
-### Safe Release
-
-任何从 `RUNNING` 离开的软件路径都必须尝试执行 `RELEASE`，包括 pause、stop、error、shutdown 和 runtime exception。
-
-PC 掉电、USB 断开或硬件自身失效属于硬件故障边界。
+任何从 `RUNNING` 离开的软件路径都必须尝试 `RELEASE`。
 
 ---
 
 ## 5. 数据与训练
 
-当前 `data/raw` 包含 15 个游戏录屏，总时长约 668.72 秒。
+当前数据：
 
-当前触控统计：
+- 15 个录屏
+- 总时长约 668.72 秒
+- PRESS / RELEASE 完整段各 301 个
+- RELEASE `<=300ms` 的 P-R-P 修正：115 / 301
+- 100~300ms RELEASE：102 个
 
-- 完整 PRESS 段：301
-- 完整 RELEASE 段：301
-- `P-R-P` 中 RELEASE `<=300ms`：115 / 301，约 38.2%
-- RELEASE `100~200ms`：40
-- RELEASE `200~300ms`：62
+因此 100~300ms 定义为有效 **Short Correction**。
 
-因此 100~300ms 的 `PRESS → RELEASE → PRESS` 被定义为有效 **Short Correction**，属于模型需要重点学习的控制行为。
-
-Label Pipeline：
+Label：
 
 ```text
-Raw Video (native FPS)
+Native FPS Video
     ↓
 Touch Marker Detection
     ↓
@@ -261,52 +211,33 @@ Raw Action Timeline
     ↓
 1-frame Isolated Glitch Cleaning
     ↓
-Training Action Timeline
+Training Timeline
 ```
 
-原则：
-
-- Label 必须先按原视频 FPS 提取，再生成训练采样
-- 不使用固定 `<100ms` 阈值粗暴删除短动作
-- 第一版只自动合并明确的 1-frame 孤立状态毛刺
-- Touch Marker 只用于生成标签，不能直接暴露给模型输入
-- Dataset 按完整 Video 划分 Train / Validation / Test，禁止 Frame-level random split
-- Transition 和 Short Correction 区域需要提高采样权重
-
-训练目标：
+全量 Dataset Build：
 
 ```text
-frames(t-history ... t) → action(t + Δt)
+samples                 = 19,979
+cleaned_frames          = 10
+near_transition         = 6,381
+near_short_correction   = 1,862
 ```
 
-重点不是总体 Frame Accuracy，而是：
+第一版 Weighted Sampling：
 
-- PRESS transition timing error
-- RELEASE transition timing error
-- Transition F1
-- Short Correction Recall（100~200ms / 200~300ms / >=300ms）
-- Replay / 实机过弯表现
+```text
+Stable            1.0
+Transition        2.0
+Short Correction  3.0
+```
 
-更详细规则见 `dataset_design.md`。
+不同时叠加 Weighted Loss。
+
+Dataset 必须按完整 Video 划分 Train / Validation / Test，禁止 Frame-level random split。
 
 ---
 
-## 6. Replay 与 Logging
-
-### Replay
-
-每次真实 Runtime Session 可保存：
-
-```text
-artifacts/replays/<session_id>/
-├── metadata.json
-├── video.mp4
-└── events.jsonl
-```
-
-- `video.mp4`：Runtime 原始输入画面
-- `events.jsonl`：Prediction、Control、Execute、Metrics 时间线
-- `metadata.json`：模型、配置、运行模式、时间等信息
+## 6. Replay 与 Evaluation
 
 Replay 复用正式 Runtime：
 
@@ -324,42 +255,31 @@ Control
 No-op / Mock Execute
 ```
 
-用于 Runtime Debug、Regression Test、Model Comparison、Controller Comparison 以及 Transition Timing 分析。
+核心评价指标：
 
-### Logging
+- PRESS onset timing error
+- RELEASE onset timing error
+- Transition F1
+- Short Correction Recall
+- Replay / 实机过弯成功率
+- 完整赛程完成率
 
-Logging 与 Replay 独立，通过 `session_id` 关联。
-
-日志主要记录 Runtime State、Input / Execute 生命周期、Model Load、PRESS / RELEASE、Hardware Error 和 Runtime Exception。
-
-Metrics 主要记录：
-
-```text
-capture_ms
-vision_ms
-inference_ms
-control_ms
-execute_ms
-loop_ms
-fps
-```
-
-高频指标默认聚合为 mean / P50 / P95 / P99 / max，而不是逐帧输出 INFO 日志。
+普通 Accuracy / Precision / Recall / F1 仅作为辅助指标。
 
 ---
 
-## 7. 配置与 Model Artifact
+## 7. 配置与 Artifact
 
-配置分为：
+配置：
 
 ```text
-hardware.yaml  # 物理设备和连接
-execute.yaml   # 执行动作方式
-runtime.yaml   # 实时运行参数
-train.yaml     # 数据与训练参数
+hardware.yaml
+execute.yaml
+runtime.yaml
+train.yaml
 ```
 
-训练结果保存为：
+Model Artifact：
 
 ```text
 artifacts/models/<model_name>/
@@ -377,40 +297,44 @@ frame_interval_ms
 history_ms
 prediction_horizon_ms
 normalization
+touch_mask_roi
 ```
 
-Runtime 应读取 Model Artifact Metadata，不重复硬编码训练参数。
+Runtime 从 Artifact Metadata 读取模型输入约束。
 
 ---
 
-## 8. 开发顺序与系统约束
+## 8. 当前约束与开发顺序
+
+当前约束：
+
+- 单进程
+- 单 Input / Model / Controller / Executor
+- 单实时控制 Loop
+- Runtime 目标 30Hz
+- Train 与 Runtime 使用同一 Vision Preprocess
+- Touch Marker 区域始终固定 Mask
+- 100~300ms Short Correction 保留
+- Controller v1 无 minimum duration
+- Dataset 按 Video 隔离
+- 离开 RUNNING 尝试 RELEASE
 
 开发顺序：
 
 ```text
-Dataset / Label Cleaning
+Dataset / Label
     ↓
-3-frame CNN Baseline
+Temporal Preprocess + CNN
     ↓
-Replay Runtime + Timing Evaluation
+Video-level Split
+    ↓
+Trainer / Evaluator
+    ↓
+Replay Runtime
     ↓
 ADB Closed Loop
     ↓
-Camera Input
+Camera
     ↓
-bleOTG Execute
+bleOTG
 ```
-
-当前约束：
-
-- 单进程、单 Input、单 Model、单 Controller、单 Executor、单实时控制 Loop
-- Runtime 目标 30Hz
-- Model 不直接调用 Execute
-- Control 不感知具体执行设备
-- Train 与 Runtime 共享视觉预处理
-- 100~300ms Short Correction 必须保留并重点评估
-- Controller v1 不设置 minimum state duration
-- Dataset 按 Video 隔离
-- 离开 `RUNNING` 必须尝试 `RELEASE`
-- Replay 不依赖普通日志作为输入
-- Logging / Metrics 不参与模型决策

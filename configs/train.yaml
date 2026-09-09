@@ -1,5 +1,7 @@
 model:
   architecture: mobilenet_v3_small
+  pretrained: true
+  input_size: 224
   frame_stack: 3
 
 train:
@@ -22,3 +24,7 @@ dataset:
   short_correction_min_ms: 100
   short_correction_max_ms: 300
   clean_isolated_one_frame_glitches: true
+
+preprocess:
+  mask_touch_area: true
+  touch_roi: [0.78, 0.82, 0.98, 0.98]

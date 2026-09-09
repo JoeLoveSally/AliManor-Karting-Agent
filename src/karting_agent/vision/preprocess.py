@@ -28,15 +28,34 @@ class PreprocessConfig:
             raise ValueError("std values must be positive")
 
 
+def preprocess_config_from_mapping(raw: dict[str, object]) -> PreprocessConfig:
+    model = raw.get("model", {})
+    preprocess = raw.get("preprocess", {})
+    if not isinstance(model, dict) or not isinstance(preprocess, dict):
+        raise ValueError("model and preprocess config must be mappings")
+
+    size = int(model.get("input_size", 224))
+    roi = tuple(
+        float(value)
+        for value in preprocess.get("touch_roi", (0.78, 0.82, 0.98, 0.98))
+    )
+    if len(roi) != 4:
+        raise ValueError("preprocess.touch_roi must contain four values")
+
+    config = PreprocessConfig(
+        input_width=size,
+        input_height=size,
+        mask_touch_area=bool(preprocess.get("mask_touch_area", True)),
+        touch_roi=roi,
+    )
+    config.validate()
+    return config
+
+
 def mask_touch_area(
     frame: np.ndarray,
     roi: tuple[float, float, float, float],
 ) -> np.ndarray:
-    """Mask the same touch-indicator area in every frame.
-
-    The mask is unconditional. Applying it only when a touch marker is detected
-    would itself leak the PRESS/RELEASE label.
-    """
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError("frame must be a BGR image with shape HxWx3")
 
@@ -52,11 +71,11 @@ def mask_touch_area(
     return masked
 
 
-def preprocess_frame(
+def prepare_frame(
     frame: np.ndarray,
     config: PreprocessConfig = PreprocessConfig(),
 ) -> np.ndarray:
-    """Convert one BGR frame into normalized RGB CHW float32."""
+    """Apply deterministic spatial preprocessing and return RGB uint8 HWC."""
     config.validate()
     image = frame
     if config.mask_touch_area:
@@ -68,20 +87,54 @@ def preprocess_frame(
         (config.input_width, config.input_height),
         interpolation=cv2.INTER_AREA,
     )
-    image = image.astype(np.float32) / 255.0
+    return np.ascontiguousarray(image, dtype=np.uint8)
 
+
+def normalize_prepared_frame(
+    image: np.ndarray,
+    config: PreprocessConfig = PreprocessConfig(),
+) -> np.ndarray:
+    """Normalize one prepared RGB uint8 HWC frame into CHW float32."""
+    config.validate()
+    if (
+        image is None
+        or image.ndim != 3
+        or image.shape != (config.input_height, config.input_width, 3)
+        or image.dtype != np.uint8
+    ):
+        raise ValueError(
+            "prepared frame must be RGB uint8 with configured HxWx3 shape"
+        )
+
+    normalized = image.astype(np.float32) / 255.0
     mean = np.asarray(config.mean, dtype=np.float32).reshape(1, 1, 3)
     std = np.asarray(config.std, dtype=np.float32).reshape(1, 1, 3)
-    image = (image - mean) / std
-    return np.transpose(image, (2, 0, 1)).astype(np.float32, copy=False)
+    normalized = (normalized - mean) / std
+    return np.transpose(normalized, (2, 0, 1)).astype(np.float32, copy=False)
+
+
+def preprocess_frame(
+    frame: np.ndarray,
+    config: PreprocessConfig = PreprocessConfig(),
+) -> np.ndarray:
+    return normalize_prepared_frame(prepare_frame(frame, config), config)
 
 
 def stack_frames(
     frames: Sequence[np.ndarray],
     config: PreprocessConfig = PreprocessConfig(),
 ) -> np.ndarray:
-    """Preprocess and concatenate temporal RGB frames along the channel axis."""
     if not frames:
         raise ValueError("frames must not be empty")
     processed = [preprocess_frame(frame, config) for frame in frames]
+    return np.concatenate(processed, axis=0)
+
+
+def stack_prepared_frames(
+    frames: Sequence[np.ndarray],
+    config: PreprocessConfig = PreprocessConfig(),
+) -> np.ndarray:
+    if not frames:
+        raise ValueError("frames must not be empty")
+    processed = [normalize_prepared_frame(frame, config) for frame in frames]
     return np.concatenate(processed, axis=0)

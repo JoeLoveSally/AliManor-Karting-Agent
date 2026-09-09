@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from karting_agent.model.base import build_model
+from karting_agent.train.frame_cache import frame_cache_root_from_config
 from karting_agent.train.trainer import (
     load_samples,
     load_sampling_config,
@@ -28,16 +29,12 @@ from karting_agent.train.trainer import (
     run_epoch,
 )
 from karting_agent.train.video_dataset import TemporalVideoDataset
-from karting_agent.vision.preprocess import PreprocessConfig
+from karting_agent.vision.preprocess import preprocess_config_from_mapping
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the temporal karting model.")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=ROOT / "configs" / "train.yaml",
-    )
+    parser.add_argument("--config", type=Path, default=ROOT / "configs" / "train.yaml")
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -48,33 +45,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable torchvision pretrained weights for this run.",
     )
+    parser.add_argument(
+        "--require-cache",
+        action="store_true",
+        help="Fail instead of falling back to MP4 when a frame cache is missing.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override train.num_workers for this machine.",
+    )
     return parser.parse_args()
 
 
-def load_raw_config(path: Path) -> dict:
+def load_raw_config(path: Path) -> dict[str, object]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("train config root must be a mapping")
     return raw
-
-
-def build_preprocess_config(raw: dict) -> PreprocessConfig:
-    model = raw.get("model", {})
-    preprocess = raw.get("preprocess", {})
-    size = int(model.get("input_size", 224))
-    roi = tuple(
-        float(value)
-        for value in preprocess.get("touch_roi", (0.78, 0.82, 0.98, 0.98))
-    )
-    if len(roi) != 4:
-        raise ValueError("preprocess.touch_roi must contain four values")
-
-    return PreprocessConfig(
-        input_width=size,
-        input_height=size,
-        mask_touch_area=bool(preprocess.get("mask_touch_area", True)),
-        touch_roi=roi,
-    )
 
 
 def select_device(torch):
@@ -101,6 +90,31 @@ def print_summary(prefix: str, summary: dict[str, object]) -> None:
     )
 
 
+def make_loader(
+    DataLoader,
+    dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    sampler=None,
+    shuffle: bool = False,
+):
+    kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "shuffle": shuffle,
+    }
+    if sampler is not None:
+        kwargs["sampler"] = sampler
+        kwargs["shuffle"] = False
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset, **kwargs)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -116,7 +130,12 @@ def main() -> int:
     loop_config = load_train_loop_config(args.config)
     sampling_config = load_sampling_config(args.config)
     split = load_video_split(args.config)
-    preprocess_config = build_preprocess_config(raw)
+    preprocess_config = preprocess_config_from_mapping(raw)
+    cache_root = frame_cache_root_from_config(raw, ROOT)
+
+    num_workers = loop_config.num_workers if args.num_workers is None else args.num_workers
+    if num_workers < 0:
+        raise ValueError("--num-workers must be >= 0")
 
     samples = load_samples(ROOT / "data" / "processed" / "samples.jsonl")
     partitions = partition_samples(samples, split)
@@ -130,17 +149,26 @@ def main() -> int:
     device = select_device(torch)
     print(f"Device: {device}")
     print(
-        f"Split {split.name}: "
-        f"train={len(partitions['train'])}, "
-        f"validation={len(partitions['validation'])}, "
-        f"test={len(partitions['test'])}"
+        f"Split {split.name}: train={len(partitions['train'])}, "
+        f"validation={len(partitions['validation'])}, test={len(partitions['test'])}"
     )
+    print(
+        "Frame cache: "
+        + (
+            f"{cache_root} (required={args.require_cache})"
+            if cache_root is not None
+            else "disabled"
+        )
+    )
+    print(f"DataLoader workers: {num_workers}")
 
     datasets = {
         name: TemporalVideoDataset(
             partition,
             project_root=ROOT,
             preprocess_config=preprocess_config,
+            cache_root=cache_root,
+            require_cache=args.require_cache,
         )
         for name, partition in partitions.items()
     }
@@ -148,37 +176,38 @@ def main() -> int:
     generator = torch.Generator()
     generator.manual_seed(loop_config.seed)
     train_sampler = make_weighted_sampler(
-        partitions["train"],
-        sampling_config,
-        generator=generator,
+        partitions["train"], sampling_config, generator=generator
     )
     pin_memory = device.type == "cuda"
 
     loaders = {
-        "train": DataLoader(
+        "train": make_loader(
+            DataLoader,
             datasets["train"],
             batch_size=loop_config.batch_size,
-            sampler=train_sampler,
-            num_workers=loop_config.num_workers,
+            num_workers=num_workers,
             pin_memory=pin_memory,
+            sampler=train_sampler,
         ),
-        "validation": DataLoader(
+        "validation": make_loader(
+            DataLoader,
             datasets["validation"],
             batch_size=loop_config.batch_size,
-            shuffle=False,
-            num_workers=loop_config.num_workers,
+            num_workers=num_workers,
             pin_memory=pin_memory,
         ),
-        "test": DataLoader(
+        "test": make_loader(
+            DataLoader,
             datasets["test"],
             batch_size=loop_config.batch_size,
-            shuffle=False,
-            num_workers=loop_config.num_workers,
+            num_workers=num_workers,
             pin_memory=pin_memory,
         ),
     }
 
     model_config = raw.get("model", {})
+    if not isinstance(model_config, dict):
+        raise ValueError("model config must be a mapping")
     architecture = str(model_config.get("architecture", "mobilenet_v3_small"))
     frame_stack = int(model_config.get("frame_stack", 3))
     pretrained = bool(model_config.get("pretrained", True)) and not args.no_pretrained
@@ -214,8 +243,11 @@ def main() -> int:
             print("Smoke test passed.")
             return 0
 
+        artifact_config = raw.get("artifact", {})
+        if not isinstance(artifact_config, dict):
+            raise ValueError("artifact config must be a mapping")
         artifact_name = str(
-            raw.get("artifact", {}).get("name", f"{architecture}_{split.name}")
+            artifact_config.get("name", f"{architecture}_{split.name}")
         )
         artifact_dir = ROOT / "artifacts" / "models" / artifact_name
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -240,7 +272,6 @@ def main() -> int:
 
             print_summary(f"epoch {epoch:02d}/train", train_summary)
             print_summary(f"epoch {epoch:02d}/validation", validation_summary)
-
             history.append(
                 {
                     "epoch": epoch,
@@ -271,12 +302,10 @@ def main() -> int:
             "config": raw,
         }
         (artifact_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2),
-            encoding="utf-8",
+            json.dumps(metadata, indent=2), encoding="utf-8"
         )
         (artifact_dir / "history.json").write_text(
-            json.dumps(history, indent=2),
-            encoding="utf-8",
+            json.dumps(history, indent=2), encoding="utf-8"
         )
         print(f"Artifact: {artifact_dir}")
         return 0

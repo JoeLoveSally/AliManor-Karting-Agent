@@ -32,6 +32,10 @@ preprocess:
   mask_touch_area: true
   touch_roi: [0.78, 0.82, 0.98, 0.98]
 
+frame_cache:
+  enabled: true
+  root: data/processed/frame_cache
+
 split:
   name: v1
   strategy: video_holdout_visual_theme_stratified

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark temporal video loading plus one training step."""
+"""Benchmark temporal data loading plus one training step."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from karting_agent.model.base import build_model
+from karting_agent.train.frame_cache import frame_cache_root_from_config
 from karting_agent.train.trainer import (
     load_samples,
     load_sampling_config,
@@ -27,49 +28,28 @@ from karting_agent.train.trainer import (
     partition_samples,
 )
 from karting_agent.train.video_dataset import TemporalVideoDataset
-from karting_agent.vision.preprocess import PreprocessConfig
+from karting_agent.vision.preprocess import preprocess_config_from_mapping
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark training throughput.")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=ROOT / "configs" / "train.yaml",
-    )
-    parser.add_argument(
-        "--workers",
-        default="0,2,4",
-        help="Comma-separated DataLoader worker counts to benchmark.",
-    )
+    parser.add_argument("--config", type=Path, default=ROOT / "configs" / "train.yaml")
+    parser.add_argument("--workers", default="0,2,4")
     parser.add_argument("--batches", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--require-cache",
+        action="store_true",
+        help="Fail instead of falling back to MP4 when cache files are missing.",
+    )
     return parser.parse_args()
 
 
-def load_raw_config(path: Path) -> dict:
+def load_raw_config(path: Path) -> dict[str, object]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("train config root must be a mapping")
     return raw
-
-
-def build_preprocess_config(raw: dict) -> PreprocessConfig:
-    model = raw.get("model", {})
-    preprocess = raw.get("preprocess", {})
-    size = int(model.get("input_size", 224))
-    roi = tuple(
-        float(value)
-        for value in preprocess.get("touch_roi", (0.78, 0.82, 0.98, 0.98))
-    )
-    if len(roi) != 4:
-        raise ValueError("preprocess.touch_roi must contain four values")
-    return PreprocessConfig(
-        input_width=size,
-        input_height=size,
-        mask_touch_area=bool(preprocess.get("mask_touch_area", True)),
-        touch_roi=roi,
-    )
 
 
 def select_device(torch):
@@ -105,8 +85,10 @@ def benchmark_worker_count(
     sampling_config,
     loop_config,
     preprocess_config,
-    raw_config: dict,
+    raw_config: dict[str, object],
     device,
+    cache_root: Path | None,
+    require_cache: bool,
 ) -> dict[str, float]:
     from torch.nn import functional as F
     from torch.utils.data import DataLoader
@@ -115,12 +97,12 @@ def benchmark_worker_count(
         train_samples,
         project_root=ROOT,
         preprocess_config=preprocess_config,
+        cache_root=cache_root,
+        require_cache=require_cache,
     )
     generator = torch.Generator().manual_seed(loop_config.seed)
     sampler = make_weighted_sampler(
-        train_samples,
-        sampling_config,
-        generator=generator,
+        train_samples, sampling_config, generator=generator
     )
 
     loader_kwargs = {
@@ -135,6 +117,8 @@ def benchmark_worker_count(
     loader = DataLoader(dataset, **loader_kwargs)
 
     model_cfg = raw_config.get("model", {})
+    if not isinstance(model_cfg, dict):
+        raise ValueError("model config must be a mapping")
     model = build_model(
         str(model_cfg.get("architecture", "mobilenet_v3_small")),
         frame_stack=int(model_cfg.get("frame_stack", 3)),
@@ -210,7 +194,8 @@ def main() -> int:
     loop_config = load_train_loop_config(args.config)
     sampling_config = load_sampling_config(args.config)
     split = load_video_split(args.config)
-    preprocess_config = build_preprocess_config(raw)
+    preprocess_config = preprocess_config_from_mapping(raw)
+    cache_root = frame_cache_root_from_config(raw, ROOT)
     samples = load_samples(ROOT / "data" / "processed" / "samples.jsonl")
     train_samples = partition_samples(samples, split)["train"]
     workers = parse_workers(args.workers)
@@ -220,6 +205,14 @@ def main() -> int:
     print(
         f"Device: {device}; train_samples={len(train_samples)}; "
         f"batch_size={loop_config.batch_size}; batches_per_epoch={epoch_batches}"
+    )
+    print(
+        "Frame cache: "
+        + (
+            f"{cache_root} (required={args.require_cache})"
+            if cache_root is not None
+            else "disabled"
+        )
     )
     print(f"Benchmark: warmup={args.warmup}, measured_batches={args.batches}")
 
@@ -236,6 +229,8 @@ def main() -> int:
             preprocess_config=preprocess_config,
             raw_config=raw,
             device=device,
+            cache_root=cache_root,
+            require_cache=args.require_cache,
         )
         results.append((worker_count, result))
         epoch_minutes = result["total_ms_per_batch"] * epoch_batches / 60_000.0

@@ -1,4 +1,4 @@
-"""Training-sample selection and weighting utilities."""
+"""Training-sample selection, splitting, and weighting utilities."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Iterable, Sequence
+
+import yaml
 
 from karting_agent.train.dataset import DatasetSample
 
@@ -28,6 +30,79 @@ class SamplingConfig:
             raise ValueError(
                 "short_correction_weight must be >= transition_weight"
             )
+
+
+@dataclass(frozen=True)
+class VideoSplit:
+    """Video-level train/validation/test partition."""
+
+    name: str
+    strategy: str
+    train: tuple[str, ...]
+    validation: tuple[str, ...]
+    test: tuple[str, ...]
+
+    def validate(self) -> None:
+        groups = {
+            "train": self.train,
+            "validation": self.validation,
+            "test": self.test,
+        }
+        for name, videos in groups.items():
+            if not videos:
+                raise ValueError(f"{name} split must not be empty")
+            if len(videos) != len(set(videos)):
+                raise ValueError(f"{name} split contains duplicate videos")
+
+        names = tuple(groups)
+        for index, left_name in enumerate(names):
+            left = set(groups[left_name])
+            for right_name in names[index + 1 :]:
+                overlap = left.intersection(groups[right_name])
+                if overlap:
+                    joined = ", ".join(sorted(overlap))
+                    raise ValueError(
+                        f"{left_name}/{right_name} split overlap: {joined}"
+                    )
+
+    @property
+    def all_videos(self) -> tuple[str, ...]:
+        return self.train + self.validation + self.test
+
+
+def _load_yaml(path: Path) -> dict:
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"config root must be a mapping: {path}")
+    return raw
+
+
+def load_sampling_config(path: Path) -> SamplingConfig:
+    raw = _load_yaml(path).get("sampling", {})
+    config = SamplingConfig(
+        stable_weight=float(raw.get("stable_weight", 1.0)),
+        transition_weight=float(raw.get("transition_weight", 2.0)),
+        short_correction_weight=float(raw.get("short_correction_weight", 3.0)),
+        replacement=bool(raw.get("replacement", True)),
+    )
+    config.validate()
+    return config
+
+
+def load_video_split(path: Path) -> VideoSplit:
+    raw = _load_yaml(path).get("split")
+    if not isinstance(raw, dict):
+        raise ValueError(f"missing split mapping in config: {path}")
+
+    config = VideoSplit(
+        name=str(raw.get("name", "unnamed")),
+        strategy=str(raw.get("strategy", "video_holdout")),
+        train=tuple(str(item) for item in raw.get("train", ())),
+        validation=tuple(str(item) for item in raw.get("validation", ())),
+        test=tuple(str(item) for item in raw.get("test", ())),
+    )
+    config.validate()
+    return config
 
 
 def load_samples(path: Path) -> list[DatasetSample]:
@@ -72,6 +147,36 @@ def select_samples_by_videos(
     """Return samples whose video field exactly matches one of ``videos``."""
     allowed = set(videos)
     return [sample for sample in samples if sample.video in allowed]
+
+
+def partition_samples(
+    samples: Sequence[DatasetSample],
+    split: VideoSplit,
+) -> dict[str, list[DatasetSample]]:
+    """Partition samples by complete videos and reject missing/unassigned videos."""
+    split.validate()
+    available = {sample.video for sample in samples}
+    configured = set(split.all_videos)
+
+    missing = configured - available
+    if missing:
+        raise ValueError(
+            "split references videos absent from samples: "
+            + ", ".join(sorted(missing))
+        )
+
+    unassigned = available - configured
+    if unassigned:
+        raise ValueError(
+            "samples contain videos not assigned to a split: "
+            + ", ".join(sorted(unassigned))
+        )
+
+    return {
+        "train": select_samples_by_videos(samples, split.train),
+        "validation": select_samples_by_videos(samples, split.validation),
+        "test": select_samples_by_videos(samples, split.test),
+    }
 
 
 def sample_weight(

@@ -28,3 +28,25 @@ dataset:
 preprocess:
   mask_touch_area: true
   touch_roi: [0.78, 0.82, 0.98, 0.98]
+
+split:
+  name: v1
+  strategy: video_holdout_visual_theme_stratified
+  train:
+    - data/raw/video_20260130_172959.mp4
+    - data/raw/video_20260130_173101.mp4
+    - data/raw/video_20260130_173228.mp4
+    - data/raw/video_20260130_173316.mp4
+    - data/raw/video_20260130_173505.mp4
+    - data/raw/video_20260130_173750.mp4
+    - data/raw/video_20260130_173917.mp4
+    - data/raw/video_20260130_174257.mp4
+    - data/raw/video_20260130_174434.mp4
+    - data/raw/video_20260130_174616.mp4
+    - data/raw/video_20260130_175811.mp4
+  validation:
+    - data/raw/video_20260130_173545.mp4
+    - data/raw/video_20260130_174012.mp4
+  test:
+    - data/raw/video_20260130_173426.mp4
+    - data/raw/video_20260130_173835.mp4

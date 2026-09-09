@@ -1,7 +1,14 @@
+from pathlib import Path
+
+import pytest
+
 from karting_agent.train.dataset import DatasetSample
 from karting_agent.train.trainer import (
     SamplingConfig,
+    VideoSplit,
     build_sample_weights,
+    load_video_split,
+    partition_samples,
     sampling_summary,
     select_samples_by_videos,
 )
@@ -63,3 +70,74 @@ def test_select_samples_by_videos_uses_exact_video_ids() -> None:
     selected = select_samples_by_videos(samples, ["a.mp4", "c.mp4"])
 
     assert [item.video for item in selected] == ["a.mp4", "c.mp4"]
+
+
+def test_partition_samples_is_video_level_and_complete() -> None:
+    samples = [
+        sample("a.mp4"),
+        sample("a.mp4", near_transition=True),
+        sample("b.mp4"),
+        sample("c.mp4"),
+    ]
+    split = VideoSplit(
+        name="v1",
+        strategy="video_holdout",
+        train=("a.mp4",),
+        validation=("b.mp4",),
+        test=("c.mp4",),
+    )
+
+    partitions = partition_samples(samples, split)
+
+    assert [item.video for item in partitions["train"]] == ["a.mp4", "a.mp4"]
+    assert [item.video for item in partitions["validation"]] == ["b.mp4"]
+    assert [item.video for item in partitions["test"]] == ["c.mp4"]
+
+
+def test_partition_samples_rejects_unassigned_video() -> None:
+    samples = [sample("a.mp4"), sample("b.mp4"), sample("c.mp4"), sample("d.mp4")]
+    split = VideoSplit(
+        name="v1",
+        strategy="video_holdout",
+        train=("a.mp4",),
+        validation=("b.mp4",),
+        test=("c.mp4",),
+    )
+
+    with pytest.raises(ValueError, match="not assigned"):
+        partition_samples(samples, split)
+
+
+def test_video_split_rejects_overlap() -> None:
+    split = VideoSplit(
+        name="bad",
+        strategy="video_holdout",
+        train=("a.mp4",),
+        validation=("a.mp4",),
+        test=("c.mp4",),
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        split.validate()
+
+
+def test_load_video_split(tmp_path: Path) -> None:
+    path = tmp_path / "train.yaml"
+    path.write_text(
+        """
+split:
+  name: v1
+  strategy: video_holdout
+  train: [a.mp4]
+  validation: [b.mp4]
+  test: [c.mp4]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    split = load_video_split(path)
+
+    assert split.name == "v1"
+    assert split.train == ("a.mp4",)
+    assert split.validation == ("b.mp4",)
+    assert split.test == ("c.mp4",)

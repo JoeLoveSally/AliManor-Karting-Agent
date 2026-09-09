@@ -4,7 +4,7 @@
 
 最终系统使用独立视觉输入和独立控制输出：
 
-```text id="jhwll9"
+```text
              ┌────────────── PC ──────────────┐
              │                                 │
 Phone Screen ──▶ Camera ──▶ Karting Agent     │
@@ -21,43 +21,27 @@ Phone Screen ──▶ Camera ──▶ Karting Agent     │
                             Android Phone
 ```
 
-系统不依赖手机内部截图和 ADB 完成最终运行。
-
-ADB 仅作为开发与 POC 方案。
+最终运行不依赖手机内部截图和 ADB。ADB 仅用于开发与 POC。
 
 ---
 
 ## 2. 硬件组成
 
-最终系统主要包含：
+| 设备 | 作用 |
+| --- | --- |
+| Android Phone | 运行支付宝卡丁车小游戏 |
+| External Camera | 获取手机屏幕实时画面 |
+| PC | Vision、Model、Control 和 Runtime |
+| bleOTG | 将 PC 控制命令转换为手机 HID 触控 |
+| USB Connection | PC 与 Camera、bleOTG 的物理连接 |
 
-| 设备              | 作用                             |
-| --------------- | ------------------------------ |
-| Android Phone   | 运行支付宝卡丁车小游戏                    |
-| External Camera | 获取手机屏幕实时画面                     |
-| PC              | Vision、Model、Control 和 Runtime |
-| bleOTG          | 将 PC 控制命令转换为手机 HID 触控          |
-| USB Connection  | PC 与 Camera、bleOTG 的物理连接       |
-
-其中 Camera 和 bleOTG 分别构成：
-
-```text id="n20dzc"
-Visual Input Path
-```
-
-和：
-
-```text id="v7g31v"
-Control Output Path
-```
-
-两条链路相互独立。
+Camera 和 bleOTG 分别构成 Visual Input Path 与 Control Output Path，两条链路相互独立。
 
 ---
 
 ## 3. Camera 链路
 
-```text id="7wg1jl"
+```text
 Android Phone
      │
      │ screen image
@@ -74,21 +58,21 @@ CameraInput
 
 摄像头型号当前未确定。
 
-选型主要关注：
+选型重点：
 
-* USB / UVC 兼容性
-* 1080p 或更高分辨率
-* 30 FPS 以上，优先 60 FPS
-* 较低采集延迟
-* 可锁定曝光和白平衡
-* 对屏幕摩尔纹、PWM 和反光的表现
-* 固定安装后的稳定性
+- USB / UVC 兼容性
+- 1080p 或更高分辨率
+- 优先 60 FPS 或更高稳定帧率
+- 低采集延迟
+- 可锁定曝光和白平衡
+- 对屏幕摩尔纹、PWM 和反光的表现
+- 固定安装后的稳定性
 
-模型不直接依赖摄像头原始坐标。
+Runtime 第一版目标控制频率为 **30 Hz**。Camera 原始采集帧率应高于控制频率，并为 3-frame temporal input 提供足够的时间采样余量。
 
-Camera Input 获取原始画面后，由 Vision 进行：
+模型不直接依赖摄像头原始坐标。Camera Input 获取原始画面后，由 Vision 进行：
 
-```text id="33l7k6"
+```text
 Camera Frame
     ↓
 Perspective Correction
@@ -96,15 +80,15 @@ Perspective Correction
 Canonical Game Frame
 ```
 
-因此摄像头和手机应尽量采用固定支架安装，减少运行过程中手机与相机的相对移动。
+摄像头和手机应尽量固定安装，减少运行过程中相对位置变化。
 
 ---
 
-## 4. bleOTG 链路
+## 4. bleOTG 链路与协议
 
 最终控制路径：
 
-```text id="z7sx4v"
+```text
 PC
  │
  │ USB Serial
@@ -116,105 +100,49 @@ bleOTG Controller
 Android Phone
 ```
 
-bleOTG 官方示例要求主控板通过 USB 接入电脑，并通过 CH340 USB-to-Serial 与 PC 通信；手机再与 bleOTG 蓝牙设备配对。
-
-PC 侧参考实现使用 Python `serial` 打开串口，示例波特率为：
-
-```text id="sy4p82"
-115200
-```
-
-并在发送后执行 `flush()`。
-
-因此项目侧的：
-
-```text id="yxt9yy"
-BleOtgExecutor
-```
-
-直接将 bleOTG 视为一个串口控制设备，不需要感知其内部 Bluetooth HID 实现。
-
----
-
-## 5. bleOTG 控制协议
+bleOTG PC 侧通过串口发送文本指令，手机侧以 HID 触控形式接收。
 
 当前项目只需要：
 
-```text id="a5ulpa"
+```text
 PRESS
 RELEASE
 ```
 
-不需要使用 bleOTG 的完整触控能力。
+参考协议：
 
-参考实现采用换行分隔的文本指令，并定义：
-
-```text id="2uioou"
-1,x,y
+```text
+1,x,y          # press
+2,x,y          # release
+3,x,y          # click
+10,width,height # screen size
 ```
 
-表示在 `(x, y)` 按下，
+项目 Runtime 统一暴露：
 
-```text id="p9lfsq"
-2,x,y
-```
-
-表示松开，
-
-```text id="333bu5"
-3,x,y
-```
-
-表示一次完整点击，
-
-```text id="ty0yp4"
-10,width,height
-```
-
-用于设置屏幕尺寸。
-
-本项目 Runtime 只对外暴露：
-
-```python id="zhn3pw"
+```python
 set_pressed(True)
 set_pressed(False)
 ```
 
-由 `BleOtgExecutor` 转换成对应的 bleOTG 指令。
+由 `BleOtgExecutor` 转换为对应串口命令。
 
-例如：
-
-```text id="m4j7q1"
-set_pressed(True)
-        ↓
-1,x,y\n
-```
-
-```text id="lrgn0h"
-set_pressed(False)
-        ↓
-2,x,y\n
-```
-
-具体触控坐标由 `execute.yaml` 配置。
+当前参考串口波特率为 `115200`，实际以实物和固件测试结果为准。
 
 ---
 
-## 6. 硬件与软件边界
+## 5. 硬件与软件边界
 
-系统软件只直接管理两类硬件接口：
+系统软件直接管理：
 
-```text id="iu53ol"
-Camera
-    → Frame
-
-bleOTG
-    ← PRESS / RELEASE
+```text
+Camera → Frame
+bleOTG ← PRESS / RELEASE
 ```
 
-内部边界为：
+内部边界：
 
-```text id="23kyjh"
+```text
 Camera Hardware
       ↓
 CameraInput
@@ -224,7 +152,7 @@ Vision
 
 以及：
 
-```text id="73m3ss"
+```text
 Control
       ↓
 BleOtgExecutor
@@ -236,92 +164,34 @@ bleOTG Hardware
 
 以下内容不进入 Control：
 
-* 串口号
-* 波特率
-* Bluetooth 配对状态
-* HID 协议
-* 摄像头设备号
-* 摄像头曝光参数
+- 串口号和波特率
+- Bluetooth 配对状态
+- HID 协议
+- 摄像头设备号
+- 摄像头曝光参数
 
 ---
 
-## 7. 配置边界
+## 6. 延迟与故障边界
 
-硬件连接参数放在：
+端到端延迟：
 
-```text id="saxuy3"
-configs/hardware.yaml
-```
-
-例如：
-
-```yaml id="09c4w1"
-camera:
-  device: 0
-  width: 1920
-  height: 1080
-  fps: 60
-
-ble_otg:
-  port: /dev/ttyUSB0
-  baudrate: 115200
-```
-
-动作相关配置放在：
-
-```text id="hb0g9l"
-configs/execute.yaml
-```
-
-例如：
-
-```yaml id="xiy2oj"
-type: ble_otg
-
-ble_otg:
-  touch_x: 500
-  touch_y: 1200
-```
-
-即：
-
-```text id="we867h"
-hardware.yaml
-= Hardware Connection
-
-execute.yaml
-= Control Usage
-```
-
----
-
-## 8. 延迟与故障边界
-
-最终端到端延迟：
-
-```text id="w13fwu"
+```text
 T_total
 =
 T_camera
-+
-T_capture
-+
-T_vision
-+
-T_model
-+
-T_control
-+
-T_serial
-+
-T_ble_otg
-+
-T_phone
++ T_capture
++ T_vision
++ T_model
++ T_control
++ T_serial
++ T_ble_otg
++ T_phone
 ```
 
-其中软件可以直接测量：
+软件可直接测量：
 
-```text id="rhrlg7"
+```text
 capture_ms
 vision_ms
 inference_ms
@@ -330,49 +200,32 @@ serial_write_ms
 loop_ms
 ```
 
-但：
+由于有效 Short Correction 大量集中在 100~300ms，硬件链路延迟必须显著低于该时间尺度，否则模型即使预测正确也可能错过控制窗口。
 
-```text id="6t077u"
-Serial write completed
-```
+`Serial write completed` 不等价于 `Android touch applied`，因此 bleOTG 到手机实际触控的端到端延迟必须通过实机实验测量，并用于确定 `prediction_horizon_ms`。
 
-并不等价于：
+任何正常软件停止流程都必须尝试 `RELEASE`。
 
-```text id="bnn65p"
-Android touch applied
-```
+以下情况属于 Hardware Failure Boundary：
 
-因此 bleOTG 到手机实际触控的端到端延迟需要通过实机实验测量。
-
-任何正常的软件停止流程都必须尝试：
-
-```text id="4rpx1e"
-RELEASE
-```
-
-但以下故障无法依靠 Runtime 完全保证恢复：
-
-* PC 突然掉电
-* USB 连接断开
-* bleOTG 掉电
-* Bluetooth 连接中断
-* 手机系统异常
-
-这些情况属于 Hardware Failure Boundary。
+- PC 突然掉电
+- USB 连接断开
+- bleOTG 掉电
+- Bluetooth 连接中断
+- 手机系统异常
 
 ---
 
-## 9. 当前待确定项
+## 7. 当前待确定项
 
-以下硬件参数在实物测试前保持未定：
+- Camera 型号
+- Camera 最终分辨率和 FPS
+- Camera 固定位置与距离
+- 手机与 Camera 安装结构
+- bleOTG 实际串口设备名
+- 固定触控坐标
+- Camera 实际采集延迟
+- bleOTG 实际端到端执行延迟
+- 真实 Runtime 是否能稳定达到 30 Hz
 
-* Camera 型号
-* Camera 最终分辨率和 FPS
-* Camera 固定位置与距离
-* 手机与 Camera 安装结构
-* bleOTG 实际串口设备名
-* 固定触控坐标
-* Camera 实际采集延迟
-* bleOTG 实际端到端执行延迟
-
-bleOTG 仓库同时说明其主控板固件针对作者提供的硬件设计，因此实际使用时应以对应硬件和固件组合为准。
+具体连接参数记录于 `configs/hardware.yaml`，动作参数记录于 `configs/execute.yaml`。

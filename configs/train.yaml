@@ -1,0 +1,15 @@
+model:
+  architecture: mobilenet_v3_small
+  frame_stack: 3
+
+train:
+  batch_size: 64
+  epochs: 30
+  learning_rate: 0.001
+
+dataset:
+  history_ms: 100
+  frame_interval_ms: 50
+  prediction_horizon_ms: 100
+  transition_window_ms: 200
+  clean_isolated_one_frame_glitches: true

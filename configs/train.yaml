@@ -7,6 +7,12 @@ train:
   epochs: 30
   learning_rate: 0.001
 
+sampling:
+  stable_weight: 1.0
+  transition_weight: 2.0
+  short_correction_weight: 3.0
+  replacement: true
+
 dataset:
   sample_fps: 30
   history_ms: 100

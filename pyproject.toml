@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "opencv-python>=4.10",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

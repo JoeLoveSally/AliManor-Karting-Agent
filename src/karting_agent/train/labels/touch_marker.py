@@ -1,8 +1,11 @@
-"""Touch-marker detection for recorded gameplay labels."""
+"""Touch-marker detection and action-timeline utilities."""
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -17,21 +20,44 @@ class TouchMarker:
     radius: float
 
 
-# The recordings use a 720 px-wide phone capture where the touch indicator is
-# roughly a 12-14 px radius circle near the lower-right control area. Scale the
-# radius with frame width so the detector is not tied to one encoded size.
+@dataclass(frozen=True)
+class ActionEvent:
+    frame_index: int
+    timestamp_ms: float
+    pressed: bool
+
+
+@dataclass(frozen=True)
+class ActionSegment:
+    start_frame: int
+    end_frame: int
+    start_ms: float
+    end_ms: float
+    pressed: bool
+
+    @property
+    def duration_ms(self) -> float:
+        return self.end_ms - self.start_ms
+
+
+@dataclass(frozen=True)
+class ActionTimeline:
+    source: str
+    fps: float
+    frame_count: int
+    duration_ms: float
+    events: tuple[ActionEvent, ...]
+    segments: tuple[ActionSegment, ...]
+    cleaned_frames: int
+
+
 _REFERENCE_WIDTH = 720.0
 _MIN_RADIUS = 8.0
 _MAX_RADIUS = 18.0
 
 
 def detect_touch_marker(frame: np.ndarray) -> TouchMarker | None:
-    """Return the touch marker if it is visible in a gameplay frame.
-
-    Detection intentionally has no temporal debounce or minimum-duration rule.
-    Short PRESS/RELEASE episodes are meaningful training signals in this game,
-    so temporal cleaning belongs to later dataset analysis, not raw detection.
-    """
+    """Return the touch marker if it is visible in a gameplay frame."""
 
     if frame is None or frame.ndim != 3:
         raise ValueError("frame must be a BGR image with shape HxWxC")
@@ -40,9 +66,8 @@ def detect_touch_marker(frame: np.ndarray) -> TouchMarker | None:
     if height <= 0 or width <= 0:
         raise ValueError("frame must have non-zero width and height")
 
-    # Restrict Hough detection to the lower-right touch-control area. The
-    # indicator is semi-transparent, so color thresholding alone is unreliable
-    # when it crosses dark road pixels; its circular edge is much more stable.
+    # The marker is semi-transparent, so color thresholding is unreliable when
+    # it crosses dark road pixels. Restrict Hough detection to its control area.
     x0 = int(width * 0.78)
     x1 = int(width * 0.98)
     y0 = int(height * 0.82)
@@ -69,8 +94,6 @@ def detect_touch_marker(frame: np.ndarray) -> TouchMarker | None:
     if circles is None:
         return None
 
-    # Hough can occasionally return more than one candidate. Prefer the one
-    # closest to the expected lower-right control area.
     expected_x = width * 0.88
     expected_y = height * 0.93
     candidates = []
@@ -82,3 +105,122 @@ def detect_touch_marker(frame: np.ndarray) -> TouchMarker | None:
 
     _, center_x, center_y, radius = min(candidates, key=lambda item: item[0])
     return TouchMarker(center_x=center_x, center_y=center_y, radius=radius)
+
+
+def extract_touch_states(video_path: Path) -> tuple[float, list[bool]]:
+    """Detect the raw PRESS state of every native video frame."""
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"cannot open video: {video_path}")
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 0:
+        capture.release()
+        raise RuntimeError(f"invalid FPS for video: {video_path}")
+
+    states: list[bool] = []
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            states.append(detect_touch_marker(frame) is not None)
+    finally:
+        capture.release()
+
+    if not states:
+        raise RuntimeError(f"video contains no readable frames: {video_path}")
+    return fps, states
+
+
+def clean_isolated_one_frame_glitches(
+    states: Sequence[bool],
+) -> tuple[list[bool], int]:
+    """Merge isolated one-frame inversions without smoothing real short actions."""
+
+    cleaned = list(states)
+    changed_total = 0
+    while len(cleaned) >= 3:
+        replacements = [
+            index
+            for index in range(1, len(cleaned) - 1)
+            if cleaned[index - 1] == cleaned[index + 1] != cleaned[index]
+        ]
+        if not replacements:
+            break
+        for index in replacements:
+            cleaned[index] = cleaned[index - 1]
+        changed_total += len(replacements)
+    return cleaned, changed_total
+
+
+def states_to_segments(
+    states: Sequence[bool], fps: float
+) -> tuple[ActionSegment, ...]:
+    if not states:
+        return ()
+
+    boundaries = [0]
+    boundaries.extend(
+        index for index in range(1, len(states)) if states[index] != states[index - 1]
+    )
+    boundaries.append(len(states))
+    frame_ms = 1000.0 / fps
+
+    return tuple(
+        ActionSegment(
+            start_frame=start,
+            end_frame=end,
+            start_ms=start * frame_ms,
+            end_ms=end * frame_ms,
+            pressed=bool(states[start]),
+        )
+        for start, end in zip(boundaries, boundaries[1:])
+    )
+
+
+def segments_to_events(
+    segments: Sequence[ActionSegment],
+) -> tuple[ActionEvent, ...]:
+    return tuple(
+        ActionEvent(
+            frame_index=segment.start_frame,
+            timestamp_ms=segment.start_ms,
+            pressed=segment.pressed,
+        )
+        for segment in segments
+    )
+
+
+def build_action_timeline(
+    video_path: Path, *, clean_one_frame: bool = True
+) -> ActionTimeline:
+    fps, raw_states = extract_touch_states(video_path)
+    states = raw_states
+    cleaned_frames = 0
+    if clean_one_frame:
+        states, cleaned_frames = clean_isolated_one_frame_glitches(raw_states)
+
+    segments = states_to_segments(states, fps)
+    events = segments_to_events(segments)
+    return ActionTimeline(
+        source=str(video_path),
+        fps=fps,
+        frame_count=len(states),
+        duration_ms=len(states) * 1000.0 / fps,
+        events=events,
+        segments=segments,
+        cleaned_frames=cleaned_frames,
+    )
+
+
+def action_at_timestamp(
+    events: Sequence[ActionEvent], timestamp_ms: float
+) -> bool:
+    if not events:
+        raise ValueError("events must not be empty")
+
+    timestamps = [event.timestamp_ms for event in events]
+    index = bisect_right(timestamps, timestamp_ms) - 1
+    return events[max(index, 0)].pressed

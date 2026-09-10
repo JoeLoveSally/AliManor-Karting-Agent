@@ -59,6 +59,7 @@ Input → Vision → Model → Control → Execute
 - Train 与 Runtime 共享 Vision Preprocess
 - Frame Cache 只是训练侧 Derived Data，不改变模型输入语义
 - Sequence Evaluation 与训练期逐 sample 指标分离
+- Replay 不依赖 Dataset Manifest、Frame Cache 或 Label
 - Logging / Replay 不参与核心控制决策
 - 高频 Short Correction 不默认平滑掉
 
@@ -70,9 +71,20 @@ Input → Vision → Model → Control → Execute
 
 统一输出 `Frame`：
 
+```text
+Frame
+├── image          # BGR ndarray
+├── frame_index
+└── timestamp_ms
+```
+
+实现：
+
 - ADB：开发 / POC
 - Camera：最终实时输入
 - Video：历史视频 / Replay
+
+`VideoInput` 使用顺序 Decode，不依赖训练 Dataset 的 `input_frame_indices`，也不做 MP4 Random Seek。
 
 ### Vision
 
@@ -102,6 +114,14 @@ Mask 必须对 PRESS / RELEASE 所有帧无条件应用同一个固定区域。�
 
 训练侧 Frame Cache 会预计算其中确定性的 `Fixed Touch Area Mask + Resize + RGB`，以 `uint8` 保存；Normalize 和 Temporal Stack 仍在 Dataset 读取时执行。这样训练与 Runtime 保持同一预处理语义，同时避免每个 epoch 重复随机 seek MP4 和重复做空间预处理。
 
+Runtime Temporal Buffer 保存最近的原始输入帧，并在推理时构建：
+
+```text
+t-100ms / t-50ms / t
+```
+
+Replay 中每个目标历史时刻只选择“已解码且时间戳不晚于该时刻”的最新帧，避免为了匹配训练样本而偷看未来帧。
+
 ### Model
 
 第一版正式 baseline：
@@ -128,6 +148,16 @@ PRESS logit / probability
 
 预训练模型第一层从 3 channels 扩展为 9 channels；RGB filter 按 frame stack 重复并除以 3，以尽量保持原始激活尺度。
 
+Runtime 不从 `train.yaml` 重建模型输入约束，而是从 Artifact `metadata.json` 读取：
+
+- architecture
+- frame_stack
+- frame_interval_ms
+- history_ms
+- prediction_horizon_ms
+- input_size
+- preprocess / touch mask
+
 3 帧是否足够通过 Ablation 和实机结果判断。
 
 ### Control
@@ -146,14 +176,26 @@ PRESS / RELEASE / HOLD
 否则                                   → HOLD
 ```
 
-当前 Runtime 配置：
+Validation Threshold Sweep 后冻结第一版 Runtime 参数：
 
 ```text
-press_threshold   = 0.7
-release_threshold = 0.3
+press_threshold   = 0.55
+release_threshold = 0.45
 ```
 
-`0.3 < P < 0.7` 是 deadband，控制状态保持不变，用于抑制 raw probability 在 0.5 附近波动造成的额外 Transition。
+`0.45 < P < 0.55` 是 deadband，控制状态保持不变，用于抑制 raw probability 在 0.5 附近波动造成的额外 Transition。
+
+本轮 Validation Sweep 的关键结果：
+
+| Controller | ±100ms F1 | ±50ms F1 | ±50ms Recall | ±50ms Short Recall | Predicted Transition |
+|---|---:|---:|---:|---:|---:|
+| Raw 0.5 | 0.885 | 0.782 | 0.847 | 0.750 | 84 |
+| 0.55 / 0.45 | 0.895 | 0.803 | 0.847 | 0.750 | 80 |
+| 0.60 / 0.40 | 0.908 | 0.789 | 0.833 | 0.667 | 80 |
+| 0.65 / 0.35 | 0.920 | 0.787 | 0.819 | 0.667 | 78 |
+| 0.70 / 0.30 | 0.920 | 0.760 | 0.792 | 0.583 | 78 |
+
+选择 `0.55 / 0.45` 的理由是：相对 Raw 0.5 减少额外 Transition，同时严格 `±50ms` 下不牺牲 Recall 和 Short Correction Recall。
 
 当前不设置 `min_press_ms` / `min_release_ms`，避免删除真实 100~300ms 高频修正。
 
@@ -170,8 +212,9 @@ executor.set_pressed(False)
 
 实现：
 
-- `AdbExecutor`
-- `BleOtgExecutor`
+- `MockExecutor`：Replay / 自动测试，只记录状态变化，不产生外部副作用
+- `AdbExecutor`：下一阶段开发 / POC
+- `BleOtgExecutor`：最终硬件
 
 最终：
 
@@ -183,18 +226,36 @@ BleOtgExecutor → USB Serial → bleOTG → Bluetooth HID → Android
 
 ## 4. Runtime
 
-RuntimeEngine 核心循环：
+第一版 `RuntimeEngine` 是单输入、单模型、单 Controller、单 Executor 的同步控制 Loop。
 
-```python
-while state == RUNNING:
-    frame = input.read()
-    model_input = vision.process(frame)
-    prediction = model.predict(model_input)
-    decision = controller.control(prediction)
-    executor.execute(decision)
+对于每个输入 Frame：
+
+```text
+Sequential Frame
+    ↓ Temporal Buffer
+Inference slot due?
+    ↓ yes
+Causal temporal stack
+    ↓ Shared Vision Preprocess
+Model.predict
+    ↓ probability
+HysteresisController.update
+    ↓ PRESS / RELEASE / HOLD
+Executor
 ```
 
 第一版目标频率：**30Hz**。
+
+Runtime 不做“漏掉几个 tick 后立即补跑多次推理”。当新 Frame 到达时，如果推理槽已到期，只对最新可用 Frame 推理一次，然后推进到下一个未来槽位，避免积压后 burst inference。
+
+Model 的 `prediction_horizon_ms=100` 表示模型输出语义是预测 `t+100ms` 的目标动作。Runtime Step 同时记录：
+
+```text
+observation_timestamp_ms
+prediction_target_timestamp_ms = observation_timestamp_ms + 100ms
+```
+
+第一版 Replay 的 Mock Execute 仍在当前 Runtime Step 立即应用 Controller 决策；因此 Replay 主要用于验证真实 Runtime 数据流、控制稳定性与性能，不把 Mock Execute 时间直接解释成最终物理触控时间。Camera / bleOTG 接入后需要实测端到端延迟，再决定是否调整 `prediction_horizon_ms`。
 
 状态：
 
@@ -298,7 +359,7 @@ Test         2 videos /  2,755 samples
 
 训练期 `Accuracy / Precision / Recall / F1 / transition_f1 / short_f1` 是逐 sample 分类指标，只用于观察优化过程。
 
-正式离线 Sequence Evaluator 按完整 Video 的时间顺序推理，并使用 native-FPS Action Timeline 作为 Ground Truth。
+正式离线 Sequence Evaluator 按每个完整 Video 的时间顺序推理，并使用 native-FPS Action Timeline 作为 Ground Truth。
 
 ### Raw classifier evaluation
 
@@ -324,15 +385,24 @@ Ground Truth action(t)
 Prediction action(t + 100ms)
 ```
 
-它不使用图像，也不训练模型。重点与 CNN 比较 sample accuracy、Transition F1、timing error 和 Short Correction Recall。
+Validation 结果：
+
+```text
+sample accuracy          = 0.915
+Transition F1 @ ±100ms  = 0.042
+Transition F1 @ ±50ms   = 0.000
+Short Recall             = 0.000
+```
+
+CNN 明显优于该 persistence baseline，因此第一版 CNN 已表现出真实的 future-action prediction 信号，而不是仅靠 action persistence 获得高 Accuracy。
 
 ### Controller-aware evaluation
 
-在 raw classifier 已确认具备未来预测能力后，将同一 ordered probability sequence 送入正式 Hysteresis Controller：
+同一 ordered probability sequence 送入正式 Hysteresis Controller：
 
 ```text
 Ordered Model Probabilities
-    ↓ press_threshold=0.7 / release_threshold=0.3
+    ↓ press_threshold=0.55 / release_threshold=0.45
 Hysteresis Controller
     ↓ PRESS / RELEASE / HOLD
 Controller State Sequence
@@ -344,7 +414,7 @@ Native Ground Truth Transitions
 
 Controller-aware Evaluation 的目标不是提高 sample accuracy，而是验证 deadband 能否减少额外 Transition，同时尽量保持真正 Transition 和 100~300ms Short Correction。
 
-重点比较 raw 与 Hysteresis：
+重点比较：
 
 - Transition predicted count / False Positive
 - Transition Precision / Recall / F1
@@ -352,27 +422,47 @@ Controller-aware Evaluation 的目标不是提高 sample accuracy，而是验证
 - RELEASE onset timing error
 - Short Correction Recall
 
-如果 Precision 上升但 Recall、Short Correction Recall 明显下降，说明 Hysteresis 过强；如果额外 Transition 减少且 Recall 基本保持，则说明 deadband 起到了预期的消抖作用。
-
 Sequence Matching 第一版默认 `±100ms`，同时使用 `±50ms` 作为更严格的 timing stress check。
 
 Short Correction Recall 要求一个 100~300ms Ground Truth RELEASE 的 `RELEASE onset` 与随后 `PRESS onset` 两个边界都被模型匹配到。额外抖动 Transition 会作为 False Positive 降低 Precision / F1。
 
-Replay 复用正式 Runtime：
+### Replay Runtime
+
+Replay 复用正式 Runtime 组件，但不依赖训练期数据结构：
 
 ```text
-Recorded Video
-    ↓
+Recorded MP4
+    ↓ sequential native-FPS decode
 VideoInput
     ↓
-Vision
+TemporalFrameBuffer
+    ↓ causal t-100 / t-50 / t selection
+Shared Vision Preprocess
     ↓
-Model
+ModelRunner
     ↓
-Control
+HysteresisController
     ↓
-No-op / Mock Execute
+MockExecutor
+    ↓
+Replay JSON
 ```
+
+Replay 第一版原则：
+
+- 不读取 `samples.jsonl`
+- 不读取 Frame Cache
+- 不读取 Touch Marker Label
+- 原视频顺序 Decode
+- 30Hz 为最大推理频率，不在掉帧后 burst 补算
+- Temporal History 只使用当前时刻已经观察到的 Frame
+- 使用 Artifact Metadata 恢复模型与预处理约束
+- Controller 从安全状态 `RELEASE` 启动
+- 视频结束或异常退出时尝试安全 `RELEASE`
+- 默认尽快运行，不主动 sleep 到实时速度
+- 每个 Step 记录 observation time、prediction target time、输入帧时间戳、probability、decision、controller state 和 inference latency
+
+第一版 Replay 的目标是验证“脱离 Dataset / Cache 后正式 Runtime 数据流仍成立”。后续再加入 Ground Truth overlay / 视频可视化，以及 ADB 实机闭环。
 
 最终核心闭环指标：
 
@@ -394,7 +484,7 @@ runtime.yaml
 train.yaml
 ```
 
-`train.yaml` 记录 Frame Cache 开关和路径、Sequence Evaluation threshold / tolerance；`runtime.yaml` 记录 Hysteresis Controller 阈值。不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
+`train.yaml` 记录 Frame Cache 开关和路径、Sequence Evaluation threshold / tolerance；`runtime.yaml` 记录 Runtime 频率和冻结后的 Hysteresis Controller 阈值。不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
 
 Model Artifact：
 
@@ -406,6 +496,12 @@ artifacts/models/<model_name>/
 └── evaluation/
     ├── <split>_sequence.json
     └── <split>_hysteresis_sequence.json
+```
+
+Replay Artifact：
+
+```text
+artifacts/replays/<model_name>/<video_stem>.json
 ```
 
 Metadata 至少记录：
@@ -438,9 +534,11 @@ Runtime 从 Artifact Metadata 读取模型输入约束。
 - Touch Marker 区域始终固定 Mask
 - 100~300ms Short Correction 保留
 - Controller v1 无 minimum duration
+- Controller v1 阈值冻结为 `0.55 / 0.45`
 - Dataset 按 Video 隔离
 - 正式训练优先使用 Frame Cache，避免 MP4 Random Seek 成为 GPU 饥饿瓶颈
 - Sequence Evaluation 按 Video 顺序运行，不使用 Weighted Sampler
+- Replay 不读取 Dataset / Frame Cache / Label
 - Test Split 不用于日常超参数迭代
 - 离开 RUNNING 尝试 RELEASE
 

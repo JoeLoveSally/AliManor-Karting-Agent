@@ -16,8 +16,8 @@ class ControlAction(str, Enum):
 
 @dataclass(frozen=True)
 class HysteresisConfig:
-    press_threshold: float = 0.7
-    release_threshold: float = 0.3
+    press_threshold: float = 0.55
+    release_threshold: float = 0.45
 
     def validate(self) -> None:
         if not (0.0 <= self.release_threshold < self.press_threshold <= 1.0):

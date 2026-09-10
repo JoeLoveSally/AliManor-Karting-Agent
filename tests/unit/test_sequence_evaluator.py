@@ -14,6 +14,7 @@ def test_sequence_transition_matching_and_timing() -> None:
         SequencePoint("video.mp4", 100.0, 0.1),
         SequencePoint("video.mp4", 150.0, 0.1),
         SequencePoint("video.mp4", 200.0, 0.9),
+        SequencePoint("video.mp4", 250.0, 0.9),
     ]
     expected = [
         Transition("video.mp4", 90.0, False),

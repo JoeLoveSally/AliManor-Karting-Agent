@@ -141,12 +141,23 @@ PRESS / RELEASE / HOLD
 第一版使用 Hysteresis：
 
 ```text
-P >= press_threshold   → PRESS
-P <= release_threshold → RELEASE
-otherwise              → HOLD
+当前 RELEASE 且 P >= press_threshold   → PRESS
+当前 PRESS   且 P <= release_threshold → RELEASE
+否则                                   → HOLD
 ```
 
+当前 Runtime 配置：
+
+```text
+press_threshold   = 0.7
+release_threshold = 0.3
+```
+
+`0.3 < P < 0.7` 是 deadband，控制状态保持不变，用于抑制 raw probability 在 0.5 附近波动造成的额外 Transition。
+
 当前不设置 `min_press_ms` / `min_release_ms`，避免删除真实 100~300ms 高频修正。
+
+Runtime 启动时使用安全状态 `RELEASE`。离线 Controller-aware Evaluation 为避免把“视频从中间开始时的初始状态”误计为控制器性能，会仅对第一个 sample 用上下阈值中点推断初始状态，之后完全按同一 Hysteresis 状态机运行。
 
 ### Execute
 
@@ -287,7 +298,9 @@ Test         2 videos /  2,755 samples
 
 训练期 `Accuracy / Precision / Recall / F1 / transition_f1 / short_f1` 是逐 sample 分类指标，只用于观察优化过程。
 
-正式离线 Sequence Evaluator 按完整 Video 的时间顺序推理，并使用 native-FPS Action Timeline 作为 Ground Truth：
+正式离线 Sequence Evaluator 按完整 Video 的时间顺序推理，并使用 native-FPS Action Timeline 作为 Ground Truth。
+
+### Raw classifier evaluation
 
 ```text
 Ordered Model Probabilities
@@ -295,20 +308,55 @@ Ordered Model Probabilities
 Predicted PRESS/RELEASE States
     ↓
 Predicted Transitions
-    ↓ same direction + one-to-one + ±100ms
+    ↓ same direction + one-to-one + tolerance
 Native Ground Truth Transitions
 ```
 
-核心指标：
+Raw classifier evaluation 用于直接观察模型输出本身，包括 probability chatter，不代表最终 Runtime Control 输出。
 
+### Action persistence baseline
+
+为了排除“模型只是识别当前动作并假设未来仍保持”的 shortcut，使用 label-only baseline：
+
+```text
+Ground Truth action(t)
+        ↓ copy
+Prediction action(t + 100ms)
+```
+
+它不使用图像，也不训练模型。重点与 CNN 比较 sample accuracy、Transition F1、timing error 和 Short Correction Recall。
+
+### Controller-aware evaluation
+
+在 raw classifier 已确认具备未来预测能力后，将同一 ordered probability sequence 送入正式 Hysteresis Controller：
+
+```text
+Ordered Model Probabilities
+    ↓ press_threshold=0.7 / release_threshold=0.3
+Hysteresis Controller
+    ↓ PRESS / RELEASE / HOLD
+Controller State Sequence
+    ↓
+Predicted Transitions
+    ↓ same direction + one-to-one + tolerance
+Native Ground Truth Transitions
+```
+
+Controller-aware Evaluation 的目标不是提高 sample accuracy，而是验证 deadband 能否减少额外 Transition，同时尽量保持真正 Transition 和 100~300ms Short Correction。
+
+重点比较 raw 与 Hysteresis：
+
+- Transition predicted count / False Positive
+- Transition Precision / Recall / F1
 - PRESS onset timing error
 - RELEASE onset timing error
-- Transition Precision / Recall / F1
 - Short Correction Recall
 
-Short Correction Recall 要求一个 100~300ms Ground Truth RELEASE 的 `RELEASE onset` 与随后 `PRESS onset` 两个边界都被模型匹配到。额外抖动 Transition 会作为 False Positive 降低 Precision / F1。
+如果 Precision 上升但 Recall、Short Correction Recall 明显下降，说明 Hysteresis 过强；如果额外 Transition 减少且 Recall 基本保持，则说明 deadband 起到了预期的消抖作用。
 
-当前 Sequence Evaluator 先评价 raw classifier state；Controller Hysteresis 的影响留到 Replay / Controller-aware Evaluation。
+Sequence Matching 第一版默认 `±100ms`，同时使用 `±50ms` 作为更严格的 timing stress check。
+
+Short Correction Recall 要求一个 100~300ms Ground Truth RELEASE 的 `RELEASE onset` 与随后 `PRESS onset` 两个边界都被模型匹配到。额外抖动 Transition 会作为 False Positive 降低 Precision / F1。
 
 Replay 复用正式 Runtime：
 
@@ -346,7 +394,7 @@ runtime.yaml
 train.yaml
 ```
 
-`train.yaml` 同时记录 Frame Cache 开关和路径、Sequence Evaluation threshold / tolerance；不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
+`train.yaml` 记录 Frame Cache 开关和路径、Sequence Evaluation threshold / tolerance；`runtime.yaml` 记录 Hysteresis Controller 阈值。不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
 
 Model Artifact：
 
@@ -356,7 +404,8 @@ artifacts/models/<model_name>/
 ├── metadata.json
 ├── history.json
 └── evaluation/
-    └── <split>_sequence.json
+    ├── <split>_sequence.json
+    └── <split>_hysteresis_sequence.json
 ```
 
 Metadata 至少记录：
@@ -408,7 +457,9 @@ Frame Cache + Trainer
     ↓
 GPU Baseline Training
     ↓
-Sequence Evaluator
+Raw Sequence Evaluator + Persistence Baseline
+    ↓
+Controller-aware Hysteresis Evaluation
     ↓
 Replay Runtime
     ↓

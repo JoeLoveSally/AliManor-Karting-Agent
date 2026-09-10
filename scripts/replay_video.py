@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--max-seconds", type=float, default=None)
+    parser.add_argument(
+        "--warmup-iterations",
+        type=int,
+        default=3,
+        help="Dummy model predictions before Replay starts; set 0 to disable.",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -95,6 +101,9 @@ def default_output(model_path: Path, video_path: Path) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.warmup_iterations < 0:
+        raise ValueError("--warmup-iterations must be >= 0")
+
     runtime_raw = load_mapping(args.runtime_config)
     target_fps = float(runtime_raw.get("target_fps", 30.0))
     if target_fps <= 0:
@@ -105,6 +114,11 @@ def main() -> int:
         model_path,
         metadata_path=args.metadata,
         device=args.device,
+    )
+    warmup_ms = (
+        model.warmup(args.warmup_iterations)
+        if args.warmup_iterations > 0
+        else ()
     )
     hysteresis = controller_config(runtime_raw)
     controller = HysteresisController(hysteresis, initial_pressed=False)
@@ -126,6 +140,15 @@ def main() -> int:
         f"Model: {model_path} ({model.spec.architecture}, device={model.device})",
         flush=True,
     )
+    if warmup_ms:
+        print(
+            "Warmup: "
+            f"iterations={len(warmup_ms)}, first={warmup_ms[0]:.2f}ms, "
+            f"last={warmup_ms[-1]:.2f}ms",
+            flush=True,
+        )
+    else:
+        print("Warmup: disabled", flush=True)
     print(
         "Temporal: "
         f"offsets={model.spec.frame_offsets_ms}, "
@@ -165,6 +188,7 @@ def main() -> int:
         f"state_changes={summary['state_changes']}, "
         f"mean_infer={summary['mean_inference_ms']:.2f}ms, "
         f"p95_infer={summary['p95_inference_ms']:.2f}ms, "
+        f"max_infer={summary['max_inference_ms']:.2f}ms, "
         f"processing_fps={summary['processing_fps']:.1f}, "
         f"safety_release={result.safety_release}",
         flush=True,
@@ -178,6 +202,7 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": str(model_path),
+        "model_warmup_ms": list(warmup_ms),
         "controller": {
             "press_threshold": hysteresis.press_threshold,
             "release_threshold": hysteresis.release_threshold,

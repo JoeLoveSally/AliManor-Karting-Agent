@@ -4,8 +4,8 @@ model:
   path: artifacts/models/current
 
 control:
-  press_threshold: 0.7
-  release_threshold: 0.3
+  press_threshold: 0.55
+  release_threshold: 0.45
 
 replay:
   record: true

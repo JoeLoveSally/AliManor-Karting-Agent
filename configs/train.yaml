@@ -36,6 +36,10 @@ frame_cache:
   enabled: true
   root: data/processed/frame_cache
 
+evaluation:
+  threshold: 0.5
+  transition_tolerance_ms: 100
+
 split:
   name: v1
   strategy: video_holdout_visual_theme_stratified

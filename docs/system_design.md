@@ -41,6 +41,8 @@ Android Phone
 
 ```text
 Raw Videos → Label → Dataset Manifest → Frame Cache → Trainer → Model Artifact
+                                                     ↓
+                                             Sequence Evaluator
 ```
 
 ```text
@@ -56,6 +58,7 @@ Input → Vision → Model → Control → Execute
 - Control 与 Execute 分离
 - Train 与 Runtime 共享 Vision Preprocess
 - Frame Cache 只是训练侧 Derived Data，不改变模型输入语义
+- Sequence Evaluation 与训练期逐 sample 指标分离
 - Logging / Replay 不参与核心控制决策
 - 高频 Short Correction 不默认平滑掉
 
@@ -282,6 +285,31 @@ Test         2 videos /  2,755 samples
 
 ## 6. Replay 与 Evaluation
 
+训练期 `Accuracy / Precision / Recall / F1 / transition_f1 / short_f1` 是逐 sample 分类指标，只用于观察优化过程。
+
+正式离线 Sequence Evaluator 按完整 Video 的时间顺序推理，并使用 native-FPS Action Timeline 作为 Ground Truth：
+
+```text
+Ordered Model Probabilities
+    ↓ threshold=0.5
+Predicted PRESS/RELEASE States
+    ↓
+Predicted Transitions
+    ↓ same direction + one-to-one + ±100ms
+Native Ground Truth Transitions
+```
+
+核心指标：
+
+- PRESS onset timing error
+- RELEASE onset timing error
+- Transition Precision / Recall / F1
+- Short Correction Recall
+
+Short Correction Recall 要求一个 100~300ms Ground Truth RELEASE 的 `RELEASE onset` 与随后 `PRESS onset` 两个边界都被模型匹配到。额外抖动 Transition 会作为 False Positive 降低 Precision / F1。
+
+当前 Sequence Evaluator 先评价 raw classifier state；Controller Hysteresis 的影响留到 Replay / Controller-aware Evaluation。
+
 Replay 复用正式 Runtime：
 
 ```text
@@ -298,16 +326,12 @@ Control
 No-op / Mock Execute
 ```
 
-核心评价指标：
+最终核心闭环指标：
 
-- PRESS onset timing error
-- RELEASE onset timing error
-- Transition F1
-- Short Correction Recall
 - Replay / 实机过弯成功率
+- 位置修正效果
 - 完整赛程完成率
-
-普通 Accuracy / Precision / Recall / F1 仅作为辅助指标。
+- Short Correction 是否延迟或遗漏
 
 ---
 
@@ -322,7 +346,7 @@ runtime.yaml
 train.yaml
 ```
 
-`train.yaml` 同时记录 Frame Cache 开关和路径；不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
+`train.yaml` 同时记录 Frame Cache 开关和路径、Sequence Evaluation threshold / tolerance；不同训练机可通过 CLI 覆盖 `num_workers`，避免把机器相关的吞吐参数写死到公共配置。
 
 Model Artifact：
 
@@ -330,7 +354,9 @@ Model Artifact：
 artifacts/models/<model_name>/
 ├── model.pt
 ├── metadata.json
-└── history.json
+├── history.json
+└── evaluation/
+    └── <split>_sequence.json
 ```
 
 Metadata 至少记录：
@@ -365,6 +391,8 @@ Runtime 从 Artifact Metadata 读取模型输入约束。
 - Controller v1 无 minimum duration
 - Dataset 按 Video 隔离
 - 正式训练优先使用 Frame Cache，避免 MP4 Random Seek 成为 GPU 饥饿瓶颈
+- Sequence Evaluation 按 Video 顺序运行，不使用 Weighted Sampler
+- Test Split 不用于日常超参数迭代
 - 离开 RUNNING 尝试 RELEASE
 
 开发顺序：
@@ -376,9 +404,11 @@ Temporal Preprocess + CNN
     ↓
 Video-level Split
     ↓
-Frame Cache + Trainer / Evaluator
+Frame Cache + Trainer
     ↓
 GPU Baseline Training
+    ↓
+Sequence Evaluator
     ↓
 Replay Runtime
     ↓

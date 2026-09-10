@@ -214,7 +214,7 @@ frames(..., t) → action(t + Δt)
 
 ## 7. Evaluation
 
-普通分类指标保留：
+训练阶段保留逐 sample 分类指标：
 
 - Accuracy
 - Precision
@@ -223,22 +223,67 @@ frames(..., t) → action(t + Δt)
 - GT PRESS ratio
 - Predicted PRESS ratio
 
-核心指标：
+这些指标用于观察训练稳定性，但不能直接代表闭环驾驶能力。
 
-- PRESS onset timing error
-- RELEASE onset timing error
-- Transition F1
-- Short Correction Recall
+### 7.1 Sequence-level Transition
 
-Short Correction 按 RELEASE duration 分桶：
+正式离线评价按每个完整 Video 的时间顺序执行推理。第一版先将 PRESS probability 以 `threshold=0.5` 转为离散状态，再从状态变化提取预测 Transition。
+
+Ground Truth Transition 直接来自 native-FPS Action Timeline，不从 30Hz sample 标签重新生成，以保留原始操作时序精度。
+
+预测 Transition 与 Ground Truth Transition 必须满足：
+
+- 同一 Video
+- 同一方向（`PRESS onset` 或 `RELEASE onset`）
+- 时间差绝对值不超过 `transition_tolerance_ms`
+- 一对一匹配
+
+第一版：
 
 ```text
-100~200ms
-200~300ms
->=300ms
+threshold               = 0.5
+transition_tolerance_ms = 100
 ```
 
-最终评价以 Replay / 实机闭环为准：
+未匹配预测 Transition 记为 False Positive；未匹配 Ground Truth Transition 记为 False Negative。因此短时间内反复抖动产生的额外切换会降低 Transition Precision / F1。
+
+输出：
+
+- Transition Precision / Recall / F1
+- PRESS Transition Precision / Recall / F1
+- RELEASE Transition Precision / Recall / F1
+- PRESS onset signed error / MAE / P50 abs / P95 abs / max abs
+- RELEASE onset signed error / MAE / P50 abs / P95 abs / max abs
+
+`mean_error_ms = predicted_timestamp - ground_truth_timestamp`：负值表示提前，正值表示滞后。
+
+### 7.2 Short Correction Recall
+
+Short Correction 仍按 native Action Timeline 中 `100~300ms` 的 RELEASE Segment 定义。
+
+一个 Ground Truth Short Correction 只有在以下两个边界都成功匹配时才算 detected：
+
+```text
+PRESS → RELEASE onset matched
+RELEASE → PRESS onset matched
+```
+
+因此它衡量的是模型是否完整复现一次短时修正，而不是“短修正附近的 frame 分类是否正确”。这与训练日志中的 `short_f1` 不同；后者只是 `near_short_correction` sample subset 的分类 F1。
+
+Release Segment 同时按 duration 输出：
+
+```text
+<100ms        # 仅监控，不作为有效 Short Correction 目标
+100~200ms
+200~300ms
+>300ms
+```
+
+其中 `100~300ms` 另外汇总为 `Short Correction Recall`。
+
+当前 Sequence Evaluator 评价的是 raw classifier state；Runtime Hysteresis 的影响将在 Replay / Controller-aware Evaluation 阶段单独评价。
+
+最终评价仍以 Replay / 实机闭环为准：
 
 - 过弯成功率
 - 位置修正效果
@@ -258,11 +303,13 @@ History window         : 100ms
 Frame interval         : 50ms
 Sample rate            : 30Hz
 Prediction horizon     : 100ms baseline
-Transition window      : ±200ms
+Transition window      : ±200ms training sample tagging
 Sampling weights       : 1 / 2 / 3
 Split                  : v1 video-level holdout
 Training input         : mmap frame cache preferred
 Cache representation   : prepared RGB uint8
+Sequence threshold     : 0.5
+Transition tolerance   : ±100ms
 ```
 
 当前不做：
@@ -272,3 +319,4 @@ Cache representation   : prepared RGB uint8
 - Frame-level random split
 - Weighted Sampling 与 Weighted Loss 同时叠加
 - 把相似视觉主题直接当作同一地图
+- 用训练期 `short_f1` 代替 Sequence Short Correction Recall

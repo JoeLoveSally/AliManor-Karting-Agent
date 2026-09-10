@@ -7,6 +7,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -86,7 +87,8 @@ def print_summary(prefix: str, summary: dict[str, object]) -> None:
         f"gt_press={all_metrics['target_positive_rate']:.3f}, "
         f"pred_press={all_metrics['predicted_positive_rate']:.3f}, "
         f"transition_f1={transition['f1']:.3f}, "
-        f"short_f1={short['f1']:.3f}"
+        f"short_f1={short['f1']:.3f}",
+        flush=True,
     )
 
 
@@ -147,10 +149,11 @@ def main() -> int:
         torch.cuda.manual_seed_all(loop_config.seed)
 
     device = select_device(torch)
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
     print(
         f"Split {split.name}: train={len(partitions['train'])}, "
-        f"validation={len(partitions['validation'])}, test={len(partitions['test'])}"
+        f"validation={len(partitions['validation'])}, test={len(partitions['test'])}",
+        flush=True,
     )
     print(
         "Frame cache: "
@@ -158,9 +161,10 @@ def main() -> int:
             f"{cache_root} (required={args.require_cache})"
             if cache_root is not None
             else "disabled"
-        )
+        ),
+        flush=True,
     )
-    print(f"DataLoader workers: {num_workers}")
+    print(f"DataLoader workers: {num_workers}", flush=True)
 
     datasets = {
         name: TemporalVideoDataset(
@@ -240,7 +244,7 @@ def main() -> int:
             )
             print_summary("smoke/train", train_summary)
             print_summary("smoke/validation", validation_summary)
-            print("Smoke test passed.")
+            print("Smoke test passed.", flush=True)
             return 0
 
         artifact_config = raw.get("artifact", {})
@@ -258,6 +262,7 @@ def main() -> int:
         history: list[dict[str, object]] = []
 
         for epoch in range(1, loop_config.epochs + 1):
+            epoch_started = time.perf_counter()
             train_summary = run_epoch(
                 model,
                 loaders["train"],
@@ -269,12 +274,18 @@ def main() -> int:
                 loaders["validation"],
                 device,
             )
+            elapsed_seconds = time.perf_counter() - epoch_started
 
             print_summary(f"epoch {epoch:02d}/train", train_summary)
             print_summary(f"epoch {epoch:02d}/validation", validation_summary)
+            print(
+                f"epoch {epoch:02d}/time: {elapsed_seconds:.1f}s",
+                flush=True,
+            )
             history.append(
                 {
                     "epoch": epoch,
+                    "elapsed_seconds": elapsed_seconds,
                     "train": train_summary,
                     "validation": validation_summary,
                 }
@@ -307,7 +318,7 @@ def main() -> int:
         (artifact_dir / "history.json").write_text(
             json.dumps(history, indent=2), encoding="utf-8"
         )
-        print(f"Artifact: {artifact_dir}")
+        print(f"Artifact: {artifact_dir}", flush=True)
         return 0
     finally:
         for dataset in datasets.values():

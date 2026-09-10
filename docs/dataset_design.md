@@ -281,6 +281,33 @@ Release Segment 同时按 duration 输出：
 
 其中 `100~300ms` 另外汇总为 `Short Correction Recall`。
 
+### 7.3 Action Persistence Baseline
+
+为了确认 CNN 是否真的学到了未来控制信号，而不是只识别当前操作状态并假设其继续保持，Evaluation 需要一个不使用图像、不训练模型的 label-only 对照：
+
+```text
+Ground Truth action(t)
+        ↓ copy state
+Prediction action(t + prediction_horizon_ms)
+```
+
+当前 `prediction_horizon_ms=100`，因此该基线定义为：
+
+```text
+action(t) → action(t+100ms)
+```
+
+这个 baseline 故意使用输入时刻 `t` 的真实动作标签，相当于一个拥有“当前动作 oracle”的 persistence predictor。它不是 Runtime 实现方案，而是用于量化数据本身的动作持续性：如果 CNN 只是在视觉上恢复 `action(t)`，其表现不应明显超过该基线。
+
+Persistence Baseline 与 CNN 使用完全相同的 Video Split、Sequence Transition Matching 和 Short Correction Recall。重点比较：
+
+- sample accuracy：说明单纯保持当前动作本身能拿到多高的逐帧准确率
+- Transition Precision / Recall / F1
+- PRESS / RELEASE signed timing error 与 MAE
+- Short Correction Recall
+
+如果 persistence baseline 的 transition signed error 接近 `+prediction_horizon_ms`，而 CNN 的误差显著更接近 0，说明 CNN 确实利用视觉信息提前预测了未来切换；反之则需要警惕 current-action leakage / action persistence shortcut。
+
 当前 Sequence Evaluator 评价的是 raw classifier state；Runtime Hysteresis 的影响将在 Replay / Controller-aware Evaluation 阶段单独评价。
 
 最终评价仍以 Replay / 实机闭环为准：
@@ -310,6 +337,7 @@ Training input         : mmap frame cache preferred
 Cache representation   : prepared RGB uint8
 Sequence threshold     : 0.5
 Transition tolerance   : ±100ms
+Control baseline       : action(t) → action(t+100ms) persistence
 ```
 
 当前不做：

@@ -1,0 +1,4 @@
+adb:
+  executable: adb
+  serial: null
+  command_timeout_seconds: 3.0

@@ -16,6 +16,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from karting_agent.control.controller import HysteresisConfig, hysteresis_states
 from karting_agent.model.base import build_model
 from karting_agent.train.frame_cache import frame_cache_root_from_config
 from karting_agent.train.sequence_evaluator import (
@@ -39,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run sequence-level model evaluation.")
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "train.yaml")
     parser.add_argument(
+        "--runtime-config",
+        type=Path,
+        default=ROOT / "configs" / "runtime.yaml",
+        help="Runtime config used for controller thresholds.",
+    )
+    parser.add_argument(
         "--split",
         choices=("validation", "test"),
         default="validation",
@@ -50,6 +57,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--tolerance-ms", type=float, default=None)
     parser.add_argument(
+        "--controller",
+        choices=("raw", "hysteresis"),
+        default="raw",
+        help="Evaluate raw classifier state or Hysteresis controller state.",
+    )
+    parser.add_argument("--press-threshold", type=float, default=None)
+    parser.add_argument("--release-threshold", type=float, default=None)
+    parser.add_argument(
         "--require-cache",
         action="store_true",
         help="Fail instead of falling back to MP4 when frame cache is missing.",
@@ -57,10 +72,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_raw_config(path: Path) -> dict[str, object]:
+def load_yaml_mapping(path: Path) -> dict[str, object]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
-        raise ValueError("train config root must be a mapping")
+        raise ValueError(f"config root must be a mapping: {path}")
     return raw
 
 
@@ -99,9 +114,35 @@ def evaluation_parameters(
     return threshold, tolerance_ms
 
 
+def controller_parameters(
+    runtime_raw: dict[str, object],
+    *,
+    press_override: float | None,
+    release_override: float | None,
+) -> HysteresisConfig:
+    control = runtime_raw.get("control", {})
+    if not isinstance(control, dict):
+        raise ValueError("runtime control config must be a mapping")
+    config = HysteresisConfig(
+        press_threshold=(
+            float(control.get("press_threshold", 0.7))
+            if press_override is None
+            else press_override
+        ),
+        release_threshold=(
+            float(control.get("release_threshold", 0.3))
+            if release_override is None
+            else release_override
+        ),
+    )
+    config.validate()
+    return config
+
+
 def artifact_paths(
     raw: dict[str, object],
     split_name: str,
+    controller_mode: str,
     model_override: Path | None,
     output_override: Path | None,
 ) -> tuple[Path, Path]:
@@ -117,10 +158,11 @@ def artifact_paths(
         if model_override is not None
         else artifact_dir / "model.pt"
     )
+    suffix = "_hysteresis" if controller_mode == "hysteresis" else ""
     output_path = (
         output_override.resolve()
         if output_override is not None
-        else artifact_dir / "evaluation" / f"{split_name}_sequence.json"
+        else artifact_dir / "evaluation" / f"{split_name}{suffix}_sequence.json"
     )
     return model_path, output_path
 
@@ -157,10 +199,31 @@ def load_state_dict(torch, path: Path, device):
         return torch.load(path, map_location=device)
 
 
+def controller_points(
+    points: list[SequencePoint],
+    config: HysteresisConfig,
+) -> list[SequencePoint]:
+    states = hysteresis_states(
+        [point.probability for point in points],
+        config,
+        initial_pressed=None,
+    )
+    return [
+        SequencePoint(
+            video=point.video,
+            timestamp_ms=point.timestamp_ms,
+            probability=1.0 if pressed else 0.0,
+        )
+        for point, pressed in zip(points, states)
+    ]
+
+
 def main() -> int:
     args = parse_args()
     if args.num_workers is not None and args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
+    if args.controller == "hysteresis" and args.threshold is not None:
+        raise ValueError("--threshold applies only to --controller raw")
 
     try:
         import torch
@@ -170,7 +233,8 @@ def main() -> int:
             'PyTorch is required; install with: python -m pip install -e ".[train]"'
         ) from exc
 
-    raw = load_raw_config(args.config)
+    raw = load_yaml_mapping(args.config)
+    runtime_raw = load_yaml_mapping(args.runtime_config)
     loop_config = load_train_loop_config(args.config)
     split_config = load_video_split(args.config)
     preprocess_config = preprocess_config_from_mapping(raw)
@@ -180,9 +244,15 @@ def main() -> int:
         threshold_override=args.threshold,
         tolerance_override=args.tolerance_ms,
     )
+    hysteresis_config = controller_parameters(
+        runtime_raw,
+        press_override=args.press_threshold,
+        release_override=args.release_threshold,
+    )
     model_path, output_path = artifact_paths(
         raw,
         split_config.name,
+        args.controller,
         args.model,
         args.output,
     )
@@ -226,9 +296,18 @@ def main() -> int:
 
     print(
         f"Device: {device}; split={args.split}; samples={len(samples)}; "
-        f"threshold={threshold:.3f}; tolerance={tolerance_ms:.1f}ms",
+        f"controller={args.controller}; tolerance={tolerance_ms:.1f}ms",
         flush=True,
     )
+    if args.controller == "raw":
+        print(f"Raw threshold: {threshold:.3f}", flush=True)
+    else:
+        print(
+            "Hysteresis: "
+            f"press>={hysteresis_config.press_threshold:.3f}, "
+            f"release<={hysteresis_config.release_threshold:.3f}",
+            flush=True,
+        )
     print(
         "Frame cache: "
         + (
@@ -276,12 +355,20 @@ def main() -> int:
         points = points_by_video.get(video)
         if not points:
             raise RuntimeError(f"no predictions for configured video: {video}")
+
+        evaluation_points = (
+            controller_points(points, hysteresis_config)
+            if args.controller == "hysteresis"
+            else points
+        )
+        evaluation_threshold = 0.5 if args.controller == "hysteresis" else threshold
+
         transitions, releases = load_label_data(video)
         evaluation = evaluate_sequence(
-            points,
+            evaluation_points,
             transitions,
             releases,
-            threshold=threshold,
+            threshold=evaluation_threshold,
             tolerance_ms=tolerance_ms,
         )
         evaluations.append(evaluation)
@@ -292,6 +379,7 @@ def main() -> int:
         print(
             f"{Path(video).name}: transition_f1={transition['f1']:.3f}, "
             f"matched={transition['matched']}/{transition['ground_truth']}, "
+            f"predicted={transition['predicted']}, "
             f"short_recall={short['recall']:.3f} "
             f"({short['detected']}/{short['segments']})",
             flush=True,
@@ -307,7 +395,10 @@ def main() -> int:
         f"transition_f1={transition['f1']:.3f}, "
         f"precision={transition['precision']:.3f}, "
         f"recall={transition['recall']:.3f}, "
+        f"predicted={transition['predicted']}, "
+        f"press_mean={press_timing['mean_error_ms']:.1f}ms, "
         f"press_mae={press_timing['mae_ms']:.1f}ms, "
+        f"release_mean={release_timing['mean_error_ms']:.1f}ms, "
         f"release_mae={release_timing['mae_ms']:.1f}ms, "
         f"short_recall={short['recall']:.3f} "
         f"({short['detected']}/{short['segments']})",
@@ -318,6 +409,16 @@ def main() -> int:
     payload = {
         "split": args.split,
         "model": str(model_path),
+        "controller": (
+            {"mode": "raw", "threshold": threshold}
+            if args.controller == "raw"
+            else {
+                "mode": "hysteresis",
+                "press_threshold": hysteresis_config.press_threshold,
+                "release_threshold": hysteresis_config.release_threshold,
+                "offline_initial_state": "inferred_from_first_probability_midpoint",
+            }
+        ),
         "aggregate": aggregate,
         "per_video": per_video,
     }

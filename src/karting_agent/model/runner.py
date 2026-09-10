@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -135,12 +136,16 @@ class ModelRunner:
         self.model.load_state_dict(state_dict)
         self.model.eval()
 
-    def predict(self, inputs: np.ndarray) -> float:
-        expected_shape = (
+    @property
+    def input_shape(self) -> tuple[int, int, int]:
+        return (
             3 * self.spec.frame_stack,
             self.spec.preprocess_config.input_height,
             self.spec.preprocess_config.input_width,
         )
+
+    def predict(self, inputs: np.ndarray) -> float:
+        expected_shape = self.input_shape
         if inputs.shape != expected_shape or inputs.dtype != np.float32:
             raise ValueError(
                 f"model input must be float32 with shape {expected_shape}, got "
@@ -152,3 +157,20 @@ class ModelRunner:
         with self._torch.inference_mode():
             probability = self._torch.sigmoid(self.model(tensor))[0].item()
         return float(probability)
+
+    def warmup(self, iterations: int = 3) -> tuple[float, ...]:
+        """Run untimed-control dummy predictions before entering RUNNING state."""
+        if iterations < 1:
+            raise ValueError("warmup iterations must be >= 1")
+
+        dummy = np.zeros(self.input_shape, dtype=np.float32)
+        latencies: list[float] = []
+        for _ in range(iterations):
+            if self.device.type == "cuda":
+                self._torch.cuda.synchronize(self.device)
+            started = time.perf_counter()
+            self.predict(dummy)
+            if self.device.type == "cuda":
+                self._torch.cuda.synchronize(self.device)
+            latencies.append((time.perf_counter() - started) * 1000.0)
+        return tuple(latencies)

@@ -144,7 +144,55 @@ Runtime 启动状态固定为 `RELEASE`。正常结束、Ctrl+C 和异常退出�
 
 ---
 
-## 6. 运行模式
+## 6. Debug Recording
+
+Armed Video Run 默认同时保存屏幕录制，方便把真实赛道画面与 probability / Controller timeline 对齐分析。
+
+同一个 Android H.264 流由 FFmpeg 一路解码给 Runtime，一路直接 `copy` 到 fragmented MP4：
+
+```text
+screenrecord H.264
+       ↓
+     FFmpeg
+      ↙   ↘
+raw BGR     H.264 copy
+Runtime     debug MP4
+```
+
+因此录制不会启动第二个 Android encoder，也不会做第二次 CPU 视频编码。
+
+每次 Run 生成同名的一对文件：
+
+```text
+artifacts/adb_runs/adb_<timestamp>.json
+artifacts/adb_runs/adb_<timestamp>.mp4
+```
+
+MP4 使用 H.264 + fragmented MP4，适合直接播放和上传分析；JSON 保留每个 Runtime Step 的 probability、action、state、source frame index 和时间戳。
+
+录制从 Video Input 启动时开始，因此会包含 warmup、等待进入游戏和 3 秒倒计时。JSON 的 `recording.control_start_source_frame` 与 `recording.control_start_timestamp_ms` 标记真正启用闭环控制的位置，用于把 MP4 与 Runtime timeline 对齐。
+
+默认行为：
+
+```text
+--arm --input video     → 自动录制
+Dry Run                 → 默认不录制
+```
+
+可显式控制：
+
+```text
+--record-debug
+--no-record-debug
+```
+
+`artifacts/adb_runs/` 已加入 `.gitignore`，Debug 视频与 Run JSON 不提交 Git。
+
+分析失败案例时应同时上传同一 stem 的 `.mp4` 和 `.json`，这样可以直接查看弯道视觉状态并对应模型概率与 PRESS / RELEASE 决策。
+
+---
+
+## 7. 运行模式
 
 默认实时模式：
 
@@ -166,11 +214,13 @@ ADB PNG screenshot → Runtime → MockExecutor
 --arm --x <X> --y <Y>
 ```
 
+`--wait-for-start` 会先完成模型、Video Input 和 persistent ADB shell 预热，然后停在 `READY`。进入游戏并等待 3 秒倒计时结束后按 Enter，Runtime 才开始闭环控制。
+
 首次 Video Dry Run 不进入游戏也可以先在持续动态页面测吞吐；真正送入模型时必须关闭 Android Developer Options 中的“显示点按”和“指针位置”，避免动作相关视觉标记泄漏给模型。
 
 ---
 
-## 7. 实机性能结果
+## 8. 实机性能结果
 
 设备：V2227A，1440×3200；本地模型使用 CPU；Runtime 目标 30 Hz。
 
@@ -193,9 +243,20 @@ control_fps  ≈ 30
 infer_p95    < 15 ms   # 360-wide mode
 ```
 
+第一次 5 秒 Armed Closed Loop 实测：
+
+```text
+input_fps       = 54.6
+control_fps     = 29.1
+infer_p95       = 10.25 ms
+execute enqueue ≈ 0.05 ms
+```
+
+第一弯通过，第二弯未及时 RELEASE 掉轨；基础实时链路已通过，后续进入 failure-case 视觉与 probability 对齐分析。
+
 ---
 
-## 8. 分阶段实机流程
+## 9. 分阶段实机流程
 
 阶段 A：Video Dry Run
 
@@ -211,7 +272,7 @@ AdbVideoInput → Runtime → Model → MockExecutor
 AdbVideoInput → Runtime → Model → Controller → persistent ADB shell
 ```
 
-代码已接入。下一步先用安全坐标或 Developer Options 指针显示验证 DOWN / UP 与安全 RELEASE，再进入游戏闭环。
+已通过：Developer Options 指针位置验证独立 DOWN / UP 可正常执行。
 
 阶段 C：Armed Closed Loop
 
@@ -219,7 +280,7 @@ AdbVideoInput → Runtime → Model → Controller → persistent ADB shell
 AdbVideoInput → Runtime → Model → Controller → AdbExecutor → Android
 ```
 
-第一次只运行数秒，并准备 Ctrl+C。确认触控坐标、DOWN / UP 语义和安全 RELEASE 后再进入完整赛道。
+已完成第一次 5 秒闭环；当前重点转向通过 MP4 + JSON 复盘失败弯道，而不是继续优化基础数据通路。
 
 阶段 D：External Camera + bleOTG
 
@@ -227,7 +288,7 @@ ADB 闭环只用于开发验证。最终切换真实摄像头输入和 bleOTG �
 
 ---
 
-## 9. 第一阶段通过标准
+## 10. 第一阶段通过标准
 
 Video Dry Run 的目标值：
 
@@ -247,4 +308,4 @@ infer_p95    < 15 ms
 - Ctrl+C / 正常退出能够清理 screenrecord 与 FFmpeg 子进程
 - 输出 JSON 包含输入、推理和 dropped-frame 指标
 
-下一验收点是 persistent ADB PRESS / RELEASE 的真机行为与 Armed 闭环。
+基础链路已通过。下一验收点是 failure replay：把同一 Run 的 MP4 与 JSON 对齐，判断第二弯持续高 PRESS probability 的真实视觉原因。

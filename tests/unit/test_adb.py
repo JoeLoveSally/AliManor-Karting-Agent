@@ -1,3 +1,4 @@
+import io
 import subprocess
 
 import cv2
@@ -7,6 +8,8 @@ import pytest
 from karting_agent.data_flow.adb import AdbClient, AdbConfig, AdbError, parse_screen_size
 from karting_agent.data_flow.execute.adb import AdbExecutor
 from karting_agent.data_flow.input.adb import AdbInput
+from karting_agent.data_flow.input.adb_video import AdbVideoConfig, AdbVideoInput, _read_exact
+from karting_agent.data_flow.input.common import Frame
 
 
 def test_parse_screen_size_prefers_override() -> None:
@@ -78,3 +81,49 @@ def test_adb_executor_sends_state_changes_only() -> None:
     ]
     assert executor.pressed is False
     assert len(executor.execute_latencies_ms) == 2
+
+
+def test_adb_video_input_builds_scaled_screenrecord_command() -> None:
+    client = AdbClient(AdbConfig(serial="SERIAL123"))
+    video = AdbVideoInput(
+        client,
+        screen_size=(1440, 3200),
+        config=AdbVideoConfig(decode_width=720, bit_rate=4_000_000),
+    )
+
+    assert video.decode_width == 720
+    assert video.decode_height == 1600
+    assert video._recorder_command() == (
+        "adb",
+        "-s",
+        "SERIAL123",
+        "exec-out",
+        "screenrecord",
+        "--output-format=h264",
+        "--size=720x1600",
+        "--bit-rate=4000000",
+        "--time-limit=0",
+        "-",
+    )
+
+
+def test_adb_video_input_replaces_stale_frame() -> None:
+    client = AdbClient()
+    video = AdbVideoInput(client, screen_size=(20, 40))
+    image = np.zeros((4, 2, 3), dtype=np.uint8)
+    first = Frame(image=image, frame_index=0, timestamp_ms=0.0)
+    second = Frame(image=image, frame_index=1, timestamp_ms=10.0)
+
+    video._offer_latest(first)
+    video._offer_latest(second)
+
+    assert video.dropped_frames == 1
+    assert video._frames.get_nowait().frame_index == 1
+
+
+def test_read_exact_collects_partial_chunks() -> None:
+    class PartialReader(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            return super().read(min(size, 2))
+
+    assert _read_exact(PartialReader(b"abcdef"), 6) == b"abcdef"

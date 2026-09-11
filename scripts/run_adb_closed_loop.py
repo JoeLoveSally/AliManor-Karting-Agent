@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the development-only ADB screenshot/touch closed-loop POC."""
+"""Run the development-only ADB video/screenshot closed-loop POC."""
 
 from __future__ import annotations
 
@@ -19,25 +19,50 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from karting_agent.control.controller import ControlAction, HysteresisConfig, HysteresisController
-from karting_agent.data_flow.adb import AdbClient, AdbConfig
-from karting_agent.data_flow.execute.adb import AdbExecutor
-from karting_agent.data_flow.execute.mock import MockExecutor
-from karting_agent.data_flow.input.adb import AdbInput
-from karting_agent.model.runner import ModelRunner
-from karting_agent.runtime.engine import RuntimeEngine, RuntimeEngineConfig
+from karting_agent.control.controller import (  # noqa: E402
+    ControlAction,
+    HysteresisConfig,
+    HysteresisController,
+)
+from karting_agent.data_flow.adb import AdbClient, AdbConfig  # noqa: E402
+from karting_agent.data_flow.execute.adb import AdbExecutor  # noqa: E402
+from karting_agent.data_flow.execute.mock import MockExecutor  # noqa: E402
+from karting_agent.data_flow.input.adb import AdbInput  # noqa: E402
+from karting_agent.data_flow.input.adb_video import (  # noqa: E402
+    AdbVideoConfig,
+    AdbVideoInput,
+)
+from karting_agent.model.runner import ModelRunner  # noqa: E402
+from karting_agent.runtime.engine import RuntimeEngine, RuntimeEngineConfig  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ADB closed-loop POC.")
-    parser.add_argument("--runtime-config", type=Path, default=ROOT / "configs" / "runtime.yaml")
-    parser.add_argument("--hardware-config", type=Path, default=ROOT / "configs" / "hardware.yaml")
-    parser.add_argument("--execute-config", type=Path, default=ROOT / "configs" / "execute.yaml")
+    parser.add_argument(
+        "--runtime-config",
+        type=Path,
+        default=ROOT / "configs" / "runtime.yaml",
+    )
+    parser.add_argument(
+        "--hardware-config",
+        type=Path,
+        default=ROOT / "configs" / "hardware.yaml",
+    )
+    parser.add_argument(
+        "--execute-config",
+        type=Path,
+        default=ROOT / "configs" / "execute.yaml",
+    )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--input", choices=("video", "screencap"), default="video")
     parser.add_argument("--adb", type=str, default=None)
     parser.add_argument("--serial", type=str, default=None)
+    parser.add_argument("--ffmpeg", type=str, default=None)
+    parser.add_argument("--decode-width", type=int, default=None)
+    parser.add_argument("--video-bit-rate", type=int, default=None)
+    parser.add_argument("--video-warmup-seconds", type=float, default=None)
     parser.add_argument("--x", type=int, default=None)
     parser.add_argument("--y", type=int, default=None)
     parser.add_argument("--max-seconds", type=float, default=5.0)
@@ -72,6 +97,34 @@ def resolve_adb_config(raw: dict[str, object], args: argparse.Namespace) -> AdbC
     return config
 
 
+def resolve_adb_video_config(
+    raw: dict[str, object],
+    args: argparse.Namespace,
+) -> AdbVideoConfig:
+    video = nested_mapping(raw, "adb_video")
+    config = AdbVideoConfig(
+        ffmpeg_executable=args.ffmpeg or str(video.get("ffmpeg_executable", "ffmpeg")),
+        decode_width=(
+            args.decode_width
+            if args.decode_width is not None
+            else int(video.get("decode_width", 720))
+        ),
+        bit_rate=(
+            args.video_bit_rate
+            if args.video_bit_rate is not None
+            else int(video.get("bit_rate", 8_000_000))
+        ),
+        frame_timeout_seconds=float(video.get("frame_timeout_seconds", 3.0)),
+        warmup_seconds=(
+            args.video_warmup_seconds
+            if args.video_warmup_seconds is not None
+            else float(video.get("warmup_seconds", 0.5))
+        ),
+    )
+    config.validate()
+    return config
+
+
 def resolve_controller_config(raw: dict[str, object]) -> HysteresisConfig:
     control = nested_mapping(raw, "control")
     config = HysteresisConfig(
@@ -82,7 +135,10 @@ def resolve_controller_config(raw: dict[str, object]) -> HysteresisConfig:
     return config
 
 
-def resolve_coordinates(raw: dict[str, object], args: argparse.Namespace) -> tuple[int, int] | None:
+def resolve_coordinates(
+    raw: dict[str, object],
+    args: argparse.Namespace,
+) -> tuple[int, int] | None:
     adb = nested_mapping(raw, "adb")
     x = args.x if args.x is not None else adb.get("x")
     y = args.y if args.y is not None else adb.get("y")
@@ -128,12 +184,15 @@ def main() -> int:
 
     coordinates = resolve_coordinates(execute_raw, args)
     if args.arm and coordinates is None:
-        raise ValueError("--arm requires explicit ADB touch coordinates via --x/--y or execute.yaml")
+        raise ValueError(
+            "--arm requires explicit ADB touch coordinates via --x/--y or execute.yaml"
+        )
     if coordinates is not None:
         x, y = coordinates
         if x >= screen_width or y >= screen_height:
             raise ValueError(
-                f"touch coordinate ({x}, {y}) is outside screen {screen_width}x{screen_height}"
+                f"touch coordinate ({x}, {y}) is outside screen "
+                f"{screen_width}x{screen_height}"
             )
 
     model = ModelRunner(args.model, metadata_path=args.metadata, device=args.device)
@@ -158,11 +217,26 @@ def main() -> int:
             prediction_horizon_ms=model.spec.prediction_horizon_ms,
         ),
     )
-    adb_input = AdbInput(client)
+
+    video_input: AdbVideoInput | None = None
+    if args.input == "video":
+        video_config = resolve_adb_video_config(hardware_raw, args)
+        video_input = AdbVideoInput(
+            client,
+            screen_size=(screen_width, screen_height),
+            config=video_config,
+        )
+        adb_input = video_input
+    else:
+        adb_input = AdbInput(client)
 
     mode = "ARMED" if args.arm else "DRY-RUN"
-    print(f"Mode: {mode}", flush=True)
-    print(f"ADB: serial={client.config.serial or '<default>'}; screen={screen_width}x{screen_height}", flush=True)
+    print(f"Mode: {mode}; input={args.input}", flush=True)
+    print(
+        f"ADB: serial={client.config.serial or '<default>'}; "
+        f"screen={screen_width}x{screen_height}",
+        flush=True,
+    )
     if coordinates is not None:
         print(f"Touch: x={coordinates[0]}, y={coordinates[1]}", flush=True)
     print(
@@ -179,18 +253,56 @@ def main() -> int:
     )
 
     steps = []
-    started = time.perf_counter()
+    input_frames = 0
+    read_frame_timestamps_ms: list[float] = []
     stop_reason = "duration"
     shutdown_error: str | None = None
     safety_release = False
+    started: float | None = None
+    decoded_start = 0
+    dropped_start = 0
+    interval_start = 0
+
     try:
+        pending_frame = None
+        if video_input is not None:
+            pending_frame = video_input.read()
+            if video_input.config.warmup_seconds:
+                time.sleep(video_input.config.warmup_seconds)
+                pending_frame = video_input.read()
+            decoded_start = video_input.decoded_frames
+            dropped_start = video_input.dropped_frames
+            interval_start = len(video_input.decode_intervals_ms)
+            print(
+                f"Video input: {video_input.decode_width}x{video_input.decode_height}, "
+                f"bit_rate={video_input.config.bit_rate}, "
+                f"startup={video_input.startup_ms:.1f}ms, "
+                f"warmup={video_input.config.warmup_seconds:g}s",
+                flush=True,
+            )
+
+        started = time.perf_counter()
         while time.perf_counter() - started < args.max_seconds:
-            frame = adb_input.read()
+            if pending_frame is None:
+                frame = adb_input.read()
+            else:
+                frame = pending_frame
+                pending_frame = None
+
+            input_frames += 1
+            read_frame_timestamps_ms.append(frame.timestamp_ms)
             step = engine.ingest(frame)
             if step is None:
                 continue
             steps.append(step)
             if args.verbose or step.action is not ControlAction.HOLD:
+                if video_input is None:
+                    input_detail = f"capture={adb_input.last_capture_ms:.1f}ms "
+                else:
+                    input_detail = (
+                        f"source_frame={frame.frame_index} "
+                        f"dropped={video_input.dropped_frames - dropped_start} "
+                    )
                 suffix = ""
                 if args.arm and step.action is not ControlAction.HOLD:
                     suffix = f" exec={executor.last_execute_ms:.1f}ms"
@@ -198,7 +310,7 @@ def main() -> int:
                     f"t={step.observation_timestamp_ms:8.1f}ms "
                     f"p={step.probability:.3f} action={step.action.value:<7} "
                     f"state={'PRESS' if step.pressed else 'RELEASE':<7} "
-                    f"capture={adb_input.last_capture_ms:.1f}ms "
+                    f"{input_detail}"
                     f"infer={step.inference_ms:.2f}ms{suffix}",
                     flush=True,
                 )
@@ -208,35 +320,77 @@ def main() -> int:
     finally:
         try:
             safety_release = engine.shutdown()
-        except Exception as exc:  # preserve observability if ADB disappears during shutdown
+        except Exception as exc:
             shutdown_error = str(exc)
             print(f"WARNING: safety RELEASE failed: {exc}", file=sys.stderr, flush=True)
         adb_input.close()
 
-    elapsed = time.perf_counter() - started
-    capture_stats = stats(adb_input.capture_latencies_ms)
+    elapsed = time.perf_counter() - started if started is not None else 0.0
     inference_stats = stats([step.inference_ms for step in steps])
     execute_stats = stats(executor.execute_latencies_ms) if args.arm else stats([])
     state_changes = sum(step.action is not ControlAction.HOLD for step in steps)
-    capture_fps = len(adb_input.capture_latencies_ms) / elapsed if elapsed > 0 else 0.0
     control_fps = len(steps) / elapsed if elapsed > 0 else 0.0
 
-    print(
-        "Summary: "
-        f"elapsed={elapsed:.2f}s frames={len(adb_input.capture_latencies_ms)} "
-        f"steps={len(steps)} state_changes={state_changes} "
-        f"capture_fps={capture_fps:.1f} control_fps={control_fps:.1f} "
-        f"capture_mean={capture_stats['mean_ms']:.1f}ms "
-        f"capture_p95={capture_stats['p95_ms']:.1f}ms "
-        f"infer_mean={inference_stats['mean_ms']:.2f}ms "
-        f"infer_p95={inference_stats['p95_ms']:.2f}ms "
-        f"safety_release={safety_release}",
-        flush=True,
-    )
+    if video_input is not None:
+        decode_intervals = video_input.decode_intervals_ms[interval_start:]
+        frame_interval_stats = stats(decode_intervals)
+        input_fps = (
+            1000.0 / frame_interval_stats["mean_ms"]
+            if frame_interval_stats["mean_ms"] > 0
+            else 0.0
+        )
+        decoded_frames = max(0, video_input.decoded_frames - decoded_start)
+        dropped_frames = max(0, video_input.dropped_frames - dropped_start)
+        capture_payload = {
+            "mode": "video",
+            "frames_read": input_frames,
+            "decoded_frames": decoded_frames,
+            "dropped_frames": dropped_frames,
+            "fps": input_fps,
+            "startup_ms": video_input.startup_ms,
+            "resolution": [video_input.decode_width, video_input.decode_height],
+            "frame_interval_ms": frame_interval_stats,
+        }
+        print(
+            "Summary: "
+            f"elapsed={elapsed:.2f}s frames_read={input_frames} "
+            f"decoded={decoded_frames} dropped={dropped_frames} "
+            f"input_fps={input_fps:.1f} "
+            f"frame_p95={frame_interval_stats['p95_ms']:.1f}ms "
+            f"steps={len(steps)} control_fps={control_fps:.1f} "
+            f"state_changes={state_changes} "
+            f"infer_mean={inference_stats['mean_ms']:.2f}ms "
+            f"infer_p95={inference_stats['p95_ms']:.2f}ms "
+            f"safety_release={safety_release}",
+            flush=True,
+        )
+    else:
+        capture_stats = stats(adb_input.capture_latencies_ms)
+        capture_fps = input_frames / elapsed if elapsed > 0 else 0.0
+        capture_payload = {
+            "mode": "screencap",
+            "frames": input_frames,
+            "fps": capture_fps,
+            **capture_stats,
+        }
+        print(
+            "Summary: "
+            f"elapsed={elapsed:.2f}s frames={input_frames} "
+            f"steps={len(steps)} state_changes={state_changes} "
+            f"capture_fps={capture_fps:.1f} control_fps={control_fps:.1f} "
+            f"capture_mean={capture_stats['mean_ms']:.1f}ms "
+            f"capture_p95={capture_stats['p95_ms']:.1f}ms "
+            f"infer_mean={inference_stats['mean_ms']:.2f}ms "
+            f"infer_p95={inference_stats['p95_ms']:.2f}ms "
+            f"safety_release={safety_release}",
+            flush=True,
+        )
+
     if args.arm:
         print(
             f"Execute: mean={execute_stats['mean_ms']:.1f}ms "
-            f"p95={execute_stats['p95_ms']:.1f}ms max={execute_stats['max_ms']:.1f}ms",
+            f"p95={execute_stats['p95_ms']:.1f}ms "
+            f"max={execute_stats['max_ms']:.1f}ms",
             flush=True,
         )
 
@@ -244,10 +398,15 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "mode": mode,
+        "input_mode": args.input,
         "stop_reason": stop_reason,
         "elapsed_seconds": elapsed,
         "screen_size": [screen_width, screen_height],
-        "touch": None if coordinates is None else {"x": coordinates[0], "y": coordinates[1]},
+        "touch": (
+            None
+            if coordinates is None
+            else {"x": coordinates[0], "y": coordinates[1]}
+        ),
         "runtime": {
             "target_fps": target_fps,
             "press_threshold": controller_config.press_threshold,
@@ -255,12 +414,17 @@ def main() -> int:
             "prediction_horizon_ms": model.spec.prediction_horizon_ms,
             "frame_offsets_ms": model.spec.frame_offsets_ms,
         },
-        "capture": {"frames": len(adb_input.capture_latencies_ms), "fps": capture_fps, **capture_stats},
-        "inference": {"steps": len(steps), "fps": control_fps, **inference_stats},
+        "capture": capture_payload,
+        "inference": {
+            "steps": len(steps),
+            "fps": control_fps,
+            **inference_stats,
+        },
         "execute": execute_stats if args.arm else None,
         "state_changes": state_changes,
         "safety_release": safety_release,
         "shutdown_error": shutdown_error,
+        "read_frame_timestamps_ms": read_frame_timestamps_ms,
         "steps": [
             {**asdict(step), "action": step.action.value}
             for step in steps

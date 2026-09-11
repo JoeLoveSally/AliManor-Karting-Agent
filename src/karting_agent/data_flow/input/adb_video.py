@@ -22,7 +22,7 @@ PopenFactory = Callable[..., subprocess.Popen[bytes]]
 @dataclass(frozen=True)
 class AdbVideoConfig:
     ffmpeg_executable: str = "ffmpeg"
-    decode_width: int = 720
+    decode_width: int = 360
     bit_rate: int = 8_000_000
     startup_timeout_seconds: float = 15.0
     frame_timeout_seconds: float = 3.0

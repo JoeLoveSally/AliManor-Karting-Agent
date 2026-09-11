@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seconds", type=float, default=5.0)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--arm", action="store_true", help="Enable real ADB DOWN/UP events.")
+    parser.add_argument(
+        "--wait-for-start",
+        action="store_true",
+        help="Warm the realtime pipeline, then wait for Enter before starting control.",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -174,6 +179,8 @@ def main() -> int:
     args = parse_args()
     if args.max_seconds <= 0:
         raise ValueError("--max-seconds must be > 0")
+    if args.wait_for_start and not args.arm:
+        raise ValueError("--wait-for-start requires --arm")
 
     runtime_raw = load_mapping(args.runtime_config)
     hardware_raw = load_mapping(args.hardware_config)
@@ -275,9 +282,6 @@ def main() -> int:
             if video_input.config.warmup_seconds:
                 time.sleep(video_input.config.warmup_seconds)
                 pending_frame = video_input.read()
-            decoded_start = video_input.decoded_frames
-            dropped_start = video_input.dropped_frames
-            interval_start = len(video_input.decode_intervals_ms)
             print(
                 f"Video input: {video_input.decode_width}x{video_input.decode_height}, "
                 f"bit_rate={video_input.config.bit_rate}, "
@@ -288,6 +292,22 @@ def main() -> int:
 
         if args.arm:
             executor.start()
+
+        if args.wait_for_start:
+            print(
+                "READY: realtime input, model and ADB executor are warm. "
+                "Enter the race, then press Enter when the 3-second countdown ends.",
+                flush=True,
+            )
+            input()
+            if video_input is not None:
+                pending_frame = video_input.read()
+            print("START: closed-loop control enabled.", flush=True)
+
+        if video_input is not None:
+            decoded_start = video_input.decoded_frames
+            dropped_start = video_input.dropped_frames
+            interval_start = len(video_input.decode_intervals_ms)
 
         started = time.perf_counter()
         while time.perf_counter() - started < args.max_seconds:
@@ -418,6 +438,7 @@ def main() -> int:
     payload = {
         "mode": mode,
         "input_mode": args.input,
+        "wait_for_start": args.wait_for_start,
         "stop_reason": stop_reason,
         "elapsed_seconds": elapsed,
         "screen_size": [screen_width, screen_height],

@@ -59,25 +59,63 @@ def test_adb_input_decodes_png_into_bgr_frame() -> None:
     assert len(adb_input.capture_latencies_ms) == 1
 
 
-def test_adb_executor_sends_state_changes_only() -> None:
-    class FakeClient:
+def test_adb_executor_uses_one_persistent_shell_and_sends_state_changes_only() -> None:
+    class FakeStdin:
         def __init__(self) -> None:
-            self.commands: list[tuple[str, ...]] = []
+            self.writes: list[bytes] = []
 
-        def run(self, *args: str) -> bytes:
-            self.commands.append(args)
-            return b""
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
 
-    client = FakeClient()
-    executor = AdbExecutor(client, x=100, y=200)  # type: ignore[arg-type]
+        def flush(self) -> None:
+            return None
 
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    calls = []
+    process = FakeProcess()
+
+    def popen_factory(command, **kwargs):
+        calls.append((command, kwargs))
+        return process
+
+    client = AdbClient(AdbConfig(serial="SERIAL123"))
+    executor = AdbExecutor(
+        client,
+        x=100,
+        y=200,
+        popen_factory=popen_factory,  # type: ignore[arg-type]
+    )
+
+    executor.start()
     executor.set_pressed(True)
     executor.set_pressed(True)
     executor.set_pressed(False)
+    executor.close()
 
-    assert client.commands == [
-        ("shell", "input", "motionevent", "DOWN", "100", "200"),
-        ("shell", "input", "motionevent", "UP", "100", "200"),
+    assert len(calls) == 1
+    assert calls[0][0] == ("adb", "-s", "SERIAL123", "shell")
+    assert process.stdin.writes == [
+        b"input motionevent DOWN 100 200\n",
+        b"input motionevent UP 100 200\n",
+        b"exit\n",
     ]
     assert executor.pressed is False
     assert len(executor.execute_latencies_ms) == 2

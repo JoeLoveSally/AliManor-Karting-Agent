@@ -155,7 +155,7 @@ def test_adb_video_input_records_same_stream_to_fragmented_mp4(tmp_path: Path) -
     )
 
     command = video._ffmpeg_command()
-    assert command[:12] == (
+    assert command[:11] == (
         "ffmpeg",
         "-loglevel",
         "error",
@@ -168,18 +168,17 @@ def test_adb_video_input_records_same_stream_to_fragmented_mp4(tmp_path: Path) -
         "-i",
         "pipe:0",
     )
-    assert (
+    assert command[11:20] == (
+        "-map",
+        "0:v:0",
+        "-an",
         "-c:v",
         "copy",
         "-movflags",
         "+frag_keyframe+empty_moov+default_base_moof",
-    ) == (
-        command[15],
-        command[16],
-        command[17],
-        command[18],
+        "-y",
+        str(record_path.resolve()),
     )
-    assert str(record_path.resolve()) in command
     assert command[-8:] == (
         "-map",
         "0:v:0",

@@ -73,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Warm the realtime pipeline, then wait for Enter before starting control.",
     )
+    parser.add_argument(
+        "--record-debug",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Save the same Android H.264 stream as MP4 next to the JSON run artifact. "
+            "Defaults to enabled for armed video runs."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -182,6 +191,18 @@ def main() -> int:
     if args.wait_for_start and not args.arm:
         raise ValueError("--wait-for-start requires --arm")
 
+    record_debug = (
+        args.record_debug
+        if args.record_debug is not None
+        else bool(args.arm and args.input == "video")
+    )
+    if record_debug and args.input != "video":
+        raise ValueError("--record-debug requires --input video")
+
+    output_path = args.output.resolve() if args.output is not None else default_output()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    recording_path = output_path.with_suffix(".mp4") if record_debug else None
+
     runtime_raw = load_mapping(args.runtime_config)
     hardware_raw = load_mapping(args.hardware_config)
     execute_raw = load_mapping(args.execute_config)
@@ -233,6 +254,7 @@ def main() -> int:
             client,
             screen_size=(screen_width, screen_height),
             config=video_config,
+            record_path=recording_path,
         )
         adb_input = video_input
     else:
@@ -259,6 +281,8 @@ def main() -> int:
         f"release<={controller_config.release_threshold:.2f}",
         flush=True,
     )
+    if recording_path is not None:
+        print(f"Debug recording: {recording_path}", flush=True)
 
     steps = []
     input_frames = 0
@@ -274,6 +298,8 @@ def main() -> int:
     dropped_end = 0
     interval_start = 0
     interval_end = 0
+    control_start_source_frame: int | None = None
+    control_start_timestamp_ms: float | None = None
 
     try:
         pending_frame = None
@@ -305,6 +331,10 @@ def main() -> int:
             print("START: closed-loop control enabled.", flush=True)
 
         if video_input is not None:
+            if pending_frame is None:
+                pending_frame = video_input.read()
+            control_start_source_frame = pending_frame.frame_index
+            control_start_timestamp_ms = pending_frame.timestamp_ms
             decoded_start = video_input.decoded_frames
             dropped_start = video_input.dropped_frames
             interval_start = len(video_input.decode_intervals_ms)
@@ -433,8 +463,23 @@ def main() -> int:
             flush=True,
         )
 
-    output_path = args.output.resolve() if args.output is not None else default_output()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    recording_payload = (
+        {
+            "path": str(recording_path),
+            "format": "mp4",
+            "codec": "h264",
+            "resolution": (
+                [video_input.decode_width, video_input.decode_height]
+                if video_input is not None
+                else None
+            ),
+            "includes_pre_control": True,
+            "control_start_source_frame": control_start_source_frame,
+            "control_start_timestamp_ms": control_start_timestamp_ms,
+        }
+        if recording_path is not None
+        else None
+    )
     payload = {
         "mode": mode,
         "input_mode": args.input,
@@ -455,6 +500,7 @@ def main() -> int:
             "frame_offsets_ms": model.spec.frame_offsets_ms,
         },
         "capture": capture_payload,
+        "recording": recording_payload,
         "inference": {
             "steps": len(steps),
             "fps": control_fps,
@@ -476,6 +522,8 @@ def main() -> int:
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Run: {output_path}", flush=True)
+    if recording_path is not None:
+        print(f"Recording: {recording_path}", flush=True)
     return 0 if shutdown_error is None else 2
 
 

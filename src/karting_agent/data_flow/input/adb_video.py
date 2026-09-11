@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Full, Queue
 import shutil
 import subprocess
@@ -44,7 +45,12 @@ class AdbVideoConfig:
 
 
 class AdbVideoInput:
-    """Decode Android ``screenrecord`` H.264 into a latest-frame BGR stream."""
+    """Decode Android ``screenrecord`` H.264 into a latest-frame BGR stream.
+
+    When ``record_path`` is provided, the same H.264 stream is copied into a
+    fragmented MP4 while it is decoded for Runtime.  Recording therefore adds
+    no second Android encoder and no CPU video re-encode.
+    """
 
     def __init__(
         self,
@@ -52,6 +58,7 @@ class AdbVideoInput:
         *,
         screen_size: tuple[int, int],
         config: AdbVideoConfig | None = None,
+        record_path: Path | None = None,
         popen_factory: PopenFactory = subprocess.Popen,
     ) -> None:
         screen_width, screen_height = screen_size
@@ -64,6 +71,9 @@ class AdbVideoInput:
         self.decode_width = min(self.config.decode_width, screen_width)
         scaled_height = screen_height * self.decode_width / screen_width
         self.decode_height = max(2, int(round(scaled_height / 2.0) * 2))
+        self.record_path = Path(record_path).resolve() if record_path is not None else None
+        if self.record_path is not None and self.record_path.suffix.lower() != ".mp4":
+            raise ValueError("ADB debug recording path must use .mp4")
         self._popen_factory = popen_factory
 
         self._recorder: subprocess.Popen[bytes] | None = None
@@ -97,28 +107,54 @@ class AdbVideoInput:
         )
 
     def _ffmpeg_command(self) -> tuple[str, ...]:
-        return (
+        command: list[str] = [
             self.config.ffmpeg_executable,
             "-loglevel",
             "error",
+            "-use_wallclock_as_timestamps",
+            "1",
             "-f",
             "h264",
             "-flags",
             "low_delay",
             "-i",
             "pipe:0",
-            "-pix_fmt",
-            "bgr24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
+        ]
+        if self.record_path is not None:
+            command.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-an",
+                    "-c:v",
+                    "copy",
+                    "-movflags",
+                    "+frag_keyframe+empty_moov+default_base_moof",
+                    "-y",
+                    str(self.record_path),
+                ]
+            )
+        command.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-an",
+                "-pix_fmt",
+                "bgr24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
         )
+        return tuple(command)
 
     def _start(self) -> None:
         if self.started:
             return
         if shutil.which(self.config.ffmpeg_executable) is None:
             raise RuntimeError(f"FFmpeg executable not found: {self.config.ffmpeg_executable}")
+        if self.record_path is not None:
+            self.record_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._origin = time.perf_counter()
         try:

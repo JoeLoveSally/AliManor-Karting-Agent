@@ -107,7 +107,7 @@ def resolve_adb_video_config(
         decode_width=(
             args.decode_width
             if args.decode_width is not None
-            else int(video.get("decode_width", 720))
+            else int(video.get("decode_width", 360))
         ),
         bit_rate=(
             args.video_bit_rate
@@ -260,9 +260,13 @@ def main() -> int:
     shutdown_error: str | None = None
     safety_release = False
     started: float | None = None
+    ended: float | None = None
     decoded_start = 0
+    decoded_end = 0
     dropped_start = 0
+    dropped_end = 0
     interval_start = 0
+    interval_end = 0
 
     try:
         pending_frame = None
@@ -281,6 +285,9 @@ def main() -> int:
                 f"warmup={video_input.config.warmup_seconds:g}s",
                 flush=True,
             )
+
+        if args.arm:
+            executor.start()
 
         started = time.perf_counter()
         while time.perf_counter() - started < args.max_seconds:
@@ -306,7 +313,7 @@ def main() -> int:
                     )
                 suffix = ""
                 if args.arm and step.action is not ControlAction.HOLD:
-                    suffix = f" exec={executor.last_execute_ms:.1f}ms"
+                    suffix = f" enqueue={executor.last_execute_ms:.2f}ms"
                 print(
                     f"t={step.observation_timestamp_ms:8.1f}ms "
                     f"p={step.probability:.3f} action={step.action.value:<7} "
@@ -319,29 +326,40 @@ def main() -> int:
         stop_reason = "keyboard_interrupt"
         print("Interrupted; requesting safety RELEASE...", flush=True)
     finally:
+        ended = time.perf_counter() if started is not None else None
+        if video_input is not None:
+            decoded_end = video_input.decoded_frames
+            dropped_end = video_input.dropped_frames
+            interval_end = len(video_input.decode_intervals_ms)
         try:
             safety_release = engine.shutdown()
         except Exception as exc:
             shutdown_error = str(exc)
             print(f"WARNING: safety RELEASE failed: {exc}", file=sys.stderr, flush=True)
         adb_input.close()
+        if args.arm:
+            executor.close()
 
-    elapsed = time.perf_counter() - started if started is not None else 0.0
+    elapsed = (
+        ended - started
+        if started is not None and ended is not None
+        else 0.0
+    )
     inference_stats = stats([step.inference_ms for step in steps])
     execute_stats = stats(executor.execute_latencies_ms) if args.arm else stats([])
     state_changes = sum(step.action is not ControlAction.HOLD for step in steps)
     control_fps = len(steps) / elapsed if elapsed > 0 else 0.0
 
     if video_input is not None:
-        decode_intervals = video_input.decode_intervals_ms[interval_start:]
+        decode_intervals = video_input.decode_intervals_ms[interval_start:interval_end]
         frame_interval_stats = stats(decode_intervals)
         input_fps = (
             1000.0 / frame_interval_stats["mean_ms"]
             if frame_interval_stats["mean_ms"] > 0
             else 0.0
         )
-        decoded_frames = max(0, video_input.decoded_frames - decoded_start)
-        dropped_frames = max(0, video_input.dropped_frames - dropped_start)
+        decoded_frames = max(0, decoded_end - decoded_start)
+        dropped_frames = max(0, dropped_end - dropped_start)
         capture_payload = {
             "mode": "video",
             "frames_read": input_frames,
@@ -389,9 +407,9 @@ def main() -> int:
 
     if args.arm:
         print(
-            f"Execute: mean={execute_stats['mean_ms']:.1f}ms "
-            f"p95={execute_stats['p95_ms']:.1f}ms "
-            f"max={execute_stats['max_ms']:.1f}ms",
+            f"Execute enqueue: mean={execute_stats['mean_ms']:.2f}ms "
+            f"p95={execute_stats['p95_ms']:.2f}ms "
+            f"max={execute_stats['max_ms']:.2f}ms",
             flush=True,
         )
 
@@ -421,7 +439,11 @@ def main() -> int:
             "fps": control_fps,
             **inference_stats,
         },
-        "execute": execute_stats if args.arm else None,
+        "execute": (
+            {"semantics": "persistent_shell_enqueue", **execute_stats}
+            if args.arm
+            else None
+        ),
         "state_changes": state_changes,
         "safety_release": safety_release,
         "shutdown_error": shutdown_error,

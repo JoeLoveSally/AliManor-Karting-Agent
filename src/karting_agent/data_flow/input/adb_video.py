@@ -48,7 +48,7 @@ class AdbVideoInput:
     """Decode Android ``screenrecord`` H.264 into a latest-frame BGR stream.
 
     When ``record_path`` is provided, the same H.264 stream is copied into a
-    fragmented MP4 while it is decoded for Runtime.  Recording therefore adds
+    fragmented MP4 while it is decoded for Runtime. Recording therefore adds
     no second Android encoder and no CPU video re-encode.
     """
 
@@ -80,6 +80,7 @@ class AdbVideoInput:
         self._ffmpeg: subprocess.Popen[bytes] | None = None
         self._reader: Thread | None = None
         self._stop = Event()
+        self._closing = Event()
         self._frames: Queue[Frame] = Queue(maxsize=1)
         self._origin: float | None = None
         self._first_frame_at: float | None = None
@@ -225,7 +226,7 @@ class AdbVideoInput:
             while not self._stop.is_set():
                 content = _read_exact(self._ffmpeg.stdout, frame_size)
                 if len(content) != frame_size:
-                    if not self._stop.is_set():
+                    if not self._closing.is_set() and not self._stop.is_set():
                         self._error = self._process_error() or "Android video stream ended"
                     return
 
@@ -252,7 +253,7 @@ class AdbVideoInput:
                 self.decoded_frames += 1
                 self._offer_latest(frame)
         except Exception as exc:
-            if not self._stop.is_set():
+            if not self._closing.is_set() and not self._stop.is_set():
                 self._error = f"ADB video frame reader failed: {exc}"
 
     def _offer_latest(self, frame: Frame) -> None:
@@ -277,19 +278,37 @@ class AdbVideoInput:
             return f"{label} exited with code {process.returncode}: {detail}".rstrip()
         return None
 
+    @staticmethod
+    def _wait_or_kill(process: subprocess.Popen[bytes], timeout: float) -> None:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
     def close(self) -> None:
-        self._stop.set()
-        for process in (self._recorder, self._ffmpeg):
-            if process is not None and process.poll() is None:
-                process.terminate()
-        for process in (self._recorder, self._ffmpeg):
-            if process is None:
-                continue
+        """Stop screen capture and let FFmpeg drain/finalize the debug MP4."""
+        self._closing.set()
+
+        recorder = self._recorder
+        ffmpeg = self._ffmpeg
+
+        # Stop the producer first. Once the ADB stdout pipe closes, FFmpeg sees
+        # EOF, drains the remaining H.264 packets, flushes decoded raw frames,
+        # and finalizes the current MP4 fragment. The reader must stay alive
+        # during this phase or FFmpeg can block on its rawvideo stdout pipe.
+        if recorder is not None and recorder.poll() is None:
+            recorder.terminate()
+            self._wait_or_kill(recorder, timeout=2)
+
+        if ffmpeg is not None and ffmpeg.poll() is None:
             try:
-                process.wait(timeout=3)
+                ffmpeg.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+                ffmpeg.terminate()
+                self._wait_or_kill(ffmpeg, timeout=2)
+
+        self._stop.set()
         if self._reader is not None:
             self._reader.join(timeout=2)
 

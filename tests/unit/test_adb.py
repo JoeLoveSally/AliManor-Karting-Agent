@@ -1,4 +1,5 @@
 import io
+from pathlib import Path
 import subprocess
 
 import cv2
@@ -143,6 +144,61 @@ def test_adb_video_input_builds_scaled_screenrecord_command() -> None:
         "--time-limit=0",
         "-",
     )
+
+
+def test_adb_video_input_records_same_stream_to_fragmented_mp4(tmp_path: Path) -> None:
+    record_path = tmp_path / "run.mp4"
+    video = AdbVideoInput(
+        AdbClient(),
+        screen_size=(1440, 3200),
+        record_path=record_path,
+    )
+
+    command = video._ffmpeg_command()
+    assert command[:12] == (
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-f",
+        "h264",
+        "-flags",
+        "low_delay",
+        "-i",
+        "pipe:0",
+    )
+    assert (
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+    ) == (
+        command[15],
+        command[16],
+        command[17],
+        command[18],
+    )
+    assert str(record_path.resolve()) in command
+    assert command[-8:] == (
+        "-map",
+        "0:v:0",
+        "-an",
+        "-pix_fmt",
+        "bgr24",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    )
+
+
+def test_adb_video_input_rejects_non_mp4_recording_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must use .mp4"):
+        AdbVideoInput(
+            AdbClient(),
+            screen_size=(20, 40),
+            record_path=tmp_path / "run.mkv",
+        )
 
 
 def test_adb_video_input_replaces_stale_frame() -> None:

@@ -114,6 +114,7 @@ def resolve_adb_video_config(
             if args.video_bit_rate is not None
             else int(video.get("bit_rate", 8_000_000))
         ),
+        startup_timeout_seconds=float(video.get("startup_timeout_seconds", 15.0)),
         frame_timeout_seconds=float(video.get("frame_timeout_seconds", 3.0)),
         warmup_seconds=(
             args.video_warmup_seconds

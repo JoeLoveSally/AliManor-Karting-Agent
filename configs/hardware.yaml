@@ -7,5 +7,6 @@ adb_video:
   ffmpeg_executable: ffmpeg
   decode_width: 720
   bit_rate: 8000000
+  startup_timeout_seconds: 15.0
   frame_timeout_seconds: 3.0
   warmup_seconds: 0.5

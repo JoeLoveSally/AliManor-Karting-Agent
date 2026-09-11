@@ -24,6 +24,7 @@ class AdbVideoConfig:
     ffmpeg_executable: str = "ffmpeg"
     decode_width: int = 720
     bit_rate: int = 8_000_000
+    startup_timeout_seconds: float = 15.0
     frame_timeout_seconds: float = 3.0
     warmup_seconds: float = 0.5
 
@@ -34,6 +35,8 @@ class AdbVideoConfig:
             raise ValueError("decode_width must be > 0")
         if self.bit_rate <= 0:
             raise ValueError("bit_rate must be > 0")
+        if self.startup_timeout_seconds <= 0:
+            raise ValueError("startup_timeout_seconds must be > 0")
         if self.frame_timeout_seconds <= 0:
             raise ValueError("frame_timeout_seconds must be > 0")
         if self.warmup_seconds < 0:
@@ -152,8 +155,11 @@ class AdbVideoInput:
         self._reader.start()
 
     def read(self, timeout_seconds: float | None = None) -> Frame:
+        first_read = not self.started
         timeout = (
-            self.config.frame_timeout_seconds
+            self.config.startup_timeout_seconds
+            if timeout_seconds is None and first_read
+            else self.config.frame_timeout_seconds
             if timeout_seconds is None
             else float(timeout_seconds)
         )

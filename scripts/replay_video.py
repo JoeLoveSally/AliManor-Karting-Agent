@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -23,6 +24,28 @@ from karting_agent.runtime.engine import RuntimeEngine, RuntimeEngineConfig
 from karting_agent.runtime.replay import ReplayRunner
 
 
+class SelectedHorizonModel:
+    """Expose one multi-horizon model head through the runtime predict() protocol."""
+
+    def __init__(self, runner: ModelRunner, horizon_ms: float) -> None:
+        self.runner = runner
+        matches = [
+            index
+            for index, configured in enumerate(runner.spec.prediction_horizons_ms)
+            if math.isclose(configured, horizon_ms, abs_tol=1e-6)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"control horizon {horizon_ms:g}ms is not one of "
+                f"{runner.spec.prediction_horizons_ms}"
+            )
+        self.output_index = matches[0]
+        self.horizon_ms = runner.spec.prediction_horizons_ms[self.output_index]
+
+    def predict(self, inputs) -> float:
+        return self.runner.predict_all(inputs)[self.output_index]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Replay a video through the runtime pipeline."
@@ -38,6 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--max-seconds", type=float, default=None)
+    parser.add_argument(
+        "--control-horizon-ms",
+        type=float,
+        default=None,
+        help=(
+            "Select one output head from a multi-horizon artifact for replay. "
+            "Defaults to the artifact control_horizon_ms."
+        ),
+    )
     parser.add_argument(
         "--warmup-iterations",
         type=int,
@@ -88,14 +120,21 @@ def controller_config(runtime_raw: dict[str, object]) -> HysteresisConfig:
     return config
 
 
-def default_output(model_path: Path, video_path: Path) -> Path:
+def default_output(
+    model_path: Path,
+    video_path: Path,
+    *,
+    selected_horizon_ms: float,
+    horizon_overridden: bool,
+) -> Path:
     artifact_name = model_path.parent.name
+    suffix = f"_h{selected_horizon_ms:g}" if horizon_overridden else ""
     return (
         ROOT
         / "artifacts"
         / "replays"
         / artifact_name
-        / f"{video_path.stem}.json"
+        / f"{video_path.stem}{suffix}.json"
     )
 
 
@@ -103,6 +142,8 @@ def main() -> int:
     args = parse_args()
     if args.warmup_iterations < 0:
         raise ValueError("--warmup-iterations must be >= 0")
+    if args.control_horizon_ms is not None and args.control_horizon_ms < 0:
+        raise ValueError("--control-horizon-ms must be >= 0")
 
     runtime_raw = load_mapping(args.runtime_config)
     target_fps = float(runtime_raw.get("target_fps", 30.0))
@@ -115,6 +156,13 @@ def main() -> int:
         metadata_path=args.metadata,
         device=args.device,
     )
+    selected_horizon_ms = (
+        model.spec.control_horizon_ms
+        if args.control_horizon_ms is None
+        else args.control_horizon_ms
+    )
+    runtime_model = SelectedHorizonModel(model, selected_horizon_ms)
+    selected_horizon_ms = runtime_model.horizon_ms
     warmup_ms = (
         model.warmup(args.warmup_iterations)
         if args.warmup_iterations > 0
@@ -124,14 +172,14 @@ def main() -> int:
     controller = HysteresisController(hysteresis, initial_pressed=False)
     executor = MockExecutor()
     engine = RuntimeEngine(
-        model=model,
+        model=runtime_model,
         preprocess_config=model.spec.preprocess_config,
         controller=controller,
         executor=executor,
         config=RuntimeEngineConfig(
             target_fps=target_fps,
             frame_offsets_ms=model.spec.frame_offsets_ms,
-            prediction_horizon_ms=model.spec.prediction_horizon_ms,
+            prediction_horizon_ms=selected_horizon_ms,
         ),
     )
 
@@ -152,7 +200,8 @@ def main() -> int:
     print(
         "Temporal: "
         f"offsets={model.spec.frame_offsets_ms}, "
-        f"horizon={model.spec.prediction_horizon_ms:g}ms, "
+        f"horizon={selected_horizon_ms:g}ms, "
+        f"available_horizons={model.spec.prediction_horizons_ms}, "
         f"target_fps={target_fps:g}",
         flush=True,
     )
@@ -197,7 +246,12 @@ def main() -> int:
     output_path = (
         args.output.resolve()
         if args.output is not None
-        else default_output(model_path, args.video)
+        else default_output(
+            model_path,
+            args.video,
+            selected_horizon_ms=selected_horizon_ms,
+            horizon_overridden=args.control_horizon_ms is not None,
+        )
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -210,7 +264,9 @@ def main() -> int:
         },
         "temporal": {
             "frame_offsets_ms": model.spec.frame_offsets_ms,
-            "prediction_horizon_ms": model.spec.prediction_horizon_ms,
+            "prediction_horizon_ms": selected_horizon_ms,
+            "available_prediction_horizons_ms": model.spec.prediction_horizons_ms,
+            "artifact_control_horizon_ms": model.spec.control_horizon_ms,
             "target_fps": target_fps,
             "selection": (
                 "latest_decoded_frame_at_or_before_each_requested_timestamp"

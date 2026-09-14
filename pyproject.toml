@@ -38,9 +38,17 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-# Keep the repository lint gate focused on correctness-level defaults.  The
+# Keep the repository lint gate focused on correctness-level defaults. The
 # project predates Ruff's broader optional rule families (B/TRY/RUF/UP/etc.),
 # so enabling those implicitly makes unrelated legacy style debt block model
-# experiments.  Additional families should be adopted deliberately, not via
+# experiments. Additional families should be adopted deliberately, not via
 # tool-version or user-level configuration drift.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# CLI scripts intentionally prepend the repository's src directory before
+# importing karting_agent so they can run directly from a checkout.
+"scripts/*.py" = ["E402"]
+# A few tests call pytest.importorskip() before importing optional-dependency
+# modules, which is also intentionally after executable module-level code.
+"tests/*.py" = ["E402"]

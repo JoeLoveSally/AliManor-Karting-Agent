@@ -9,21 +9,31 @@ import cv2
 import numpy as np
 
 
+Roi = tuple[float, float, float, float]
+
+
+def _validate_roi(roi: Roi, name: str) -> None:
+    x0, y0, x1, y1 = roi
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+        raise ValueError(f"{name} must contain normalized coordinates in [0, 1]")
+
+
 @dataclass(frozen=True)
 class PreprocessConfig:
     input_width: int = 224
     input_height: int = 224
     mask_touch_area: bool = True
-    touch_roi: tuple[float, float, float, float] = (0.78, 0.82, 0.98, 0.98)
+    touch_roi: Roi = (0.78, 0.82, 0.98, 0.98)
+    mask_rois: tuple[Roi, ...] = ()
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     def validate(self) -> None:
         if self.input_width <= 0 or self.input_height <= 0:
             raise ValueError("input size must be positive")
-        x0, y0, x1, y1 = self.touch_roi
-        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
-            raise ValueError("touch_roi must contain normalized coordinates in [0, 1]")
+        _validate_roi(self.touch_roi, "touch_roi")
+        for index, roi in enumerate(self.mask_rois):
+            _validate_roi(roi, f"mask_rois[{index}]")
         if any(value <= 0 for value in self.std):
             raise ValueError("std values must be positive")
 
@@ -42,20 +52,27 @@ def preprocess_config_from_mapping(raw: dict[str, object]) -> PreprocessConfig:
     if len(roi) != 4:
         raise ValueError("preprocess.touch_roi must contain four values")
 
+    raw_mask_rois = preprocess.get("mask_rois", ())
+    if not isinstance(raw_mask_rois, (list, tuple)):
+        raise ValueError("preprocess.mask_rois must be a sequence")
+    mask_rois: list[Roi] = []
+    for index, raw_roi in enumerate(raw_mask_rois):
+        if not isinstance(raw_roi, (list, tuple)) or len(raw_roi) != 4:
+            raise ValueError(f"preprocess.mask_rois[{index}] must contain four values")
+        mask_rois.append(tuple(float(value) for value in raw_roi))
+
     config = PreprocessConfig(
         input_width=size,
         input_height=size,
         mask_touch_area=bool(preprocess.get("mask_touch_area", True)),
-        touch_roi=roi,
+        touch_roi=roi,  # type: ignore[arg-type]
+        mask_rois=tuple(mask_rois),
     )
     config.validate()
     return config
 
 
-def mask_touch_area(
-    frame: np.ndarray,
-    roi: tuple[float, float, float, float],
-) -> np.ndarray:
+def mask_area(frame: np.ndarray, roi: Roi) -> np.ndarray:
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError("frame must be a BGR image with shape HxWx3")
 
@@ -71,6 +88,10 @@ def mask_touch_area(
     return masked
 
 
+def mask_touch_area(frame: np.ndarray, roi: Roi) -> np.ndarray:
+    return mask_area(frame, roi)
+
+
 def prepare_frame(
     frame: np.ndarray,
     config: PreprocessConfig = PreprocessConfig(),
@@ -79,7 +100,9 @@ def prepare_frame(
     config.validate()
     image = frame
     if config.mask_touch_area:
-        image = mask_touch_area(image, config.touch_roi)
+        image = mask_area(image, config.touch_roi)
+    for roi in config.mask_rois:
+        image = mask_area(image, roi)
 
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image = cv2.resize(

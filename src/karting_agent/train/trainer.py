@@ -28,9 +28,7 @@ class SamplingConfig:
         if self.transition_weight < self.stable_weight:
             raise ValueError("transition_weight must be >= stable_weight")
         if self.short_correction_weight < self.transition_weight:
-            raise ValueError(
-                "short_correction_weight must be >= transition_weight"
-            )
+            raise ValueError("short_correction_weight must be >= transition_weight")
 
 
 @dataclass(frozen=True)
@@ -57,8 +55,6 @@ class TrainLoopConfig:
 
 @dataclass(frozen=True)
 class VideoSplit:
-    """Video-level train/validation/test partition."""
-
     name: str
     strategy: str
     train: tuple[str, ...]
@@ -66,26 +62,21 @@ class VideoSplit:
     test: tuple[str, ...]
 
     def validate(self) -> None:
-        groups = {
-            "train": self.train,
-            "validation": self.validation,
-            "test": self.test,
-        }
+        groups = {"train": self.train, "validation": self.validation, "test": self.test}
         for name, videos in groups.items():
             if not videos:
                 raise ValueError(f"{name} split must not be empty")
             if len(videos) != len(set(videos)):
                 raise ValueError(f"{name} split contains duplicate videos")
-
         names = tuple(groups)
         for index, left_name in enumerate(names):
             left = set(groups[left_name])
             for right_name in names[index + 1 :]:
                 overlap = left.intersection(groups[right_name])
                 if overlap:
-                    joined = ", ".join(sorted(overlap))
                     raise ValueError(
-                        f"{left_name}/{right_name} split overlap: {joined}"
+                        f"{left_name}/{right_name} split overlap: "
+                        + ", ".join(sorted(overlap))
                     )
 
     @property
@@ -130,7 +121,6 @@ def load_video_split(path: Path) -> VideoSplit:
     raw = _load_yaml(path).get("split")
     if not isinstance(raw, dict):
         raise ValueError(f"missing split mapping in config: {path}")
-
     config = VideoSplit(
         name=str(raw.get("name", "unnamed")),
         strategy=str(raw.get("strategy", "video_holdout")),
@@ -142,8 +132,23 @@ def load_video_split(path: Path) -> VideoSplit:
     return config
 
 
+def _optional_float_tuple(raw: dict, key: str) -> tuple[float, ...]:
+    value = raw.get(key, ())
+    return tuple(float(item) for item in value)
+
+
+def _optional_int_tuple(raw: dict, key: str) -> tuple[int, ...]:
+    value = raw.get(key, ())
+    return tuple(int(item) for item in value)
+
+
+def _optional_bool_tuple(raw: dict, key: str) -> tuple[bool, ...]:
+    value = raw.get(key, ())
+    return tuple(bool(item) for item in value)
+
+
 def load_samples(path: Path) -> list[DatasetSample]:
-    """Load temporal samples from a JSONL manifest."""
+    """Load old single-horizon or new multi-horizon JSONL samples."""
     samples: list[DatasetSample] = []
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -151,64 +156,55 @@ def load_samples(path: Path) -> list[DatasetSample]:
                 continue
             try:
                 raw = json.loads(line)
+                distance = raw["transition_distance_ms"]
                 samples.append(
                     DatasetSample(
                         video=str(raw["video"]),
-                        input_frame_indices=tuple(raw["input_frame_indices"]),
-                        input_timestamps_ms=tuple(raw["input_timestamps_ms"]),
+                        input_frame_indices=tuple(int(v) for v in raw["input_frame_indices"]),
+                        input_timestamps_ms=tuple(float(v) for v in raw["input_timestamps_ms"]),
                         target_frame_index=int(raw["target_frame_index"]),
                         target_timestamp_ms=float(raw["target_timestamp_ms"]),
                         target_pressed=bool(raw["target_pressed"]),
-                        transition_distance_ms=(
-                            None
-                            if raw["transition_distance_ms"] is None
-                            else float(raw["transition_distance_ms"])
-                        ),
+                        transition_distance_ms=None if distance is None else float(distance),
                         near_transition=bool(raw["near_transition"]),
-                        near_short_correction=bool(
-                            raw["near_short_correction"]
+                        near_short_correction=bool(raw["near_short_correction"]),
+                        target_frame_indices=_optional_int_tuple(raw, "target_frame_indices"),
+                        target_timestamps_ms=_optional_float_tuple(raw, "target_timestamps_ms"),
+                        target_pressed_by_horizon=_optional_bool_tuple(
+                            raw, "target_pressed_by_horizon"
+                        ),
+                        transition_distance_ms_by_horizon=tuple(
+                            None if value is None else float(value)
+                            for value in raw.get("transition_distance_ms_by_horizon", ())
+                        ),
+                        near_transition_by_horizon=_optional_bool_tuple(
+                            raw, "near_transition_by_horizon"
+                        ),
+                        near_short_correction_by_horizon=_optional_bool_tuple(
+                            raw, "near_short_correction_by_horizon"
                         ),
                     )
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"invalid dataset sample at {path}:{line_number}"
-                ) from exc
+                raise ValueError(f"invalid dataset sample at {path}:{line_number}") from exc
     return samples
 
 
-def select_samples_by_videos(
-    samples: Iterable[DatasetSample],
-    videos: Iterable[str],
-) -> list[DatasetSample]:
-    """Return samples whose video field exactly matches one of ``videos``."""
+def select_samples_by_videos(samples: Iterable[DatasetSample], videos: Iterable[str]) -> list[DatasetSample]:
     allowed = set(videos)
     return [sample for sample in samples if sample.video in allowed]
 
 
-def partition_samples(
-    samples: Sequence[DatasetSample],
-    split: VideoSplit,
-) -> dict[str, list[DatasetSample]]:
-    """Partition samples by complete videos and reject missing/unassigned videos."""
+def partition_samples(samples: Sequence[DatasetSample], split: VideoSplit) -> dict[str, list[DatasetSample]]:
     split.validate()
     available = {sample.video for sample in samples}
     configured = set(split.all_videos)
-
     missing = configured - available
     if missing:
-        raise ValueError(
-            "split references videos absent from samples: "
-            + ", ".join(sorted(missing))
-        )
-
+        raise ValueError("split references videos absent from samples: " + ", ".join(sorted(missing)))
     unassigned = available - configured
     if unassigned:
-        raise ValueError(
-            "samples contain videos not assigned to a split: "
-            + ", ".join(sorted(unassigned))
-        )
-
+        raise ValueError("samples contain videos not assigned to a split: " + ", ".join(sorted(unassigned)))
     return {
         "train": select_samples_by_videos(samples, split.train),
         "validation": select_samples_by_videos(samples, split.validation),
@@ -216,14 +212,7 @@ def partition_samples(
     }
 
 
-def sample_weight(
-    sample: DatasetSample,
-    config: SamplingConfig,
-) -> float:
-    """Return one relative sampling weight.
-
-    Short-correction samples take precedence over generic transition samples.
-    """
+def sample_weight(sample: DatasetSample, config: SamplingConfig) -> float:
     config.validate()
     if sample.near_short_correction:
         return config.short_correction_weight
@@ -232,29 +221,17 @@ def sample_weight(
     return config.stable_weight
 
 
-def build_sample_weights(
-    samples: Sequence[DatasetSample],
-    config: SamplingConfig,
-) -> list[float]:
-    """Build weights aligned one-to-one with ``samples``."""
+def build_sample_weights(samples: Sequence[DatasetSample], config: SamplingConfig) -> list[float]:
     config.validate()
     return [sample_weight(sample, config) for sample in samples]
 
 
-def sampling_summary(
-    samples: Sequence[DatasetSample],
-    config: SamplingConfig,
-) -> dict[str, float | int]:
-    """Summarize raw and weighted sample composition."""
+def sampling_summary(samples: Sequence[DatasetSample], config: SamplingConfig) -> dict[str, float | int]:
     config.validate()
     total = len(samples)
-    stable = sum(
-        not sample.near_transition and not sample.near_short_correction
-        for sample in samples
-    )
-    short = sum(sample.near_short_correction for sample in samples)
+    stable = sum(not s.near_transition and not s.near_short_correction for s in samples)
+    short = sum(s.near_short_correction for s in samples)
     transition = total - stable - short
-
     weighted_stable = stable * config.stable_weight
     weighted_transition = transition * config.transition_weight
     weighted_short = short * config.short_correction_weight
@@ -277,28 +254,14 @@ def sampling_summary(
     }
 
 
-def make_weighted_sampler(
-    samples: Sequence[DatasetSample],
-    config: SamplingConfig,
-    *,
-    generator=None,
-):
-    """Create a PyTorch ``WeightedRandomSampler`` for training.
-
-    PyTorch is imported lazily so dataset tooling does not require the train
-    optional dependency.
-    """
+def make_weighted_sampler(samples: Sequence[DatasetSample], config: SamplingConfig, *, generator=None):
     config.validate()
     if not samples:
         raise ValueError("cannot create a sampler for an empty dataset")
-
     try:
         from torch.utils.data import WeightedRandomSampler
     except ImportError as exc:
-        raise RuntimeError(
-            'PyTorch is required; install with: pip install -e ".[train]"'
-        ) from exc
-
+        raise RuntimeError('PyTorch is required; install with: pip install -e ".[train]"') from exc
     return WeightedRandomSampler(
         weights=build_sample_weights(samples, config),
         num_samples=len(samples),
@@ -316,21 +279,19 @@ def run_epoch(
     threshold: float = 0.5,
     max_batches: int | None = None,
 ) -> dict[str, object]:
-    """Run one train or evaluation epoch and return loss plus subset metrics."""
+    """Run one epoch. Column zero remains the primary/control head."""
     try:
         import torch
         from torch.nn import functional as F
     except ImportError as exc:
-        raise RuntimeError(
-            'PyTorch is required; install with: pip install -e ".[train]"'
-        ) from exc
+        raise RuntimeError('PyTorch is required; install with: pip install -e ".[train]"') from exc
 
     training = optimizer is not None
     model.train(training)
-
     all_metrics = BinaryMetricAccumulator(threshold)
     transition_metrics = BinaryMetricAccumulator(threshold)
     short_metrics = BinaryMetricAccumulator(threshold)
+    output_metrics: list[BinaryMetricAccumulator] | None = None
     total_loss = 0.0
     total_samples = 0
 
@@ -339,49 +300,63 @@ def run_epoch(
         for batch_index, batch in enumerate(data_loader):
             if max_batches is not None and batch_index >= max_batches:
                 break
-
             inputs = batch["input"].to(device=device, dtype=torch.float32)
             targets = batch["target"].to(device=device, dtype=torch.float32)
-
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
             logits = model(inputs)
-            loss = F.binary_cross_entropy_with_logits(logits, targets)
+            if logits.ndim == 1:
+                if targets.ndim != 1:
+                    targets = targets.reshape(-1)
+                primary_logits = logits
+                primary_targets = targets
+                output_count = 1
+            elif logits.ndim == 2:
+                if targets.ndim != 2 or targets.shape != logits.shape:
+                    raise ValueError(
+                        f"multi-horizon target/logit shape mismatch: {targets.shape} vs {logits.shape}"
+                    )
+                primary_logits = logits[:, 0]
+                primary_targets = targets[:, 0]
+                output_count = logits.shape[1]
+            else:
+                raise ValueError(f"unsupported model output shape: {tuple(logits.shape)}")
 
+            loss = F.binary_cross_entropy_with_logits(logits, targets)
             if training:
                 loss.backward()
                 optimizer.step()
 
-            batch_size = int(targets.numel())
+            batch_size = int(inputs.shape[0])
             total_loss += float(loss.detach().item()) * batch_size
             total_samples += batch_size
 
-            probabilities = torch.sigmoid(logits).detach().cpu().numpy()
-            target_values = targets.detach().cpu().numpy()
-            transition_mask = (
-                batch["near_transition"].detach().cpu().numpy().astype(bool)
-            )
-            short_mask = (
-                batch["near_short_correction"].detach().cpu().numpy().astype(bool)
-            )
+            primary_probabilities = torch.sigmoid(primary_logits).detach().cpu().numpy()
+            primary_values = primary_targets.detach().cpu().numpy()
+            transition_mask = batch["near_transition"].detach().cpu().numpy().astype(bool)
+            short_mask = batch["near_short_correction"].detach().cpu().numpy().astype(bool)
+            all_metrics.update(primary_probabilities, primary_values)
+            transition_metrics.update(primary_probabilities[transition_mask], primary_values[transition_mask])
+            short_metrics.update(primary_probabilities[short_mask], primary_values[short_mask])
 
-            all_metrics.update(probabilities, target_values)
-            transition_metrics.update(
-                probabilities[transition_mask],
-                target_values[transition_mask],
-            )
-            short_metrics.update(
-                probabilities[short_mask],
-                target_values[short_mask],
-            )
+            if output_metrics is None:
+                output_metrics = [BinaryMetricAccumulator(threshold) for _ in range(output_count)]
+            if logits.ndim == 1:
+                output_metrics[0].update(primary_probabilities, primary_values)
+            else:
+                probabilities = torch.sigmoid(logits).detach().cpu().numpy()
+                values = targets.detach().cpu().numpy()
+                for index, metric in enumerate(output_metrics):
+                    metric.update(probabilities[:, index], values[:, index])
 
     if total_samples == 0:
         raise ValueError("data loader produced no samples")
-
+    assert output_metrics is not None
     return {
         "loss": total_loss / total_samples,
         "all": all_metrics.result().to_dict(),
         "transition": transition_metrics.result().to_dict(),
         "short_correction": short_metrics.result().to_dict(),
+        "outputs": [metric.result().to_dict() for metric in output_metrics],
     }

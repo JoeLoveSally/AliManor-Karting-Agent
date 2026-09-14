@@ -29,12 +29,15 @@ def load_config(path: Path) -> DatasetConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     model = raw.get("model", {})
     dataset = raw.get("dataset", {})
+    raw_horizons = dataset.get("prediction_horizons_ms", ())
+    horizons = tuple(float(value) for value in raw_horizons)
     return DatasetConfig(
         sample_fps=float(dataset.get("sample_fps", 30)),
         frame_stack=int(model.get("frame_stack", 3)),
         history_ms=float(dataset.get("history_ms", 100)),
         frame_interval_ms=float(dataset.get("frame_interval_ms", 50)),
         prediction_horizon_ms=float(dataset.get("prediction_horizon_ms", 100)),
+        prediction_horizons_ms=horizons,
         transition_window_ms=float(dataset.get("transition_window_ms", 200)),
         short_correction_min_ms=float(dataset.get("short_correction_min_ms", 100)),
         short_correction_max_ms=float(dataset.get("short_correction_max_ms", 300)),
@@ -51,7 +54,10 @@ def main() -> int:
         raise FileNotFoundError(f"no MP4 videos found in {args.input}")
 
     config = load_config(args.config)
-    print(f"Building dataset from {len(videos)} video(s)...")
+    print(
+        f"Building dataset from {len(videos)} video(s); "
+        f"horizons={config.target_horizons_ms}..."
+    )
     manifest = build_dataset(
         videos,
         args.output,

@@ -83,6 +83,7 @@ def main() -> int:
             "input_height": preprocess_config.input_height,
             "mask_touch_area": preprocess_config.mask_touch_area,
             "touch_roi": preprocess_config.touch_roi,
+            "mask_rois": preprocess_config.mask_rois,
         },
         "summary": {
             "videos": summary["videos"],

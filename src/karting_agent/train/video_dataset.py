@@ -165,9 +165,16 @@ class TemporalVideoDataset:
             frames = self._read_video_frames(sample.video, sample.input_frame_indices)
             model_input = stack_frames(frames, self.preprocess_config)
 
+        states = sample.target_states
+        target: np.float32 | np.ndarray
+        if len(states) == 1:
+            target = np.float32(1.0 if states[0] else 0.0)
+        else:
+            target = np.asarray(states, dtype=np.float32)
+
         return {
             "input": model_input,
-            "target": np.float32(1.0 if sample.target_pressed else 0.0),
+            "target": target,
             "video": sample.video,
             "target_timestamp_ms": np.float32(sample.target_timestamp_ms),
             "near_transition": sample.near_transition,

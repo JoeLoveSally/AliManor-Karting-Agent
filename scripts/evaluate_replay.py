@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
         description="Compare Replay Runtime output with recorded action labels."
     )
     parser.add_argument("replay", type=Path)
+    parser.add_argument(
+        "--labels-dir",
+        type=Path,
+        default=ROOT / "data" / "processed" / "labels",
+        help="Directory containing per-video label JSON files.",
+    )
     parser.add_argument("--tolerance-ms", type=float, default=100.0)
     parser.add_argument(
         "--timeline",
@@ -40,8 +46,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_label_data(video: str) -> tuple[list[Transition], list[ReleaseSegment]]:
-    path = ROOT / "data" / "processed" / "labels" / f"{Path(video).stem}.json"
+def load_label_data(
+    labels_dir: Path,
+    video: str,
+) -> tuple[list[Transition], list[ReleaseSegment]]:
+    path = labels_dir / f"{Path(video).stem}.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     raw_events = payload.get("events")
     if not isinstance(raw_events, list) or not raw_events:
@@ -93,6 +102,7 @@ def main() -> int:
         raise ValueError("--tolerance-ms must be >= 0")
 
     replay_path = args.replay.resolve()
+    labels_dir = args.labels_dir.resolve()
     payload = json.loads(replay_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("replay root must be a mapping")
@@ -108,7 +118,7 @@ def main() -> int:
     video = str(replay.get("video", ""))
     if not video:
         raise ValueError("replay artifact is missing video path")
-    transitions, releases = load_label_data(video)
+    transitions, releases = load_label_data(labels_dir, video)
 
     timelines = (
         ("target", "observation") if args.timeline == "both" else (args.timeline,)
@@ -117,6 +127,7 @@ def main() -> int:
     print(
         f"Replay: {replay_path}\n"
         f"Video: {video}\n"
+        f"Labels: {labels_dir}\n"
         f"Tolerance: {args.tolerance_ms:.1f}ms",
         flush=True,
     )
@@ -145,6 +156,7 @@ def main() -> int:
             {
                 "replay": str(replay_path),
                 "video": video,
+                "labels_dir": str(labels_dir),
                 "tolerance_ms": args.tolerance_ms,
                 "timelines": results,
             },

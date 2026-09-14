@@ -159,3 +159,45 @@ For each `+100ms`, `+200ms`, and `+300ms` head it reports:
 - the same classification/sequence metrics for the label-only persistence baseline `action(t) -> action(t+horizon)`.
 
 This evaluator intentionally reads `near_transition_by_horizon` and `near_short_correction_by_horizon` from the v2 manifest instead of using the aggregate `any(horizon)` flags. Older training logs that print `transition_f1` and `short_f1` for the selected control head therefore should not be used as the final v2 subset metrics.
+
+### Current held-out test result
+
+The first v2 run selected epoch 2 by minimum validation BCE. On the held-out two-video test split:
+
+| Horizon | Model F1 | Persistence F1 | Near-transition F1 | Persistence near-transition F1 | Sequence transition F1 | Short release recall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| +100 ms | 0.970 | 0.917 | 0.909 | 0.746 | 0.920 | 0.889 |
+| +200 ms | 0.961 | 0.843 | 0.885 | 0.517 | 0.889 | 0.667 |
+| +300 ms | 0.950 | 0.788 | 0.857 | 0.551 | 0.718 | 0.389 |
+
+The persistence gap grows with horizon, which is evidence that v2 is learning future information beyond simply copying the current action. However, `+300ms` loses too much sequence timing and short-correction quality. `+100ms` currently has the strongest sequence metrics, while `+200ms` has a much larger margin over persistence and remains a viable candidate.
+
+## 10. Runtime replay comparison
+
+Before real ADB control, compare `+100ms` and `+200ms` using the same held-out test videos and the real runtime hysteresis path. `replay_video.py` accepts `--control-horizon-ms` without modifying the artifact metadata.
+
+Example for one test video:
+
+```bash
+python scripts/replay_video.py data/raw/video_20260130_173426.mp4 \
+  --model artifacts/models/mobilenet_v3_small_v2/model.pt \
+  --control-horizon-ms 100
+
+python scripts/replay_video.py data/raw/video_20260130_173426.mp4 \
+  --model artifacts/models/mobilenet_v3_small_v2/model.pt \
+  --control-horizon-ms 200
+```
+
+Evaluate each replay against the v2 labels:
+
+```bash
+python scripts/evaluate_replay.py \
+  artifacts/replays/mobilenet_v3_small_v2/video_20260130_173426_h100.json \
+  --labels-dir data/processed/v2/labels
+
+python scripts/evaluate_replay.py \
+  artifacts/replays/mobilenet_v3_small_v2/video_20260130_173426_h200.json \
+  --labels-dir data/processed/v2/labels
+```
+
+Repeat for `video_20260130_173835.mp4`. Compare both the target timeline and observation timeline. The target timeline measures whether the future-action semantics line up with labels; the observation timeline shows when the runtime actually emits the decision before actuator latency.

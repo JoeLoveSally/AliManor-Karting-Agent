@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Inspect which image regions drive PRESS/RELEASE predictions in a debug run.
+"""Inspect which image regions drive PRESS/RELEASE predictions.
 
 This is an architecture-agnostic occlusion-sensitivity diagnostic. It reads the
-same temporal source-frame indices saved by ``run_adb_closed_loop.py``, rebuilds
-the model input, masks one spatial grid cell across all temporal frames, and
-measures the resulting probability change.
+same temporal source-frame indices saved by ``run_adb_closed_loop.py`` or
+``replay_video.py``, rebuilds the model input, masks one spatial grid cell across
+all temporal frames, and measures the resulting probability change.
 
 Positive sensitivity means the region supports PRESS. Negative sensitivity
 means the region suppresses PRESS (evidence for RELEASE).
@@ -34,7 +34,7 @@ from karting_agent.vision.preprocess import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate occlusion-sensitivity maps for an ADB debug run."
+        description="Generate occlusion-sensitivity maps for an ADB run or replay artifact."
     )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--video", type=Path, required=True)
@@ -58,9 +58,14 @@ def parse_args() -> argparse.Namespace:
 
 def load_run(path: Path) -> dict[str, object]:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or not isinstance(raw.get("steps"), list):
-        raise ValueError(f"invalid debug run JSON: {path}")
-    return raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid run JSON: {path}")
+    if isinstance(raw.get("steps"), list):
+        return raw
+    replay = raw.get("replay")
+    if isinstance(replay, dict) and isinstance(replay.get("steps"), list):
+        return replay
+    raise ValueError(f"run JSON contains no steps: {path}")
 
 
 def selected_steps(

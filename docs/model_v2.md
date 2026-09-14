@@ -201,3 +201,24 @@ python scripts/evaluate_replay.py \
 ```
 
 Repeat for `video_20260130_173835.mp4`. Compare both the target timeline and observation timeline. The target timeline measures whether the future-action semantics line up with labels; the observation timeline shows when the runtime actually emits the decision before actuator latency.
+
+### Replay result and control-head decision
+
+Across the two held-out videos, the RuntimeEngine + hysteresis replay produced:
+
+```text
+                           matched / GT    predicted    transition F1
++100ms target                 81 / 88          82           0.953
++200ms target                 72 / 88          74           0.889
+
++100ms observation            57 / 88          82           0.671
++200ms observation             2 / 88          74           0.025
+```
+
+On the target timeline, `+100ms` also detected 16/18 short 100-300 ms RELEASE segments, versus 12/18 for `+200ms`. On the observation timeline the corresponding counts were 10/18 and 0/18.
+
+The near-zero `+200ms` observation score is partly mechanical: Runtime executes the selected future state immediately, so a correct `t+200ms` prediction is emitted about 200 ms before the recorded human action and therefore falls outside the 100 ms matching tolerance. Even after accounting for that, `+100ms` is stronger on the target timeline too: it has higher transition recall and short-correction recall on both held-out videos.
+
+Decision: use `+100ms` as the next runtime control head. Keep `+200ms` and `+300ms` as auxiliary training heads; their value is to regularize the shared representation away from current-action persistence shortcuts, not necessarily to execute those heads directly.
+
+Before armed ADB testing, run the focus diagnostic on the `+100ms` replay head and verify that dominant evidence is no longer HUD/action-state shortcut evidence.

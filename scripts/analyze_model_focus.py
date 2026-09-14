@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inspect which image regions drive PRESS/RELEASE predictions in a debug run.
 
-This is an architecture-agnostic occlusion-sensitivity diagnostic.  It reads the
+This is an architecture-agnostic occlusion-sensitivity diagnostic. It reads the
 same temporal source-frame indices saved by ``run_adb_closed_loop.py``, rebuilds
 the model input, masks one spatial grid cell across all temporal frames, and
 measures the resulting probability change.
@@ -92,24 +92,49 @@ def selected_steps(
 
 
 def read_video_frames(path: Path, frame_indices: list[int]) -> dict[int, np.ndarray]:
+    """Decode requested MP4 frames sequentially using decoder-order indices.
+
+    Runtime ``source_frame`` is the sequential frame number emitted by FFmpeg's
+    rawvideo output. Debug MP4 files are fragmented stream copies whose H.264
+    timestamps can be unusual, so OpenCV random seeking with
+    ``CAP_PROP_POS_FRAMES`` is not a reliable way to recover that same ordinal
+    frame. Decode once from the beginning and select by decoder order instead.
+    """
+    requested = sorted(set(int(index) for index in frame_indices))
+    if not requested:
+        return {}
+    if requested[0] < 0:
+        raise ValueError("frame indices must be >= 0")
+
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise RuntimeError(f"cannot open debug video: {path}")
+
+    wanted = set(requested)
+    last = requested[-1]
+    frames: dict[int, np.ndarray] = {}
     try:
-        frames: dict[int, np.ndarray] = {}
-        for frame_index in sorted(set(frame_indices)):
-            if frame_index < 0:
-                raise ValueError("frame indices must be >= 0")
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        frame_index = 0
+        while frame_index <= last:
             ok, frame = capture.read()
             if not ok or frame is None:
-                raise RuntimeError(
-                    f"cannot decode source frame {frame_index} from {path}"
-                )
-            frames[frame_index] = frame
-        return frames
+                break
+            if frame_index in wanted:
+                frames[frame_index] = frame.copy()
+                if len(frames) == len(wanted):
+                    break
+            frame_index += 1
     finally:
         capture.release()
+
+    missing = [index for index in requested if index not in frames]
+    if missing:
+        preview = ", ".join(str(index) for index in missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise RuntimeError(
+            f"debug video ended before source frames were decoded: {preview}{suffix}"
+        )
+    return frames
 
 
 def occlusion_sensitivity(

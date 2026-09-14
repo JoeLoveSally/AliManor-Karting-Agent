@@ -15,7 +15,7 @@ import numpy as np
 from karting_agent.train.dataset import DatasetSample
 from karting_agent.vision.preprocess import PreprocessConfig, prepare_frame
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 FRAMES_FILENAME = "frames.npy"
 INDEX_FILENAME = "index.json"
 
@@ -29,6 +29,7 @@ class FrameCacheMetadata:
     input_height: int
     mask_touch_area: bool
     touch_roi: tuple[float, float, float, float]
+    mask_rois: tuple[tuple[float, float, float, float], ...] = ()
     color_space: str = "RGB"
     dtype: str = "uint8"
 
@@ -42,6 +43,10 @@ class FrameCacheMetadata:
             input_height=int(raw["input_height"]),
             mask_touch_area=bool(raw["mask_touch_area"]),
             touch_roi=tuple(float(value) for value in raw["touch_roi"]),
+            mask_rois=tuple(
+                tuple(float(value) for value in roi)
+                for roi in raw.get("mask_rois", ())
+            ),
             color_space=str(raw.get("color_space", "RGB")),
             dtype=str(raw.get("dtype", "uint8")),
         )
@@ -62,6 +67,8 @@ class FrameCacheMetadata:
             for left, right in zip(self.touch_roi, config.touch_roi, strict=True)
         ):
             raise ValueError("frame cache touch ROI does not match preprocess config")
+        if self.mask_rois != config.mask_rois:
+            raise ValueError("frame cache fixed mask ROIs do not match preprocess config")
         if self.color_space != "RGB" or self.dtype != "uint8":
             raise ValueError("unsupported frame cache representation")
 
@@ -230,6 +237,7 @@ def build_video_cache(
         input_height=preprocess_config.input_height,
         mask_touch_area=preprocess_config.mask_touch_area,
         touch_roi=preprocess_config.touch_roi,
+        mask_rois=preprocess_config.mask_rois,
     )
     tmp_index.write_text(json.dumps(asdict(metadata), indent=2), encoding="utf-8")
     os.replace(tmp_frames, frames_path)

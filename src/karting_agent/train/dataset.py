@@ -24,6 +24,7 @@ class DatasetConfig:
     history_ms: float = 100.0
     frame_interval_ms: float = 50.0
     prediction_horizon_ms: float = 100.0
+    prediction_horizons_ms: tuple[float, ...] = ()
     transition_window_ms: float = 200.0
     short_correction_min_ms: float = 100.0
     short_correction_max_ms: float = 300.0
@@ -41,8 +42,21 @@ class DatasetConfig:
             raise ValueError(
                 "history_ms must equal (frame_stack - 1) * frame_interval_ms"
             )
+        horizons = self.target_horizons_ms
+        if not horizons:
+            raise ValueError("at least one prediction horizon is required")
+        if any(value < 0 for value in horizons):
+            raise ValueError("prediction horizons must be >= 0")
+        if tuple(sorted(horizons)) != horizons:
+            raise ValueError("prediction horizons must be sorted")
+        if len(set(horizons)) != len(horizons):
+            raise ValueError("prediction horizons must be unique")
         if not (0 <= self.short_correction_min_ms <= self.short_correction_max_ms):
             raise ValueError("invalid short-correction duration range")
+
+    @property
+    def target_horizons_ms(self) -> tuple[float, ...]:
+        return self.prediction_horizons_ms or (self.prediction_horizon_ms,)
 
     @property
     def frame_offsets_ms(self) -> tuple[float, ...]:
@@ -63,10 +77,22 @@ class DatasetSample:
     transition_distance_ms: float | None
     near_transition: bool
     near_short_correction: bool
+    target_frame_indices: tuple[int, ...] = ()
+    target_timestamps_ms: tuple[float, ...] = ()
+    target_pressed_by_horizon: tuple[bool, ...] = ()
+    transition_distance_ms_by_horizon: tuple[float | None, ...] = ()
+    near_transition_by_horizon: tuple[bool, ...] = ()
+    near_short_correction_by_horizon: tuple[bool, ...] = ()
+
+    @property
+    def target_states(self) -> tuple[bool, ...]:
+        return self.target_pressed_by_horizon or (self.target_pressed,)
+
 
 
 def _nearest_frame_index(timestamp_ms: float, fps: float, frame_count: int) -> int:
     return min(frame_count - 1, max(0, round(timestamp_ms * fps / 1000.0)))
+
 
 
 def _nearest_transition_distance(
@@ -85,6 +111,7 @@ def _nearest_transition_distance(
     return min(candidates)
 
 
+
 def _short_corrections(
     segments: Sequence[ActionSegment], config: DatasetConfig
 ) -> tuple[ActionSegment, ...]:
@@ -94,6 +121,7 @@ def _short_corrections(
         if not segment.pressed
         and config.short_correction_min_ms <= segment.duration_ms <= config.short_correction_max_ms
     )
+
 
 
 def _near_short_correction(
@@ -107,14 +135,16 @@ def _near_short_correction(
     )
 
 
+
 def build_samples(
     timeline: ActionTimeline,
     video_name: str,
     config: DatasetConfig,
 ) -> list[DatasetSample]:
     config.validate()
+    horizons = config.target_horizons_ms
     start_ms = config.history_ms
-    end_ms = timeline.duration_ms - config.prediction_horizon_ms
+    end_ms = timeline.duration_ms - max(horizons)
     if end_ms < start_ms:
         return []
 
@@ -135,31 +165,56 @@ def build_samples(
             _nearest_frame_index(timestamp_ms, timeline.fps, timeline.frame_count)
             for timestamp_ms in input_timestamps
         )
-        target_ms = current_ms + config.prediction_horizon_ms
-        distance = _nearest_transition_distance(target_ms, timeline.events)
+
+        target_timestamps = tuple(current_ms + horizon for horizon in horizons)
+        target_indices = tuple(
+            _nearest_frame_index(timestamp_ms, timeline.fps, timeline.frame_count)
+            for timestamp_ms in target_timestamps
+        )
+        target_states = tuple(
+            action_at_timestamp(timeline.events, timestamp_ms)
+            for timestamp_ms in target_timestamps
+        )
+        distances = tuple(
+            _nearest_transition_distance(timestamp_ms, timeline.events)
+            for timestamp_ms in target_timestamps
+        )
+        near_transitions = tuple(
+            distance is not None and distance <= config.transition_window_ms
+            for distance in distances
+        )
+        near_short = tuple(
+            _near_short_correction(
+                timestamp_ms,
+                corrections,
+                config.transition_window_ms,
+            )
+            for timestamp_ms in target_timestamps
+        )
 
         samples.append(
             DatasetSample(
                 video=video_name,
                 input_frame_indices=input_indices,
                 input_timestamps_ms=input_timestamps,
-                target_frame_index=_nearest_frame_index(
-                    target_ms, timeline.fps, timeline.frame_count
-                ),
-                target_timestamp_ms=target_ms,
-                target_pressed=action_at_timestamp(timeline.events, target_ms),
-                transition_distance_ms=distance,
-                near_transition=(
-                    distance is not None and distance <= config.transition_window_ms
-                ),
-                near_short_correction=_near_short_correction(
-                    target_ms, corrections, config.transition_window_ms
-                ),
+                target_frame_index=target_indices[0],
+                target_timestamp_ms=target_timestamps[0],
+                target_pressed=target_states[0],
+                transition_distance_ms=distances[0],
+                near_transition=any(near_transitions),
+                near_short_correction=any(near_short),
+                target_frame_indices=target_indices,
+                target_timestamps_ms=target_timestamps,
+                target_pressed_by_horizon=target_states,
+                transition_distance_ms_by_horizon=distances,
+                near_transition_by_horizon=near_transitions,
+                near_short_correction_by_horizon=near_short,
             )
         )
         sample_index += 1
 
     return samples
+
 
 
 def build_dataset(
@@ -244,6 +299,7 @@ def build_dataset(
 
     manifest = {
         "config": asdict(config),
+        "target_horizons_ms": list(config.target_horizons_ms),
         "videos": video_summaries,
         "summary": {
             "videos": len(video_summaries),

@@ -18,12 +18,22 @@ class ModelRuntimeSpec:
     architecture: str
     frame_stack: int
     frame_offsets_ms: tuple[float, ...]
-    prediction_horizon_ms: float
+    prediction_horizons_ms: tuple[float, ...]
+    control_horizon_ms: float
     preprocess_config: PreprocessConfig
 
     @property
     def history_ms(self) -> float:
         return max(0.0, -min(self.frame_offsets_ms))
+
+    @property
+    def prediction_horizon_ms(self) -> float:
+        """Backward-compatible runtime horizon used by RuntimeEngine."""
+        return self.control_horizon_ms
+
+    @property
+    def control_output_index(self) -> int:
+        return self.prediction_horizons_ms.index(self.control_horizon_ms)
 
 
 def _runtime_spec(metadata: dict[str, object]) -> ModelRuntimeSpec:
@@ -40,15 +50,37 @@ def _runtime_spec(metadata: dict[str, object]) -> ModelRuntimeSpec:
     )
     frame_stack = int(metadata.get("frame_stack", model_config.get("frame_stack", 0)))
     frame_interval_ms = float(dataset_config.get("frame_interval_ms", 0.0))
-    prediction_horizon_ms = float(dataset_config.get("prediction_horizon_ms", 0.0))
     history_ms = float(dataset_config.get("history_ms", 0.0))
+
+    raw_horizons = metadata.get(
+        "prediction_horizons_ms",
+        dataset_config.get("prediction_horizons_ms"),
+    )
+    if raw_horizons is None:
+        raw_horizons = [dataset_config.get("prediction_horizon_ms", 0.0)]
+    if not isinstance(raw_horizons, (list, tuple)) or not raw_horizons:
+        raise ValueError("prediction horizons are missing from model metadata")
+    prediction_horizons_ms = tuple(float(value) for value in raw_horizons)
+    control_horizon_ms = float(
+        metadata.get(
+            "control_horizon_ms",
+            dataset_config.get("control_horizon_ms", prediction_horizons_ms[0]),
+        )
+    )
 
     if not architecture:
         raise ValueError("model architecture is missing from metadata")
     if frame_stack < 1:
         raise ValueError("frame_stack must be >= 1")
-    if frame_interval_ms < 0 or prediction_horizon_ms < 0:
+    if frame_interval_ms < 0 or any(value < 0 for value in prediction_horizons_ms):
         raise ValueError("runtime temporal intervals must be >= 0")
+    if tuple(sorted(prediction_horizons_ms)) != prediction_horizons_ms:
+        raise ValueError("prediction horizons must be sorted")
+    if len(set(prediction_horizons_ms)) != len(prediction_horizons_ms):
+        raise ValueError("prediction horizons must be unique")
+    if control_horizon_ms not in prediction_horizons_ms:
+        raise ValueError("control horizon must be one of the prediction horizons")
+
     expected_history_ms = (frame_stack - 1) * frame_interval_ms
     if not math.isclose(history_ms, expected_history_ms, abs_tol=1e-6):
         raise ValueError(
@@ -63,7 +95,8 @@ def _runtime_spec(metadata: dict[str, object]) -> ModelRuntimeSpec:
         architecture=architecture,
         frame_stack=frame_stack,
         frame_offsets_ms=frame_offsets_ms,
-        prediction_horizon_ms=prediction_horizon_ms,
+        prediction_horizons_ms=prediction_horizons_ms,
+        control_horizon_ms=control_horizon_ms,
         preprocess_config=preprocess_config_from_mapping(raw_config),
     )
 
@@ -124,6 +157,7 @@ class ModelRunner:
             self.spec.architecture,
             frame_stack=self.spec.frame_stack,
             pretrained=False,
+            output_dim=len(self.spec.prediction_horizons_ms),
         ).to(self.device)
         try:
             state_dict = torch.load(
@@ -144,19 +178,27 @@ class ModelRunner:
             self.spec.preprocess_config.input_width,
         )
 
-    def predict(self, inputs: np.ndarray) -> float:
+    def _tensor(self, inputs: np.ndarray):
         expected_shape = self.input_shape
         if inputs.shape != expected_shape or inputs.dtype != np.float32:
             raise ValueError(
                 f"model input must be float32 with shape {expected_shape}, got "
                 f"{inputs.dtype} {inputs.shape}"
             )
-
         tensor = self._torch.from_numpy(np.ascontiguousarray(inputs)).unsqueeze(0)
-        tensor = tensor.to(device=self.device, dtype=self._torch.float32)
+        return tensor.to(device=self.device, dtype=self._torch.float32)
+
+    def predict_all(self, inputs: np.ndarray) -> tuple[float, ...]:
+        tensor = self._tensor(inputs)
         with self._torch.inference_mode():
-            probability = self._torch.sigmoid(self.model(tensor))[0].item()
-        return float(probability)
+            probabilities = self._torch.sigmoid(self.model(tensor))[0]
+        if probabilities.ndim == 0:
+            return (float(probabilities.item()),)
+        return tuple(float(value) for value in probabilities.detach().cpu().tolist())
+
+    def predict(self, inputs: np.ndarray) -> float:
+        probabilities = self.predict_all(inputs)
+        return probabilities[self.spec.control_output_index]
 
     def warmup(self, iterations: int = 3) -> tuple[float, ...]:
         """Run untimed-control dummy predictions before entering RUNNING state."""

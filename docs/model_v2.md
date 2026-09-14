@@ -134,3 +134,28 @@ v2 is not accepted solely because sample accuracy or F1 increases. Evaluation mu
 5. ADB replay/closed-loop completion quality.
 
 The main question is whether v2 learns upcoming control transitions from visual geometry and motion, not whether it can reproduce the majority persistent state.
+
+## 9. Post-training multi-horizon evaluation
+
+Use the dedicated v2 evaluator after training. It evaluates the already-saved best checkpoint, so no retraining is required:
+
+```bash
+python scripts/evaluate_model_v2.py \
+  --config configs/train_v2.yaml \
+  --samples data/processed/v2/samples.jsonl \
+  --labels-dir data/processed/v2/labels \
+  --split test \
+  --require-cache \
+  --num-workers 4
+```
+
+For each `+100ms`, `+200ms`, and `+300ms` head it reports:
+
+- ordinary sample F1;
+- F1 on that horizon's own `near_transition` subset;
+- F1 on that horizon's own `near_short_correction` subset;
+- sequence-level transition F1 and onset timing;
+- short-release-segment recall;
+- the same classification/sequence metrics for the label-only persistence baseline `action(t) -> action(t+horizon)`.
+
+This evaluator intentionally reads `near_transition_by_horizon` and `near_short_correction_by_horizon` from the v2 manifest instead of using the aggregate `any(horizon)` flags. Older training logs that print `transition_f1` and `short_f1` for the selected control head therefore should not be used as the final v2 subset metrics.

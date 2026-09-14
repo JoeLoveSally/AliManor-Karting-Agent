@@ -34,7 +34,9 @@ from karting_agent.vision.preprocess import preprocess_config_from_mapping
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the v2 multi-horizon karting model.")
+    parser = argparse.ArgumentParser(
+        description="Train the v2 multi-horizon karting model."
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -94,6 +96,7 @@ def print_summary(
     prefix: str,
     summary: dict[str, object],
     horizons: tuple[float, ...],
+    primary_index: int,
 ) -> None:
     primary = summary["all"]
     transition = summary["transition"]
@@ -101,14 +104,13 @@ def print_summary(
     output_metrics = summary.get("outputs", [])
     horizon_bits = []
     for horizon, metrics in zip(horizons, output_metrics, strict=False):
-        horizon_bits.append(
-            f"h{horizon:g}_f1={metrics['f1']:.3f}"
-        )
+        horizon_bits.append(f"h{horizon:g}_f1={metrics['f1']:.3f}")
     suffix = ", " + ", ".join(horizon_bits) if horizon_bits else ""
+    primary_horizon = horizons[primary_index]
     print(
         f"{prefix}: loss={summary['loss']:.4f}, "
-        f"h{horizons[0]:g}_acc={primary['accuracy']:.3f}, "
-        f"h{horizons[0]:g}_f1={primary['f1']:.3f}, "
+        f"control_h{primary_horizon:g}_acc={primary['accuracy']:.3f}, "
+        f"control_h{primary_horizon:g}_f1={primary['f1']:.3f}, "
         f"transition_f1={transition['f1']:.3f}, "
         f"short_f1={short['f1']:.3f}{suffix}",
         flush=True,
@@ -151,11 +153,21 @@ def main() -> int:
     raw = load_raw_config(args.config)
     horizons = target_horizons(raw)
     selected_control_horizon = control_horizon(raw, horizons)
+    primary_index = horizons.index(selected_control_horizon)
     loop_config = load_train_loop_config(args.config)
     sampling_config = load_sampling_config(args.config)
     split = load_video_split(args.config)
     preprocess_config = preprocess_config_from_mapping(raw)
     cache_root = frame_cache_root_from_config(raw, ROOT)
+
+    model_config = raw.get("model", {})
+    dataset_config = raw.get("dataset", {})
+    if not isinstance(model_config, dict) or not isinstance(dataset_config, dict):
+        raise ValueError("model and dataset config must be mappings")
+    architecture = str(model_config.get("architecture", "mobilenet_v3_small"))
+    frame_stack = int(model_config.get("frame_stack", 5))
+    history_ms = float(dataset_config.get("history_ms", 200))
+    pretrained = bool(model_config.get("pretrained", True)) and not args.no_pretrained
 
     num_workers = loop_config.num_workers if args.num_workers is None else args.num_workers
     if num_workers < 0:
@@ -180,13 +192,14 @@ def main() -> int:
     device = select_device(torch)
     print(f"Device: {device}", flush=True)
     print(
-        f"V2: history=200ms frame_stack=5 horizons={horizons} "
-        f"control_horizon={selected_control_horizon:g}ms",
+        f"V2: history={history_ms:g}ms frame_stack={frame_stack} "
+        f"horizons={horizons} control_horizon={selected_control_horizon:g}ms",
         flush=True,
     )
     print(
         f"Split {split.name}: train={len(partitions['train'])}, "
-        f"validation={len(partitions['validation'])}, test={len(partitions['test'])}",
+        f"validation={len(partitions['validation'])}, "
+        f"test={len(partitions['test'])}",
         flush=True,
     )
     print(
@@ -240,13 +253,6 @@ def main() -> int:
         ),
     }
 
-    model_config = raw.get("model", {})
-    if not isinstance(model_config, dict):
-        raise ValueError("model config must be a mapping")
-    architecture = str(model_config.get("architecture", "mobilenet_v3_small"))
-    frame_stack = int(model_config.get("frame_stack", 5))
-    pretrained = bool(model_config.get("pretrained", True)) and not args.no_pretrained
-
     model = build_model(
         architecture,
         frame_stack=frame_stack,
@@ -266,23 +272,31 @@ def main() -> int:
                 loaders["train"],
                 device,
                 optimizer=optimizer,
+                primary_output_index=primary_index,
                 max_batches=1,
             )
             validation_summary = run_epoch(
                 model,
                 loaders["validation"],
                 device,
+                primary_output_index=primary_index,
                 max_batches=1,
             )
-            print_summary("smoke/train", train_summary, horizons)
-            print_summary("smoke/validation", validation_summary, horizons)
+            print_summary(
+                "smoke/train", train_summary, horizons, primary_index
+            )
+            print_summary(
+                "smoke/validation", validation_summary, horizons, primary_index
+            )
             print("V2 smoke test passed.", flush=True)
             return 0
 
         artifact_config = raw.get("artifact", {})
         if not isinstance(artifact_config, dict):
             raise ValueError("artifact config must be a mapping")
-        artifact_name = str(artifact_config.get("name", "mobilenet_v3_small_v2"))
+        artifact_name = str(
+            artifact_config.get("name", "mobilenet_v3_small_v2")
+        )
         artifact_dir = ROOT / "artifacts" / "models" / artifact_name
         artifact_dir.mkdir(parents=True, exist_ok=True)
         model_path = artifact_dir / "model.pt"
@@ -297,11 +311,27 @@ def main() -> int:
                 loaders["train"],
                 device,
                 optimizer=optimizer,
+                primary_output_index=primary_index,
             )
-            validation_summary = run_epoch(model, loaders["validation"], device)
+            validation_summary = run_epoch(
+                model,
+                loaders["validation"],
+                device,
+                primary_output_index=primary_index,
+            )
             elapsed = time.perf_counter() - started
-            print_summary(f"epoch {epoch:02d}/train", train_summary, horizons)
-            print_summary(f"epoch {epoch:02d}/validation", validation_summary, horizons)
+            print_summary(
+                f"epoch {epoch:02d}/train",
+                train_summary,
+                horizons,
+                primary_index,
+            )
+            print_summary(
+                f"epoch {epoch:02d}/validation",
+                validation_summary,
+                horizons,
+                primary_index,
+            )
             print(f"epoch {epoch:02d}/time: {elapsed:.1f}s", flush=True)
             history.append(
                 {
@@ -317,9 +347,22 @@ def main() -> int:
                 best_epoch = epoch
                 torch.save(model.state_dict(), model_path)
 
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        test_summary = run_epoch(model, loaders["test"], device)
-        print_summary("test", test_summary, horizons)
+        try:
+            state_dict = torch.load(
+                model_path,
+                map_location=device,
+                weights_only=True,
+            )
+        except TypeError:
+            state_dict = torch.load(model_path, map_location=device)
+        model.load_state_dict(state_dict)
+        test_summary = run_epoch(
+            model,
+            loaders["test"],
+            device,
+            primary_output_index=primary_index,
+        )
+        print_summary("test", test_summary, horizons, primary_index)
 
         metadata = {
             "architecture": architecture,

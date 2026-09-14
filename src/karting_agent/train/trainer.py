@@ -62,7 +62,11 @@ class VideoSplit:
     test: tuple[str, ...]
 
     def validate(self) -> None:
-        groups = {"train": self.train, "validation": self.validation, "test": self.test}
+        groups = {
+            "train": self.train,
+            "validation": self.validation,
+            "test": self.test,
+        }
         for name, videos in groups.items():
             if not videos:
                 raise ValueError(f"{name} split must not be empty")
@@ -133,18 +137,15 @@ def load_video_split(path: Path) -> VideoSplit:
 
 
 def _optional_float_tuple(raw: dict, key: str) -> tuple[float, ...]:
-    value = raw.get(key, ())
-    return tuple(float(item) for item in value)
+    return tuple(float(item) for item in raw.get(key, ()))
 
 
 def _optional_int_tuple(raw: dict, key: str) -> tuple[int, ...]:
-    value = raw.get(key, ())
-    return tuple(int(item) for item in value)
+    return tuple(int(item) for item in raw.get(key, ()))
 
 
 def _optional_bool_tuple(raw: dict, key: str) -> tuple[bool, ...]:
-    value = raw.get(key, ())
-    return tuple(bool(item) for item in value)
+    return tuple(bool(item) for item in raw.get(key, ()))
 
 
 def load_samples(path: Path) -> list[DatasetSample]:
@@ -160,22 +161,34 @@ def load_samples(path: Path) -> list[DatasetSample]:
                 samples.append(
                     DatasetSample(
                         video=str(raw["video"]),
-                        input_frame_indices=tuple(int(v) for v in raw["input_frame_indices"]),
-                        input_timestamps_ms=tuple(float(v) for v in raw["input_timestamps_ms"]),
+                        input_frame_indices=tuple(
+                            int(value) for value in raw["input_frame_indices"]
+                        ),
+                        input_timestamps_ms=tuple(
+                            float(value) for value in raw["input_timestamps_ms"]
+                        ),
                         target_frame_index=int(raw["target_frame_index"]),
                         target_timestamp_ms=float(raw["target_timestamp_ms"]),
                         target_pressed=bool(raw["target_pressed"]),
-                        transition_distance_ms=None if distance is None else float(distance),
+                        transition_distance_ms=(
+                            None if distance is None else float(distance)
+                        ),
                         near_transition=bool(raw["near_transition"]),
                         near_short_correction=bool(raw["near_short_correction"]),
-                        target_frame_indices=_optional_int_tuple(raw, "target_frame_indices"),
-                        target_timestamps_ms=_optional_float_tuple(raw, "target_timestamps_ms"),
+                        target_frame_indices=_optional_int_tuple(
+                            raw, "target_frame_indices"
+                        ),
+                        target_timestamps_ms=_optional_float_tuple(
+                            raw, "target_timestamps_ms"
+                        ),
                         target_pressed_by_horizon=_optional_bool_tuple(
                             raw, "target_pressed_by_horizon"
                         ),
                         transition_distance_ms_by_horizon=tuple(
                             None if value is None else float(value)
-                            for value in raw.get("transition_distance_ms_by_horizon", ())
+                            for value in raw.get(
+                                "transition_distance_ms_by_horizon", ()
+                            )
                         ),
                         near_transition_by_horizon=_optional_bool_tuple(
                             raw, "near_transition_by_horizon"
@@ -186,25 +199,39 @@ def load_samples(path: Path) -> list[DatasetSample]:
                     )
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise ValueError(f"invalid dataset sample at {path}:{line_number}") from exc
+                raise ValueError(
+                    f"invalid dataset sample at {path}:{line_number}"
+                ) from exc
     return samples
 
 
-def select_samples_by_videos(samples: Iterable[DatasetSample], videos: Iterable[str]) -> list[DatasetSample]:
+def select_samples_by_videos(
+    samples: Iterable[DatasetSample],
+    videos: Iterable[str],
+) -> list[DatasetSample]:
     allowed = set(videos)
     return [sample for sample in samples if sample.video in allowed]
 
 
-def partition_samples(samples: Sequence[DatasetSample], split: VideoSplit) -> dict[str, list[DatasetSample]]:
+def partition_samples(
+    samples: Sequence[DatasetSample],
+    split: VideoSplit,
+) -> dict[str, list[DatasetSample]]:
     split.validate()
     available = {sample.video for sample in samples}
     configured = set(split.all_videos)
     missing = configured - available
     if missing:
-        raise ValueError("split references videos absent from samples: " + ", ".join(sorted(missing)))
+        raise ValueError(
+            "split references videos absent from samples: "
+            + ", ".join(sorted(missing))
+        )
     unassigned = available - configured
     if unassigned:
-        raise ValueError("samples contain videos not assigned to a split: " + ", ".join(sorted(unassigned)))
+        raise ValueError(
+            "samples contain videos not assigned to a split: "
+            + ", ".join(sorted(unassigned))
+        )
     return {
         "train": select_samples_by_videos(samples, split.train),
         "validation": select_samples_by_videos(samples, split.validation),
@@ -221,16 +248,25 @@ def sample_weight(sample: DatasetSample, config: SamplingConfig) -> float:
     return config.stable_weight
 
 
-def build_sample_weights(samples: Sequence[DatasetSample], config: SamplingConfig) -> list[float]:
+def build_sample_weights(
+    samples: Sequence[DatasetSample],
+    config: SamplingConfig,
+) -> list[float]:
     config.validate()
     return [sample_weight(sample, config) for sample in samples]
 
 
-def sampling_summary(samples: Sequence[DatasetSample], config: SamplingConfig) -> dict[str, float | int]:
+def sampling_summary(
+    samples: Sequence[DatasetSample],
+    config: SamplingConfig,
+) -> dict[str, float | int]:
     config.validate()
     total = len(samples)
-    stable = sum(not s.near_transition and not s.near_short_correction for s in samples)
-    short = sum(s.near_short_correction for s in samples)
+    stable = sum(
+        not sample.near_transition and not sample.near_short_correction
+        for sample in samples
+    )
+    short = sum(sample.near_short_correction for sample in samples)
     transition = total - stable - short
     weighted_stable = stable * config.stable_weight
     weighted_transition = transition * config.transition_weight
@@ -254,14 +290,21 @@ def sampling_summary(samples: Sequence[DatasetSample], config: SamplingConfig) -
     }
 
 
-def make_weighted_sampler(samples: Sequence[DatasetSample], config: SamplingConfig, *, generator=None):
+def make_weighted_sampler(
+    samples: Sequence[DatasetSample],
+    config: SamplingConfig,
+    *,
+    generator=None,
+):
     config.validate()
     if not samples:
         raise ValueError("cannot create a sampler for an empty dataset")
     try:
         from torch.utils.data import WeightedRandomSampler
     except ImportError as exc:
-        raise RuntimeError('PyTorch is required; install with: pip install -e ".[train]"') from exc
+        raise RuntimeError(
+            'PyTorch is required; install with: pip install -e ".[train]"'
+        ) from exc
     return WeightedRandomSampler(
         weights=build_sample_weights(samples, config),
         num_samples=len(samples),
@@ -277,14 +320,20 @@ def run_epoch(
     *,
     optimizer=None,
     threshold: float = 0.5,
+    primary_output_index: int = 0,
     max_batches: int | None = None,
 ) -> dict[str, object]:
-    """Run one epoch. Column zero remains the primary/control head."""
+    """Run one epoch and report the selected control head plus every output."""
     try:
         import torch
         from torch.nn import functional as F
     except ImportError as exc:
-        raise RuntimeError('PyTorch is required; install with: pip install -e ".[train]"') from exc
+        raise RuntimeError(
+            'PyTorch is required; install with: pip install -e ".[train]"'
+        ) from exc
+
+    if primary_output_index < 0:
+        raise ValueError("primary_output_index must be >= 0")
 
     training = optimizer is not None
     model.train(training)
@@ -307,6 +356,8 @@ def run_epoch(
 
             logits = model(inputs)
             if logits.ndim == 1:
+                if primary_output_index != 0:
+                    raise ValueError("single-output model only supports primary index 0")
                 if targets.ndim != 1:
                     targets = targets.reshape(-1)
                 primary_logits = logits
@@ -315,13 +366,20 @@ def run_epoch(
             elif logits.ndim == 2:
                 if targets.ndim != 2 or targets.shape != logits.shape:
                     raise ValueError(
-                        f"multi-horizon target/logit shape mismatch: {targets.shape} vs {logits.shape}"
+                        "multi-horizon target/logit shape mismatch: "
+                        f"{targets.shape} vs {logits.shape}"
                     )
-                primary_logits = logits[:, 0]
-                primary_targets = targets[:, 0]
                 output_count = logits.shape[1]
+                if primary_output_index >= output_count:
+                    raise ValueError(
+                        f"primary_output_index {primary_output_index} >= {output_count}"
+                    )
+                primary_logits = logits[:, primary_output_index]
+                primary_targets = targets[:, primary_output_index]
             else:
-                raise ValueError(f"unsupported model output shape: {tuple(logits.shape)}")
+                raise ValueError(
+                    f"unsupported model output shape: {tuple(logits.shape)}"
+                )
 
             loss = F.binary_cross_entropy_with_logits(logits, targets)
             if training:
@@ -332,29 +390,47 @@ def run_epoch(
             total_loss += float(loss.detach().item()) * batch_size
             total_samples += batch_size
 
-            primary_probabilities = torch.sigmoid(primary_logits).detach().cpu().numpy()
+            primary_probabilities = (
+                torch.sigmoid(primary_logits).detach().cpu().numpy()
+            )
             primary_values = primary_targets.detach().cpu().numpy()
-            transition_mask = batch["near_transition"].detach().cpu().numpy().astype(bool)
-            short_mask = batch["near_short_correction"].detach().cpu().numpy().astype(bool)
+            transition_mask = (
+                batch["near_transition"].detach().cpu().numpy().astype(bool)
+            )
+            short_mask = (
+                batch["near_short_correction"].detach().cpu().numpy().astype(bool)
+            )
             all_metrics.update(primary_probabilities, primary_values)
-            transition_metrics.update(primary_probabilities[transition_mask], primary_values[transition_mask])
-            short_metrics.update(primary_probabilities[short_mask], primary_values[short_mask])
+            transition_metrics.update(
+                primary_probabilities[transition_mask],
+                primary_values[transition_mask],
+            )
+            short_metrics.update(
+                primary_probabilities[short_mask],
+                primary_values[short_mask],
+            )
 
             if output_metrics is None:
-                output_metrics = [BinaryMetricAccumulator(threshold) for _ in range(output_count)]
+                output_metrics = [
+                    BinaryMetricAccumulator(threshold) for _ in range(output_count)
+                ]
             if logits.ndim == 1:
                 output_metrics[0].update(primary_probabilities, primary_values)
             else:
                 probabilities = torch.sigmoid(logits).detach().cpu().numpy()
                 values = targets.detach().cpu().numpy()
-                for index, metric in enumerate(output_metrics):
-                    metric.update(probabilities[:, index], values[:, index])
+                for output_index, metric in enumerate(output_metrics):
+                    metric.update(
+                        probabilities[:, output_index],
+                        values[:, output_index],
+                    )
 
     if total_samples == 0:
         raise ValueError("data loader produced no samples")
     assert output_metrics is not None
     return {
         "loss": total_loss / total_samples,
+        "primary_output_index": primary_output_index,
         "all": all_metrics.result().to_dict(),
         "transition": transition_metrics.result().to_dict(),
         "short_correction": short_metrics.result().to_dict(),

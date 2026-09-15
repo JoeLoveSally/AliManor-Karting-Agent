@@ -27,9 +27,9 @@ def test_extract_road_mask_selects_blue_track_over_cyan_background() -> None:
 
 def test_extract_road_mask_combines_multiple_visual_themes() -> None:
     hsv = np.zeros((180, 180, 3), dtype=np.uint8)
-    hsv[:, :] = (94, 120, 230)  # bright cyan background, intentionally excluded
-    hsv[20:80, 20:100] = (116, 180, 150)  # blue road
-    hsv[100:160, 70:160] = (60, 170, 150)  # green road
+    hsv[:, :] = (94, 120, 230)
+    hsv[20:80, 20:100] = (116, 180, 150)
+    hsv[100:160, 70:160] = (60, 170, 150)
     frame = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     config = RoadMaskConfig(
@@ -59,7 +59,7 @@ def test_row_centerline_uses_widest_contiguous_run() -> None:
         assert abs(x_norm - 59.5 / 99.0) < 1e-6
 
 
-def test_rectilinear_geometry_classifies_single_straight_axis() -> None:
+def test_rectilinear_geometry_derives_center_axis_from_straight_edges() -> None:
     mask = np.zeros((240, 240), dtype=np.uint8)
     mask[90:140, 20:220] = 255
 
@@ -67,22 +67,28 @@ def test_rectilinear_geometry_classifies_single_straight_axis() -> None:
         mask,
         RectilinearGeometryConfig(
             hough_threshold=20,
-            # Long-axis filtering suppresses the short road-width end caps.
             min_line_length_fraction=0.16,
             max_line_gap_fraction=0.03,
+            min_road_width_fraction=0.02,
+            max_road_width_fraction=0.30,
+            min_axis_overlap_fraction=0.05,
         ),
     )
 
     assert geometry.geometry_class == "straight"
-    assert geometry.primary_angle_deg is not None
-    assert min(abs(geometry.primary_angle_deg), abs(180 - geometry.primary_angle_deg)) < 5
-    assert geometry.secondary_angle_deg is None
+    assert geometry.primary_center_axis is not None
+    axis = geometry.primary_center_axis
+    assert min(abs(axis.angle_deg), abs(180 - axis.angle_deg)) < 5
+    midpoint_y = 0.5 * (axis.y1 + axis.y2)
+    assert abs(midpoint_y - 114.5) < 6
+    assert 40 < axis.width_px < 60
+    assert axis.length > 150
+    assert geometry.secondary_center_axis is None
     assert not geometry.corner_visible
 
 
-def test_rectilinear_geometry_detects_visible_l_corner() -> None:
+def test_rectilinear_geometry_derives_center_axes_for_l_corner() -> None:
     mask = np.zeros((260, 260), dtype=np.uint8)
-    # Thick L-shaped drivable area. Both road legs are much longer than road width.
     mask[70:120, 30:220] = 255
     mask[70:230, 170:220] = 255
 
@@ -94,19 +100,29 @@ def test_rectilinear_geometry_detects_visible_l_corner() -> None:
             max_line_gap_fraction=0.04,
             axis_tolerance_deg=8.0,
             min_axis_separation_deg=40.0,
+            min_road_width_fraction=0.02,
+            max_road_width_fraction=0.30,
+            min_axis_overlap_fraction=0.05,
             corner_extension_fraction=0.12,
             anchor_x_norm=0.5,
             anchor_y_norm=0.5,
         ),
     )
 
-    assert geometry.primary_angle_deg is not None
-    assert geometry.secondary_angle_deg is not None
-    separation = abs(geometry.primary_angle_deg - geometry.secondary_angle_deg) % 180
+    assert geometry.primary_center_axis is not None
+    assert geometry.secondary_center_axis is not None
+    separation = abs(
+        geometry.primary_center_axis.angle_deg
+        - geometry.secondary_center_axis.angle_deg
+    ) % 180
     separation = min(separation, 180 - separation)
     assert separation > 70
-    assert geometry.corner_score > 0
     assert geometry.corner_visible
     assert geometry.corner_x_norm is not None
     assert geometry.corner_y_norm is not None
     assert geometry.corner_distance_norm is not None
+
+    # The inferred center axes should meet near the corridor center, around
+    # (195, 95), rather than at one of the visible road boundaries.
+    assert abs(geometry.corner_x_norm - 195 / 259) < 0.08
+    assert abs(geometry.corner_y_norm - 95 / 259) < 0.08

@@ -1,13 +1,41 @@
-# Initial v4 pseudo-label teacher for the current blue-track visual theme.
-# OpenCV HSV ranges: H=[0,179], S=[0,255], V=[0,255].
+# Offline geometry-teacher feasibility configuration.
+#
+# The kart tracks are mostly piecewise straight with discrete corners. The
+# teacher therefore focuses on visible straight axes + corner intersections,
+# not continuous centerline curvature. OpenCV HSV uses H=[0,179], S/V=[0,255].
 road_mask:
-  hsv_lower: [103, 90, 50]
-  hsv_upper: [130, 255, 220]
+  # Multiple ranges are OR-ed. These are broad POC ranges for the dark/medium
+  # blue, cyan/teal, green and dark-neutral track themes in the 15 recordings.
+  # They still require visual audit before becoming training supervision.
+  hsv_ranges:
+    - lower: [103, 70, 35]
+      upper: [135, 255, 210]
+    - lower: [80, 70, 35]
+      upper: [102, 255, 205]
+    - lower: [35, 55, 30]
+      upper: [85, 255, 205]
+    - lower: [0, 0, 0]
+      upper: [179, 110, 135]
   close_kernel: 9
   open_kernel: 3
-  min_component_area_fraction: 0.02
+  min_component_area_fraction: 0.01
+  max_components: 4
+
+rectilinear:
+  canny_low: 40
+  canny_high: 120
+  hough_threshold: 24
+  min_line_length_fraction: 0.10
+  max_line_gap_fraction: 0.025
+  axis_tolerance_deg: 10.0
+  min_axis_separation_deg: 25.0
+  corner_extension_fraction: 0.08
+
+  # Diagnostic anchor only. It is NOT claimed to be the kart center. Until a
+  # reliable kart/travel-direction teacher exists we report nearest visible
+  # corner, not "next left/right corner".
+  anchor_x_norm: 0.50
+  anchor_y_norm: 0.58
 
 preview:
   sample_every_frames: 120
-  row_step: 16
-  min_run_width: 12

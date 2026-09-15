@@ -247,4 +247,37 @@ The evaluator sweeps switch thresholds `0.5 0.6 0.7 0.8 0.9` and reports:
 - number of rapid state flips below 100 ms and 200 ms;
 - auxiliary future-action F1 as a visual-backbone sanity check.
 
-The stateful replay is the final offline gate before implementing the v3 RuntimeEngine/ADB path. Threshold selection should be based on transition timing and chatter together, not sample F1 alone.
+Held-out test results:
+
+```text
+threshold  target transition F1  short recall  <100ms flips  <200ms flips
+0.50       0.919                 0.778         2             10
+0.60       0.918                 0.778         1              9
+0.70       0.854                 0.500         1              6
+0.80       0.840                 0.500         1              6
+0.90       0.785                 0.389         0              2
+```
+
+All tested thresholds produced zero false switches in the evaluator's true stable-section mask. Raising the threshold above 0.6 sharply reduces short-correction recall, so `0.6` is selected for the first runtime test. The `<200ms` count is not treated as pure chatter because the dataset contains legitimate 100-300 ms correction segments; `<100ms` is the stronger chatter warning and only one such pair remains at threshold 0.6.
+
+The observation-timeline transition F1 is lower because `switch@+100ms` describes the desired state at `t+100ms` while the first runtime implementation executes a confident switch immediately. This lead is intentional for the first closed-loop experiment and will be reassessed from recorded ADB timing rather than hidden with an arbitrary fixed delay.
+
+Decision: the v3 offline gate passes. Use `switch_threshold=0.6`, no debounce/min-hold initially, and preserve the short corrections that the model currently detects.
+
+## 13. Runtime integration
+
+The v3 runtime path is separate from the existing v1/v2 PRESS-probability path:
+
+```text
+visual stack + current physical state
+            ↓
+StateConditionedModelRunner
+            ↓
+switch@100ms probability
+            ↓
+StateConditionedRuntimeEngine
+            ↓
+p >= 0.6 ? flip PRESS/RELEASE : HOLD
+```
+
+The engine feeds its own post-execution state back into the next inference call. It starts in RELEASE and performs a safety RELEASE on shutdown if needed. The first ADB POC uses `scripts/run_adb_closed_loop_v3.py`; the existing `run_adb_closed_loop.py` remains unchanged for v1/v2.

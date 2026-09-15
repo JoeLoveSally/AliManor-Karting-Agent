@@ -67,7 +67,8 @@ def test_rectilinear_geometry_classifies_single_straight_axis() -> None:
         mask,
         RectilinearGeometryConfig(
             hough_threshold=20,
-            min_line_length_fraction=0.08,
+            # Long-axis filtering suppresses the short road-width end caps.
+            min_line_length_fraction=0.16,
             max_line_gap_fraction=0.03,
         ),
     )
@@ -81,7 +82,7 @@ def test_rectilinear_geometry_classifies_single_straight_axis() -> None:
 
 def test_rectilinear_geometry_detects_visible_l_corner() -> None:
     mask = np.zeros((260, 260), dtype=np.uint8)
-    # Thick L-shaped drivable area. Its outer/inner edges provide two strong axes.
+    # Thick L-shaped drivable area. Both road legs are much longer than road width.
     mask[70:120, 30:220] = 255
     mask[70:230, 170:220] = 255
 
@@ -89,7 +90,7 @@ def test_rectilinear_geometry_detects_visible_l_corner() -> None:
         mask,
         RectilinearGeometryConfig(
             hough_threshold=18,
-            min_line_length_fraction=0.07,
+            min_line_length_fraction=0.16,
             max_line_gap_fraction=0.04,
             axis_tolerance_deg=8.0,
             min_axis_separation_deg=40.0,

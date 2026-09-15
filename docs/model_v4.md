@@ -5,15 +5,13 @@
 v4 keeps the deployed controller fully model-driven while separating two questions that v1-v3 mixed together:
 
 1. how temporal information should be represented;
-2. whether visual supervision should force the model to understand road geometry instead of relying on shortcuts.
+2. whether visual supervision should force the model to understand causal track/kart geometry instead of relying on shortcuts.
 
 Traditional computer vision is allowed only as an offline pseudo-label teacher and shadow debugger. It never sends runtime control actions.
 
 ## 2. v3 reference
 
 v3 remains the best control baseline at the end of the temporal ablation.
-
-Architecture:
 
 ```text
 5 RGB frames
@@ -47,215 +45,216 @@ observation F1       = 0.753
 
 ## 3. Controlled temporal ablation
 
-The v3 → v4-A → v4-A2 comparison kept these fixed:
+The v3 → v4-A → v4-A2 comparison kept data, split, 200ms/5-frame history, preprocessing, targets, state conditioning, sampling, optimizer and checkpoint semantics fixed.
 
-- same 15 source videos and video-level split;
-- same v3 sample manifest;
-- same five timestamps `[-200,-150,-100,-50,0] ms`;
-- same `224×224` preprocessing and HUD/touch masks;
-- same current-state conditioning and counterfactual train states;
-- same KEEP/SWITCH targets;
-- same future-action auxiliary targets and weight `0.5`;
-- same `100/200/300ms` horizons and `100ms` control horizon;
-- same sampling weights, optimizer, batch size, epoch count, and seed;
-- same checkpoint rule: lowest validation `switch_loss`;
-- no geometry loss.
+### v4-A: shared per-frame CNN + GRU
 
-The explicit-time models reused the same per-frame cache in `data/processed/frame_cache_v2`.
-
-## 4. v4-A: shared per-frame CNN + GRU
-
-```text
-5 RGB frames
-→ shared MobileNetV3-Small per frame
-→ 5 × 128-d feature sequence
-→ GRU(128)
-→ temporal feature
-+ current action
-→ KEEP / SWITCH
-```
-
-Best checkpoint was epoch 1 because validation loss worsened rapidly after that.
-
-Held-out result:
-
-```text
-static switch@100 F1 = 0.776
-aux h100/h200/h300   = 0.960 / 0.959 / 0.962
-```
-
-Best useful stateful point was approximately threshold `0.50`:
+Best useful stateful result:
 
 ```text
 target transition F1 = 0.892
 matched              = 74 / 88
-predicted            = 78
 short recall         = 0.722
-chatter <100ms       = 0
-chatter <200ms       = 1
 observation F1       = 0.554
 ```
 
-Interpretation: GRU produced a smoother controller, but it missed useful short corrections and did not beat v3.
+GRU was smoother but missed useful short corrections.
 
-## 5. v4-A2: shared per-frame CNN + ordered temporal MLP
+### v4-A2: shared per-frame CNN + ordered temporal MLP
 
-v4-A2 removed recurrence while preserving explicit frame order:
-
-```text
-frame -200 → CNN → z1
-frame -150 → CNN → z2
-frame -100 → CNN → z3
-frame  -50 → CNN → z4
-frame    0 → CNN → z5
-
-[z1,z2,z3,z4,z5]
-→ ordered concatenation (640-d)
-→ Linear(640,128) + Hardswish + Dropout
-→ temporal feature
-+ current action
-→ KEEP / SWITCH
-```
-
-The model again overfit quickly. Lowest validation `switch_loss` occurred at epoch 1.
-
-Held-out static result:
+Best target-timeline point was threshold `0.70`:
 
 ```text
-switch@100 precision = 0.793
-switch@100 recall    = 0.769
-switch@100 F1        = 0.781
-aux h100/h200/h300   = 0.965 / 0.962 / 0.959
+target transition F1 = 0.907
+matched              = 78 / 88
+short recall         = 0.722
+observation F1       = 0.744
+chatter <200ms       = 4
 ```
 
-Stateful evaluator:
+It recovered some performance versus GRU but still did not beat v3, especially on short-correction recall.
+
+### Temporal conclusion
 
 ```text
-threshold 0.50:
-  target F1      = 0.897
-  matched        = 78 / 88
-  predicted      = 86
-  short recall   = 0.722
-  chatter <100   = 2
-  chatter <200   = 8
-  observation F1 = 0.701
-
-threshold 0.60:
-  target F1      = 0.897
-  matched        = 78 / 88
-  predicted      = 86
-  short recall   = 0.722
-  chatter <100   = 2
-  chatter <200   = 8
-  observation F1 = 0.736
-
-threshold 0.70:
-  target F1      = 0.907
-  matched        = 78 / 88
-  predicted      = 84
-  short recall   = 0.722
-  chatter <100   = 1
-  chatter <200   = 4
-  observation F1 = 0.744
-
-threshold 0.90:
-  target F1      = 0.894
-  matched        = 76 / 88
-  predicted      = 82
-  short recall   = 0.667
-  chatter <100   = 0
-  chatter <200   = 3
-  observation F1 = 0.812
+v3 15-channel temporal CNN         → best overall control baseline
+v4-A per-frame CNN + GRU           → worse, overly smooth
+v4-A2 per-frame CNN + temporal MLP → closer, still no meaningful win
 ```
 
-The best target-timeline point is threshold `0.70`. It is close to v3 on transition F1 and has less chatter, but still loses on the control behavior we care about most:
-
-```text
-                 v3@0.60   v4-A2@0.70
-transition F1      0.918       0.907
-matched            78/88       78/88
-short recall       0.778       0.722
-observation F1     0.753       0.744
-chatter <200ms         9           4
-```
-
-The higher v4-A2 observation F1 at threshold `0.90` is not selected because it is achieved by delaying decisions and reducing short-correction recall to `0.667`.
-
-## 6. Temporal conclusion
-
-The controlled temporal experiment is now closed.
-
-Evidence:
-
-```text
-v3 15-channel temporal CNN        → best overall control baseline
-v4-A per-frame CNN + GRU          → worse, overly smooth
-v4-A2 per-frame CNN + temporal MLP→ closer, but still no meaningful win
-```
-
-Therefore:
+Therefore temporal architecture search is paused:
 
 - do not implement v4-A/v4-A2 ADB runtime;
-- do not spend the next iteration on GRU tuning;
-- do not proceed to `400/800ms` temporal history yet;
+- do not continue with 400/800ms GRU history now;
 - do not add TCN/attention simply to continue architecture search.
 
-This result does not prove explicit time is inherently inferior. It shows that with the current 15 expert videos, explicit per-frame encoders add capacity and overfit quickly without producing better held-out control behavior.
+The next experiment returns to the v3 control formulation and changes visual supervision instead.
 
-## 7. Next phase: v4-C structured visual supervision
+## 4. Track geometry model: piecewise straight, not continuous curvature
 
-The next experiment keeps the best v3 control formulation and asks a different question:
-
-> Can auxiliary road supervision force the visual backbone to encode causal track geometry and reduce shortcut reliance?
-
-Initial target:
+The recorded game tracks are not ordinary continuously curved racing roads. Their useful structure is better described as:
 
 ```text
-road segmentation
+straight segment
+→ discrete corner
+→ straight segment
+→ discrete corner
 ```
 
-Later targets such as centerline, curvature, bend distance, kart center, or heading are added only if their labels are reliable.
+Screen projection may make the world axes appear diagonal, but the topology remains piecewise rectilinear. The curved visual trajectory during drifting is primarily vehicle motion, not the road centerline itself.
 
-The intended experimental principle is again to change one thing at a time. The first v4-C policy should stay as close to v3 as possible while adding an auxiliary geometry objective.
+Therefore v4-C must **not** treat continuous centerline curvature as the primary geometry target.
 
-Conceptually:
+The geometry priorities are now:
+
+```text
+1. drivable-road / road-region representation
+2. visible local road axis / straight-segment direction
+3. visible corner presence and proximity
+4. later: travel-relative next-corner direction
+5. later: kart center / heading
+6. later: lateral offset and heading error relative to current road axis
+```
+
+Continuous curvature is deferred unless later evidence shows it adds value.
+
+## 5. Why kart-relative state matters
+
+The important closed-loop failure observed in v3 was not simply "the model cannot see a bend".
+
+During the critical second bend, after RELEASE the kart progressively moved/rotated toward the road edge while the policy continued to KEEP RELEASE. This is naturally described by state variables such as:
+
+```text
+current road axis
++ kart lateral offset
++ kart heading error
++ distance to a relevant corner
++ current PRESS / RELEASE state
+```
+
+That motivates structured visual supervision. It does **not** imply the deployed controller should become a hand-written geometric controller.
+
+## 6. v4-C target architecture
+
+Keep the best v3 temporal/control path and add auxiliary geometry tasks:
 
 ```text
 15-channel v3 visual history
         ↓
-MobileNetV3 shared backbone
-        ├── policy feature → state-conditioned KEEP/SWITCH
-        ├── future-action auxiliary head
-        └── road-geometry auxiliary supervision
+MobileNetV3 backbone
+        ↓
+shared visual feature
+   ┌─────────────┬──────────────────┬───────────────────┐
+   ↓             ↓                  ↓                   ↓
+KEEP/SWITCH   future action      road/axis heads     later kart-pose heads
+   head          head               │                   │
+   │                              training-only structured supervision
+current action
+   │
+learned policy
 ```
 
-The exact geometry head should only be finalized after teacher-label quality is audited.
+The deployment path stays neural. Analytic CV is used only to create labels and diagnose failures.
 
-## 8. Geometry pseudo-label teacher
+## 7. Geometry teacher: feasibility stage
 
-Current teacher:
+The first road-mask POC used one blue HSV range. The 15-video audit showed that this assumption was too narrow: several dark/blue/cyan/green/neutral themes produced effectively zero mask coverage while others worked.
+
+The teacher is therefore changed in two ways.
+
+### 7.1 Multi-theme road candidate mask
+
+The POC now ORs several broad HSV bands covering:
+
+- blue;
+- cyan / teal;
+- green;
+- dark neutral road themes.
+
+Morphology and connected-component filtering are then applied. This is still only a teacher candidate and must be visually audited again; the ranges are intentionally not treated as ground truth.
+
+### 7.2 Rectilinear geometry diagnostics
+
+From the road candidate mask:
 
 ```text
-expert video frame
-→ HSV threshold for the current blue-track theme
-→ morphology
-→ largest valid road component
-→ road mask
-→ optional row-centerline diagnostic
+mask
+→ edge map
+→ Hough line segments
+→ weighted dominant screen-space road axis
+→ optional second axis
+→ finite-segment intersection candidates
+→ nearest visible corner diagnostic
 ```
 
-The teacher is supervision tooling only. It is not a runtime controller.
+Per frame the POC reports:
 
-Before pseudo-labels enter training loss, audit all 15 videos:
+```text
+geometry_class:
+  unknown / straight / mixed_axes / corner_visible
 
-1. sample representative frames from every video;
-2. inspect road-mask coverage through straights and bends;
-3. check whether kart occlusion breaks the road region;
-4. check whether UI/background regions leak into the mask;
-5. identify visual themes or intervals where the teacher is unreliable;
-6. exclude or down-weight unreliable pseudo-labels rather than silently training on them.
+primary_angle_deg
+secondary_angle_deg
+straight_confidence
+corner_score
+corner_visible
+corner_x_norm / corner_y_norm
+corner_distance_norm
+```
 
-The inspection script writes per-video sheets plus one global overview sheet:
+The overlay uses:
+
+```text
+green   = road candidate mask
+yellow  = primary straight-axis segments
+magenta = secondary-axis segments
+red     = nearest visible axis intersection
+white X = diagnostic anchor
+```
+
+## 8. Important semantic limit: nearest visible corner is not next corner
+
+The current teacher deliberately does **not** output:
+
+```text
+next corner = left/right
+```
+
+or claim that the white diagnostic anchor is the kart center.
+
+A road mask alone does not provide travel direction. The nearest visible intersection can be ahead, behind, or unrelated to the vehicle's current motion.
+
+Reliable travel-relative labels require an additional teacher for at least one of:
+
+```text
+kart center + heading
+or
+kart motion vector from adjacent frames
+```
+
+Only after that exists can we define:
+
+```text
+current road direction
+next corner distance
+next corner direction
+lateral offset
+heading error
+```
+
+without inventing semantics that the teacher cannot support.
+
+## 9. Current geometry audit outputs
+
+Run:
+
+```bash
+python scripts/inspect_geometry_pseudo_labels.py \
+  data/raw/video_*.mp4 \
+  --max-previews-per-video 12
+```
+
+Outputs:
 
 ```text
 artifacts/geometry_pseudo_labels/
@@ -268,35 +267,119 @@ artifacts/geometry_pseudo_labels/
     └── summary.json
 ```
 
-## 9. Geometry loss
+`index.json` explicitly records that these labels are not yet available:
 
-When the teacher passes audit, v4-C may use:
+```text
+next_corner_direction
+kart_center
+kart_heading
+lateral_offset
+heading_error
+```
+
+This prevents the POC diagnostic from silently becoming a stronger label claim later.
+
+## 10. Gate before model training
+
+Do **not** generate full pseudo-labels or train v4-C until the revised teacher passes a second audit.
+
+Inspect all 15 video themes for:
+
+1. road mask coverage on straight segments;
+2. background/UI false positives;
+3. stability through visually patterned road themes;
+4. primary axis alignment with real road edges;
+5. second-axis detection around actual corners;
+6. false intersections caused by UI or unrelated fragments;
+7. geometry usability rate by video/theme.
+
+A label family only enters training if its teacher quality is high enough to be more informative than noisy.
+
+## 11. Planned supervision stages
+
+Do not add every geometry target at once.
+
+### v4-C1: road/axis supervision
+
+First candidate after audit:
 
 ```text
 L = L_switch
   + λ_action * L_future_action
   + λ_road * L_road
+  + optional λ_axis * L_axis
 ```
 
-`λ_road` is an explicit hyperparameter, not a default constant. Too little supervision may leave the shortcut unchanged; too much may over-optimize segmentation at the expense of control.
+Possible axis target representation should avoid angle wrap ambiguity, e.g. predict axial orientation as:
 
-Geometry quality and policy quality must be evaluated separately.
+```text
+(cos 2θ, sin 2θ)
+```
 
-## 10. Covariate shift remains independent
+rather than direct degrees.
 
-v4-C addresses visual representation, not expert-only behavior-cloning covariate shift.
+### v4-C2: corner state
 
-Even with better perception, model-driven closed loop can still create observations outside the expert distribution after an earlier timing error. Later iterations therefore still need valid pre-failure deviation/recovery data through iterative behavior cloning or a DAgger-like process.
+Only if visible-corner labels are reliable:
 
-Do not create labels around impossible recovery after the kart is already irreversibly off track.
+```text
+corner visible / not visible
+corner location or normalized proximity
+```
 
-## 11. Shadow teacher
+Do not call this `next_corner` until travel direction is known.
+
+### v4-C3: kart-relative geometry
+
+Once kart position/heading supervision is reliable:
+
+```text
+kart center
+kart heading
+current-road-axis relation
+lateral offset
+heading error
+travel-relative next-corner distance/direction
+```
+
+These targets are more directly tied to the second-bend failure than continuous road curvature.
+
+## 12. Geometry loss policy
+
+Every auxiliary term is a hyperparameter, not a convention:
+
+```text
+L = L_switch
+  + λ_action * L_future_action
+  + λ_road * L_road
+  + λ_axis * L_axis
+  + λ_corner * L_corner
+  + later λ_pose * L_pose
+```
+
+Targets are added incrementally so causal attribution remains possible.
+
+A geometry head is retained only if:
+
+- its held-out geometry metric is meaningful;
+- it does not degrade v3 stateful control metrics;
+- ideally it improves closed-loop behavior after the offline gate.
+
+## 13. Covariate shift remains independent
+
+Structured perception does not solve expert-only behavior-cloning covariate shift.
+
+Even with better road/kart features, a model-driven closed loop can create observations absent from the expert data after an earlier timing error. Later iterations still need valid pre-failure deviation/recovery examples through iterative behavior cloning or a DAgger-like process.
+
+Do not create impossible recovery labels after the kart is already irreversibly off track.
+
+## 14. Shadow teacher
 
 Keep the analytic teacher after training for offline post-run diagnosis:
 
 ```text
 recorded MP4
-   ├── learned geometry prediction
+   ├── learned structured visual prediction
    ├── analytic teacher geometry
    └── policy KEEP/SWITCH output
 ```
@@ -304,31 +387,34 @@ recorded MP4
 Failure classification:
 
 ```text
-learned geometry wrong
+teacher plausible, learned geometry wrong
 → perception/representation problem
 
-geometry reasonable, policy wrong
+geometry plausible, policy wrong
 → control problem
 
-both reasonable, state outside expert distribution
+both plausible, observation off expert distribution
 → data/covariate-shift problem
 ```
 
-## 12. Current implementation order
+The teacher never controls the kart.
+
+## 15. Current implementation order
 
 ```text
-1. run road pseudo-label inspection on all 15 expert videos
-2. manually audit overview + suspicious per-video contact sheets
-3. define trusted/untrusted teacher coverage
-4. only after audit, implement full road-label generation
-5. implement v4-C with v3 control path + road auxiliary supervision
-6. tune λ_road using held-out geometry and control metrics
-7. stateful evaluation against the same v3 reference
+1. run revised multi-theme + rectilinear teacher on all 15 videos
+2. audit overview and suspicious per-video sheets
+3. quantify usable mask/axis/corner coverage by theme
+4. decide which label families are trustworthy
+5. only then implement full pseudo-label generation
+6. first model experiment: v3 + smallest trustworthy geometry auxiliary target(s)
+7. stateful offline comparison against v3 reference
 8. only if offline gate passes, run ADB closed-loop A/B
-9. preserve failure/deviation runs for later DAgger-like data iteration
+9. add kart/travel-direction teacher before using travel-relative corner labels
+10. preserve failure/deviation runs for later DAgger-like iteration
 ```
 
-## 13. What v4 is not
+## 16. What v4 is not
 
 v4 is not a hand-written geometric controller.
 
@@ -336,4 +422,6 @@ v4 is not based on the claim that v3 lacked temporal information.
 
 v4 is not committed to GRU or explicit per-frame encoding when the evidence does not support them.
 
-The project remains model-driven: analytic CV is used to create supervision and diagnostics, while deployment remains neural inference plus learned control.
+v4 is not based on continuous road curvature when the game geometry is mostly piecewise straight.
+
+The project remains model-driven: analytic CV creates training supervision and diagnostics; deployment remains neural perception plus learned control.

@@ -139,15 +139,31 @@ class SequentialStateConditionedPolicy(nn.Module):
         encoded = self.visual_encoder(flattened)
         return encoded.reshape(batch, time, self.visual_feature_dim)
 
-    def forward(
+    def forward_from_features(
         self,
-        inputs: torch.Tensor,
+        sequence: torch.Tensor,
         current_pressed: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        sequence = self.encode_sequence(inputs)
+        """Predict from precomputed per-frame features.
+
+        Runtime uses this entry point with a small feature cache so overlapping
+        temporal windows do not repeatedly run the CNN on old frames.
+        """
+        if sequence.ndim != 3:
+            raise ValueError(
+                "feature sequence must be BxTxF, got " f"{tuple(sequence.shape)}"
+            )
+        if sequence.shape[1] != self.frame_stack:
+            raise ValueError(
+                f"expected {self.frame_stack} feature steps, got {sequence.shape[1]}"
+            )
+        if sequence.shape[2] != self.visual_feature_dim:
+            raise ValueError(
+                f"expected feature dim {self.visual_feature_dim}, got {sequence.shape[2]}"
+            )
+
         temporal_output, _ = self.temporal_model(sequence)
         temporal_features = temporal_output[:, -1, :]
-
         states = current_pressed.reshape(-1).to(dtype=torch.long)
         if states.shape[0] != temporal_features.shape[0]:
             raise ValueError("current_pressed batch size does not match visual input")
@@ -159,6 +175,14 @@ class SequentialStateConditionedPolicy(nn.Module):
         switch_logits = self.switch_head(conditioned)
         future_action_logits = self.future_action_head(temporal_features)
         return switch_logits, future_action_logits
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        current_pressed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sequence = self.encode_sequence(inputs)
+        return self.forward_from_features(sequence, current_pressed)
 
 
 def build_sequential_state_conditioned_model(

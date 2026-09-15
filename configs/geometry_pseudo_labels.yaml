@@ -1,7 +1,7 @@
 # Offline geometry-teacher feasibility configuration.
 #
 # The kart tracks are mostly piecewise straight with discrete corners. The
-# teacher therefore focuses on visible straight axes + corner intersections,
+# teacher therefore focuses on road center axes + center-axis intersections,
 # not continuous centerline curvature. OpenCV HSV uses H=[0,179], S/V=[0,255].
 road_mask:
   # Multiple ranges are OR-ed. These are broad POC ranges for the dark/medium
@@ -26,18 +26,26 @@ rectilinear:
   canny_high: 120
   hough_threshold: 24
 
-  # Prefer long road-edge segments. A lower threshold also detects the short
-  # cross-edge at the end of an otherwise straight rectangular road segment and
-  # can falsely interpret road width as a second road axis/corner.
+  # Hough detects road boundaries, not the center axis. Prefer long edge
+  # evidence so short road-width end caps do not dominate orientation.
   min_line_length_fraction: 0.16
   max_line_gap_fraction: 0.025
   axis_tolerance_deg: 10.0
   min_axis_separation_deg: 25.0
+
+  # Pair two roughly parallel, overlapping road edges to infer their midpoint
+  # center axis. Fractions are relative to image diagonal.
+  min_road_width_fraction: 0.025
+  max_road_width_fraction: 0.22
+  min_axis_overlap_fraction: 0.06
+
+  # Allow inferred center axes to extend slightly when testing whether two
+  # center lines form a visible corner.
   corner_extension_fraction: 0.08
 
   # Diagnostic anchor only. It is NOT claimed to be the kart center. Until a
   # reliable kart/travel-direction teacher exists we report nearest visible
-  # corner, not "next left/right corner".
+  # center-axis intersection, not "next left/right corner".
   anchor_x_norm: 0.50
   anchor_y_norm: 0.58
 

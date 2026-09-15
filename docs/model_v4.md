@@ -176,7 +176,34 @@ weight = straight_confidence × (1 - corner_score)
 
 Current feasibility defaults are stored in `configs/geometry_pseudo_labels.yaml` and remain tunable teacher parameters, not model hyperparameters.
 
-### 6.3 Axial target representation
+### 6.3 Full-label audit result
+
+The full v3 manifest contains `19,844` observation frames. Running the axis-label builder produced:
+
+```text
+overall detected rate = 0.967
+overall accepted rate = 0.343
+```
+
+So roughly one third of all observations receive high-confidence straight-road orientation supervision, while ambiguous frames remain unlabeled.
+
+Per-video accepted rates are stable across visual themes, approximately `0.274–0.461`. The held-out videos are not under-covered:
+
+```text
+validation:
+video_20260130_173545  accepted = 0.349
+video_20260130_174012  accepted = 0.461
+
+test:
+video_20260130_173426  accepted = 0.333
+video_20260130_173835  accepted = 0.304
+```
+
+Accepted-label confidence is also consistently high; per-video mean accepted weight is approximately `0.864–0.941`.
+
+This gate passes. The teacher has enough coverage for v4-C1 without obvious train/held-out theme imbalance, so the next step is model smoke + Spark training rather than loosening teacher thresholds.
+
+### 6.4 Axial target representation
 
 A road orientation is axial: `θ` and `θ + 180°` are equivalent. v4-C1 therefore uses:
 
@@ -231,36 +258,16 @@ Pseudo-label generation reads raw current frames because the HSV teacher should 
 
 ## 9. Required gate before Spark training
 
-First build the full axis-label file on the PC:
-
-```bash
-python scripts/build_axis_pseudo_labels.py \
-  --samples data/processed/v3/samples.jsonl
-```
-
-Outputs:
+The label-distribution gate has passed. Generated files:
 
 ```text
 data/processed/v4c1/axis_labels.jsonl
 data/processed/v4c1/axis_manifest.json
 ```
 
-Before training, inspect the console/manifest for:
-
-```text
-detected_rate
-accepted_rate
-mean_accepted_weight
-per-video accepted_rate
-```
-
-The goal is not maximum coverage. A moderate high-precision straight-frame subset is preferable to broad ambiguous labels.
-
-If one held-out visual theme has near-zero accepted labels while training themes are high, stop and revisit the teacher before interpreting model results.
+The next required gate is a local smoke test before copying code + the two small v4-C1 label files to Spark.
 
 ## 10. Training/evaluation gate
-
-If the label distribution is reasonable:
 
 ```text
 PC smoke
@@ -343,16 +350,15 @@ This separates representation errors from control errors and off-distribution fa
 ## 14. Current implementation order
 
 ```text
-1. build full v4-C1 axis pseudo-labels on PC
-2. inspect total + per-video accepted-rate distribution
-3. pytest + Ruff
-4. v4-C1 PC smoke
-5. copy the small axis-label files to Spark
-6. Spark smoke
-7. full v4-C1 training
-8. stateful evaluator vs v3
-9. only if offline control gate passes, implement/run ADB closed-loop A/B
-10. keep center-axis/corner and kart-pose work as later independent experiments
+1. pytest + Ruff
+2. v4-C1 PC smoke
+3. rsync code to Spark using the normal no-.git/no-data command
+4. separately copy data/processed/v4c1/axis_labels.jsonl + axis_manifest.json to Spark
+5. Spark smoke
+6. full v4-C1 training
+7. stateful evaluator vs v3
+8. only if offline control gate passes, implement/run ADB closed-loop A/B
+9. keep center-axis/corner and kart-pose work as later independent experiments
 ```
 
 ## 15. What v4 is not

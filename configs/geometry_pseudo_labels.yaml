@@ -25,7 +25,11 @@ rectilinear:
   canny_low: 40
   canny_high: 120
   hough_threshold: 24
-  min_line_length_fraction: 0.10
+
+  # Prefer long road-edge segments. A lower threshold also detects the short
+  # cross-edge at the end of an otherwise straight rectangular road segment and
+  # can falsely interpret road width as a second road axis/corner.
+  min_line_length_fraction: 0.16
   max_line_gap_fraction: 0.025
   axis_tolerance_deg: 10.0
   min_axis_separation_deg: 25.0

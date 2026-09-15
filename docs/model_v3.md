@@ -201,3 +201,50 @@ python scripts/train_model_v3.py \
 ```
 
 After the local smoke test passes, run the same command without `--smoke` on Spark. Runtime/ADB changes are made only after the trained v3 artifact passes the offline acceptance gates above.
+
+## 11. First full training result
+
+The first Spark run used the v2 frame cache and completed all 30 epochs. Validation switch BCE was lowest at epoch 1, so the saved artifact is the epoch-1 checkpoint even though later epochs occasionally reached higher thresholded F1. This is intentional: later epochs drove training loss close to zero while validation BCE rose sharply, indicating increasing over-confidence and overfitting.
+
+The saved checkpoint produced the following held-out test metrics at threshold 0.5:
+
+```text
+switch@100ms: precision=0.856 recall=0.765 F1=0.808
+expert switch positive rate=0.096
+predicted switch positive rate=0.086
+all-negative switch FPR=0.014
+near-transition switch F1=0.808
+near-short-correction switch F1=0.792
+
+aux future-action F1:
++100ms = 0.970
++200ms = 0.949
++300ms = 0.948
+```
+
+The auxiliary heads therefore retained essentially the same future-action quality as v2 while the new primary task learned a non-trivial switch decision. The remaining concern is controller-level behavior: a per-sample false-switch rate cannot by itself tell whether a 30 Hz state-conditioned loop will chatter or self-correct after a wrong flip.
+
+## 12. Stateful offline replay and threshold selection
+
+Before adding the v3 ADB runtime path, evaluate the saved checkpoint with the controller state fed back into the next inference step on the held-out expert visuals:
+
+```bash
+python scripts/evaluate_model_v3.py \
+  --config configs/train_v3.yaml \
+  --samples data/processed/v3/samples.jsonl \
+  --labels-dir data/processed/v3/labels \
+  --split test \
+  --require-cache \
+  --num-workers 4
+```
+
+The evaluator sweeps switch thresholds `0.5 0.6 0.7 0.8 0.9` and reports:
+
+- expert-conditioned switch precision/recall/F1;
+- true stable-section false-switch rate;
+- stateful transition F1 on both target and observation timelines;
+- short RELEASE-segment recall;
+- number of rapid state flips below 100 ms and 200 ms;
+- auxiliary future-action F1 as a visual-backbone sanity check.
+
+The stateful replay is the final offline gate before implementing the v3 RuntimeEngine/ADB path. Threshold selection should be based on transition timing and chatter together, not sample F1 alone.

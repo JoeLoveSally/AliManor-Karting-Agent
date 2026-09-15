@@ -83,6 +83,57 @@ def write_contact_sheet(images: list[np.ndarray], path: Path, columns: int = 4) 
         raise RuntimeError(f"failed to write contact sheet: {path}")
 
 
+def write_overview_sheet(
+    summaries: list[dict[str, object]],
+    path: Path,
+    *,
+    columns: int = 3,
+) -> None:
+    """Create one audit image containing every per-video contact sheet."""
+    tiles: list[np.ndarray] = []
+    for summary in summaries:
+        contact_sheet = Path(str(summary["contact_sheet"]))
+        image = cv2.imread(str(contact_sheet))
+        if image is None:
+            continue
+        target_width = 720
+        target_height = max(1, round(image.shape[0] * target_width / image.shape[1]))
+        tile = cv2.resize(image, (target_width, target_height))
+        label_height = 42
+        labeled = np.zeros(
+            (tile.shape[0] + label_height, tile.shape[1], 3), dtype=np.uint8
+        )
+        labeled[label_height:, :] = tile
+        video_name = Path(str(summary["video"])).name
+        cv2.putText(
+            labeled,
+            video_name,
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        tiles.append(labeled)
+
+    if not tiles:
+        return
+
+    tile_width = max(tile.shape[1] for tile in tiles)
+    tile_height = max(tile.shape[0] for tile in tiles)
+    rows = (len(tiles) + columns - 1) // columns
+    canvas = np.zeros((rows * tile_height, columns * tile_width, 3), dtype=np.uint8)
+    for index, tile in enumerate(tiles):
+        row, column = divmod(index, columns)
+        y0 = row * tile_height
+        x0 = column * tile_width
+        canvas[y0 : y0 + tile.shape[0], x0 : x0 + tile.shape[1]] = tile
+
+    if not cv2.imwrite(str(path), canvas):
+        raise RuntimeError(f"failed to write overview sheet: {path}")
+
+
 def inspect_video(
     video: Path,
     *,
@@ -214,8 +265,20 @@ def main() -> int:
             flush=True,
         )
 
+    overview_path = output_dir / "overview_contact_sheet.jpg"
+    write_overview_sheet(summaries, overview_path)
     index_path = output_dir / "index.json"
-    index_path.write_text(json.dumps({"videos": summaries}, indent=2), encoding="utf-8")
+    index_path.write_text(
+        json.dumps(
+            {
+                "overview_contact_sheet": str(overview_path),
+                "videos": summaries,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Overview: {overview_path}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     return 0
 

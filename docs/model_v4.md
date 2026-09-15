@@ -207,7 +207,76 @@ The key new data is not more copies of expert-centerline driving. It is states s
 - late release / late press situations;
 - valid recovery after a small policy error.
 
-## 6. Pseudo-label teacher and quality audit
+## 6. v4-A implementation
+
+The first controlled variant is implemented with:
+
+```text
+configs/train_v4a.yaml
+src/karting_agent/model/sequential_state_conditioned.py
+src/karting_agent/model/sequential_state_conditioned_runner.py
+src/karting_agent/train/state_conditioned_dataset.py
+src/karting_agent/runtime/sequential_state_conditioned_engine.py
+scripts/train_model_v4a.py
+scripts/evaluate_model_v4a.py
+tests/unit/test_v4a_training.py
+```
+
+The v4-A dataset deliberately reuses the exact v3 manifest and the existing v2/v3 frame cache. Spatial preprocessing is unchanged. The only model-facing data change is:
+
+```text
+v3 dataset output:   (15, H, W)
+v4-A dataset output: (5, 3, H, W)
+```
+
+The same five cached RGB frames are therefore used without rebuilding the 5.6 GB cache.
+
+The model structure is:
+
+```text
+5 RGB frames
+   ↓ shared MobileNetV3-Small, applied independently
+5 × 128-d z(t)
+   ↓ GRU(hidden=128, 1 layer)
+h(t)
+   + 8-d current-action embedding
+   ↓ nonlinear policy head
+switch@100 / 200 / 300ms
+
+h(t)
+   ↓ auxiliary head
+future-action@100 / 200 / 300ms
+```
+
+Checkpoint selection remains lowest validation `switch_loss`, matching v3.
+
+## 7. Runtime compute design
+
+Training encodes all five frames. Realtime inference must not rerun the CNN for all five overlapping frames on every control step.
+
+The initial v4-A runtime therefore uses an exact-window feature cache:
+
+```text
+new temporal window indices
+      ↓
+look up z(frame_index)
+      ↓ miss only
+shared CNN once for unseen frame
+      ↓
+assemble the exact five latent features used by training
+      ↓
+small GRU over 5 latent vectors
+      ↓
+policy
+```
+
+This preserves the exact sampled-window semantics while making steady-state CNN cost approach one new-frame encode per observation. The GRU is tiny, so recomputing five latent steps is intentionally preferred over introducing a recurrent hidden-state semantic mismatch at this stage.
+
+A later streaming-GRU optimization is allowed only if it reproduces the trained sampling semantics or is trained explicitly for streaming state.
+
+For CPU runtime, benchmark and pin a small PyTorch thread count (`1`, `2`, `4`). Do not assume the host default is optimal.
+
+## 8. Pseudo-label teacher and quality audit
 
 The existing geometry teacher remains useful, but its role changes from "next thing to train" to a parallel data-quality track.
 
@@ -233,7 +302,7 @@ Before pseudo-labels enter a loss, audit all 15 videos by visual theme:
 
 A teacher error must not silently become a student target.
 
-## 7. Geometry loss is a hyperparameter, not a constant
+## 9. Geometry loss is a hyperparameter, not a constant
 
 When v4-C begins, the loss is conceptually:
 
@@ -252,7 +321,7 @@ L = L_switch
 
 The geometry loss is accepted only if it improves held-out geometry quality without degrading stateful sequence/control metrics. Additional geometry heads get their own independently tuned weights.
 
-## 8. Shadow teacher for post-run diagnosis
+## 10. Shadow teacher for post-run diagnosis
 
 Keep the analytic geometry teacher even after the deployed runtime becomes model-only.
 
@@ -280,46 +349,13 @@ both reasonable but state is outside training distribution
 
 The shadow teacher never sends runtime control actions.
 
-## 9. Runtime compute design
-
-Training a sequence requires encoding all frames, but realtime inference must not naively recompute the whole window on every step.
-
-Preferred steady-state runtime:
-
-```text
-new frame
-  ↓
-CNN once → z(t)
-  ↓
-GRU step with previous hidden state
-  ↓
-policy head
-```
-
-Therefore the steady-state cost target is approximately one CNN forward plus one small GRU step per observation, not five CNN forwards per control tick.
-
-Implementation requirements:
-
-- keep a feature/hidden-state cache;
-- reset temporal state on race/runtime reset;
-- never reuse features across incompatible preprocessing/model versions;
-- benchmark real end-to-end latency rather than only isolated model forward time.
-
-Do not lower input resolution pre-emptively. After v4-A runtime exists, benchmark at least the useful resolution/thread combinations and choose the smallest input that preserves control quality.
-
-For CPU inference, explicitly benchmark and pin a small PyTorch thread count (`1`, `2`, `4`) because small CNN latency can degrade badly with excessive CPU threads on this machine.
-
-## 10. Evaluation matrix
+## 11. Evaluation matrix
 
 Every v4 variant must be compared against the same v3 reference using the same held-out videos and runtime semantics.
 
 Track separately:
 
 ```text
-Representation quality
-- optional road Dice / IoU
-- geometry teacher/student disagreement
-
 Policy quality
 - static switch precision / recall / F1
 - stateful target transition F1
@@ -333,33 +369,37 @@ Runtime quality
 - control fps
 - inference mean / p95 / max
 - frame gap p95 / max
+- CNN feature-cache hit / miss ratio
 
 Closed-loop quality
 - bends completed
 - time / distance before failure
 - first irreversible trajectory deviation
 - recovery success on small deviations
+
+Later representation quality
+- road Dice / IoU
+- geometry teacher/student disagreement
 ```
 
 Offline metrics are gates and diagnostics, not proof of closed-loop success.
 
-## 11. Current implementation order
-
-The current order is intentionally:
+## 12. Current implementation order
 
 ```text
-1. v4-A: per-frame shared CNN + GRU, 200ms, no geometry loss
-2. strict v3 vs v4-A replay + ADB comparison
-3. v4-B: 200 / 400 / 800ms history ablation
-4. continue pseudo-label quality audit in parallel
-5. v4-C: add audited road supervision and tune λ_road
-6. shadow-teacher diagnostics on closed-loop runs
-7. collect recovery/on-policy data and iterate
+1. v4-A train/smoke using the exact v3 manifest and frame cache
+2. v4-A static + stateful held-out evaluation
+3. strict v3 vs v4-A replay/ADB comparison
+4. v4-B: 200 / 400 / 800ms history ablation
+5. continue pseudo-label quality audit in parallel
+6. v4-C: add audited road supervision and tune λ_road
+7. shadow-teacher diagnostics on closed-loop runs
+8. collect recovery/on-policy data and iterate
 ```
 
 The existing geometry pseudo-label POC is retained; it is not discarded. It simply does not enter the policy training loss until v4-A/B isolate the temporal contribution and the teacher quality has been audited.
 
-## 12. What v4 is not
+## 13. What v4 is not
 
 v4 is not a hand-written geometric controller.
 

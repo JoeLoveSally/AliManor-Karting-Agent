@@ -1,47 +1,81 @@
 # Model v4: Structured CNN + GRU Policy
 
-## 1. Why v4
+## 1. Goal
 
-v1-v3 proved that the realtime capture/ADB path is fast enough and that a lightweight CNN can learn strong offline action metrics. They also exposed the main limitation of direct behavior cloning: the visual backbone is only supervised by action labels, so it is free to use shortcuts instead of learning the spatial state that actually determines steering.
-
-v4 keeps the project model-driven, but gives the model a more structured job:
+v4 keeps the project model-driven, but separates three jobs that v1-v3 mixed together:
 
 ```text
-single frames
-    ↓
-shared CNN visual encoder
-    ├── road / geometry auxiliary heads
-    └── latent feature z(t)
-             ↓
-     sequence of z(t)
-             ↓
-            GRU
-             +
-      current PRESS/RELEASE
-             ↓
-      state-conditioned policy
-             ↓
-         KEEP / SWITCH
+RGB frame sequence
+      ↓
+shared per-frame CNN
+      ↓
+ordered latent sequence z(t)
+      ↓
+GRU temporal state
+      +
+current PRESS / RELEASE
+      ↓
+state-conditioned policy
+      ↓
+KEEP / SWITCH
 ```
 
-Traditional computer vision is allowed only as an **offline pseudo-label teacher**. It is not part of the final runtime path.
+Traditional computer vision is allowed only as an offline pseudo-label teacher and shadow debugger. It is not part of the deployed control path.
 
-## 2. Responsibilities
+The final runtime remains:
 
-### CNN: understand one frame spatially
+```text
+Camera / ADB video
+      ↓
+CNN
+      ↓
+GRU
+      ↓
+learned policy
+      ↓
+PRESS / RELEASE
+```
 
-The CNN should learn information such as:
+## 2. What v3 actually proved
+
+v3 concatenates five RGB frames into a 15-channel tensor. The pretrained first convolution is initialized by repeating the RGB filter for each frame and dividing by `frame_stack`.
+
+At initialization only, this first convolution is therefore equivalent to applying the original RGB filter to the average of the input frames. This does **not** mean the trained v3 model remains a temporal average: the expanded convolution is trainable, so the per-frame channel weights may diverge during optimization.
+
+The temporal counterfactual diagnostic also showed that the trained v3 model uses channel order:
+
+```text
+repeat_latest: flip_rate = 0.351
+reverse:       flip_rate = 0.622
+
+adjacent replacement:
+-200ms: 0.000
+-150ms: 0.081
+-100ms: 0.081
+ -50ms: 0.297
+    0ms: 0.649
+```
+
+So v3 did learn temporal information, but it represents time implicitly through channel position. v4 changes this to an explicit sequence representation because that is a cleaner temporal inductive bias and easier to inspect, ablate, and run incrementally.
+
+## 3. Responsibilities
+
+### CNN — spatial perception
+
+The CNN processes one RGB frame at a time with weights shared across time. Its primary output is a compact latent feature `z(t)`.
+
+Later geometry supervision may require the same encoder to predict:
 
 - drivable-road segmentation;
-- road centerline / local road direction;
-- optional kart position and heading when reliable pseudo-labels become available;
-- a compact latent feature vector for the temporal model.
+- local road direction / centerline;
+- curvature or distance-to-bend when pseudo-label quality is sufficient;
+- kart position / heading only when reliable labels are available.
 
-The first v4 milestone requires only road-mask supervision plus the latent feature. Centerline, curvature, kart center, and kart heading are added only after their pseudo-labels are shown to be stable enough.
+The CNN is the spatial perception model, not the temporal controller.
 
-### GRU: understand how the scene is changing
+### GRU — temporal state
 
-The GRU receives one CNN latent vector per frame rather than a 15-channel image stack. It models short-term motion and temporal trend:
+The GRU receives the ordered latent sequence rather than an image stack collapsed into channels:
 
 ```text
 z(t-200ms)
@@ -52,23 +86,132 @@ z(t)
     ↓
    GRU
     ↓
-temporal driving state
+temporal state h(t)
 ```
 
-This lets the policy distinguish states that look similar in a single frame but are moving differently, for example a kart that is still rotating into a bend versus one that has already started recovering.
+Its job is to encode motion trend: whether the kart is rotating into a bend, continuing to drift, recovering, or moving toward/away from a road boundary.
 
-### Policy head: decide KEEP / SWITCH
+GRU is the first temporal model to test, not a permanent architectural requirement. A temporal 1D convolution or attention model can replace it later if evidence justifies that change. The invariant is that the time axis remains explicit until temporal modeling occurs.
+
+### Policy head — control decision
 
 The policy receives:
 
-- the GRU temporal state;
-- the physical current action (`PRESS` or `RELEASE`).
+- temporal state `h(t)`;
+- the physical current state (`PRESS` or `RELEASE`).
 
-It predicts whether the current physical state should be kept or switched. The v3 counterfactual state-conditioning idea is retained.
+It predicts `KEEP / SWITCH`. The v3 counterfactual current-state training remains part of v4.
 
-## 3. Pseudo-label teacher
+## 4. Important separation: representation vs. covariate shift
 
-Pseudo-labels are generated offline from the recorded expert videos. The first teacher is a theme-specific HSV road segmenter because the current blue-track theme has strong color separation between the road and background.
+v4 addresses representation quality. It does **not** claim to solve behavior-cloning covariate shift by architecture alone.
+
+Expert-only training data mostly contains states on expert trajectories. Closed-loop execution can create states such as:
+
+```text
+small timing error
+→ different lateral position / heading
+→ observation is less represented in expert data
+→ another action error
+→ larger deviation
+```
+
+A better CNN/GRU can reduce the probability of entering this failure chain and may generalize better to small deviations, but recovery from off-expert states ultimately requires closed-loop correction data if those states are absent from training.
+
+Therefore architecture work and on-policy data work are tracked as two independent axes.
+
+## 5. Experimental plan
+
+The central rule is: change one source of capability at a time.
+
+### v4-A — explicit temporal representation, 200ms
+
+First test only the temporal representation change.
+
+Keep from v3:
+
+- same train / validation / test video split;
+- same five observation times: `[-200, -150, -100, -50, 0] ms`;
+- same image resolution initially (`224×224`);
+- same current-action conditioning;
+- same counterfactual train states;
+- same KEEP/SWITCH targets;
+- same future-action auxiliary target and weight;
+- no geometry supervision.
+
+Change only:
+
+```text
+v3:
+5 RGB frames → 15-channel CNN → visual feature
+
+v4-A:
+each RGB frame → shared 3-channel CNN → ordered latent sequence → GRU
+```
+
+This is the strictest test of whether explicit temporal modeling improves offline sequence metrics and closed-loop behavior.
+
+Acceptance is based on more than sample F1:
+
+- stateful transition F1;
+- short-correction recall;
+- transition timing error;
+- chatter;
+- held-out replay;
+- ADB closed-loop trajectory and survival time.
+
+If v4-A does not improve meaningful sequence/closed-loop behavior, do not continue increasing temporal-model complexity by default.
+
+### v4-B — history-window ablation
+
+Only after v4-A is working, test how much temporal history is useful. Do not infer required history directly from how far ahead the road is visible: spatial lookahead and temporal history answer different questions.
+
+Initial controlled variants keep five frames to avoid mixing history length and compute:
+
+```text
+200ms: [-200, -150, -100,  -50, 0]
+400ms: [-400, -300, -200, -100, 0]
+800ms: [-800, -600, -400, -200, 0]
+```
+
+The 200/400/800ms values are experiment points, not assumptions that longer must be better.
+
+### v4-C — geometry auxiliary supervision
+
+Only after the temporal ablation is understood, add explicit geometry supervision to the CNN.
+
+Initial target:
+
+```text
+road segmentation
+```
+
+Later targets may include centerline, curvature, bend distance, kart center, or kart heading only after their pseudo-labels pass quality audit.
+
+This sequencing allows attribution:
+
+```text
+v3 → v4-A : effect of explicit temporal representation
+v4-A → v4-B : effect of longer temporal context
+v4-B → v4-C : effect of structured geometry supervision
+```
+
+### v4-D — closed-loop correction data
+
+In parallel with v4-A/B/C, preserve every closed-loop failure run. Once the structured model is functional, add recovery / deviation states through iterative behavior cloning or a DAgger-like collection loop.
+
+The key new data is not more copies of expert-centerline driving. It is states such as:
+
+- kart too far toward one boundary;
+- heading already over-rotated;
+- late release / late press situations;
+- valid recovery after a small policy error.
+
+## 6. Pseudo-label teacher and quality audit
+
+The existing geometry teacher remains useful, but its role changes from "next thing to train" to a parallel data-quality track.
+
+First teacher:
 
 ```text
 expert video frame
@@ -77,99 +220,149 @@ OpenCV HSV threshold + morphology
       ↓
 road mask
       ↓
-optional row-wise centerline diagnostic
+optional centerline / geometry diagnostics
 ```
 
-The teacher output is used only during training and evaluation. Deployment remains:
+Before pseudo-labels enter a loss, audit all 15 videos by visual theme:
+
+1. sample representative frames from every video;
+2. inspect mask continuity through bends and around the kart;
+3. mark unreliable intervals or themes;
+4. exclude or down-weight unreliable pseudo-labels;
+5. measure coverage instead of assuming all teacher outputs are valid.
+
+A teacher error must not silently become a student target.
+
+## 7. Geometry loss is a hyperparameter, not a constant
+
+When v4-C begins, the loss is conceptually:
 
 ```text
-camera / ADB video
-      ↓
-CNN
-      ↓
-GRU
-      ↓
-policy
-      ↓
-PRESS / RELEASE
+L = L_switch
+  + λ_action * L_future_action
+  + λ_road * L_road
 ```
 
-The initial HSV thresholds are deliberately treated as a feasibility POC, not a cross-theme solution. If later recordings use different visual themes, the teacher can become adaptive or use per-theme threshold profiles without changing the learned runtime architecture.
-
-## 4. Proposed model structure
-
-The intended v4 model is:
+`λ_road` is not fixed by convention. It must be tuned because two failure modes are possible:
 
 ```text
-                       ┌─ road segmentation head
-frame(t) → CNN encoder ┤
-                       └─ latent z(t)
-
-z(t-N ... t) → GRU → temporal feature ─┐
-                                       ├→ nonlinear switch head
-current action → state embedding ──────┘
+λ_road too small  → visual shortcut may remain
+λ_road too large  → representation over-optimizes segmentation and hurts policy
 ```
 
-The CNN weights are shared across time. Unlike v1-v3, the five RGB frames are **not** concatenated into a 15-channel image before the CNN. Each frame is encoded independently and the GRU receives the ordered feature sequence.
+The geometry loss is accepted only if it improves held-out geometry quality without degrading stateful sequence/control metrics. Additional geometry heads get their own independently tuned weights.
 
-This separation is intentional:
+## 8. Shadow teacher for post-run diagnosis
 
-- CNN = spatial representation;
-- GRU = temporal representation;
-- policy head = control decision.
+Keep the analytic geometry teacher even after the deployed runtime becomes model-only.
 
-## 5. Training losses
-
-The first implementation target is:
+After each recorded closed-loop run:
 
 ```text
-loss = L_switch
-     + λ_road * L_road_segmentation
-     + λ_action * L_future_action
+recorded MP4
+   ├── learned CNN geometry prediction
+   ├── offline analytic teacher geometry
+   └── policy KEEP/SWITCH output
 ```
 
-Where:
+This separates failure classes:
 
-- `L_switch` keeps the v3 state-conditioned KEEP/SWITCH objective;
-- `L_road_segmentation` forces the CNN to encode drivable-road structure;
-- `L_future_action` is retained as a weak auxiliary target for continuity with v2/v3.
+```text
+CNN geometry wrong
+→ perception failure
 
-Later geometry heads can add losses for centerline, curvature, kart position, or heading only after pseudo-label quality has been measured.
+CNN geometry reasonable, policy wrong
+→ temporal / policy failure
 
-## 6. Data policy
+both reasonable but state is outside training distribution
+→ data / recovery failure
+```
 
-The existing video-level split remains unchanged. Pseudo-labels must be generated independently for train/validation/test videos; they must not change the split.
+The shadow teacher never sends runtime control actions.
 
-The first geometry POC does **not** replace the current action labels. It adds a new supervision source on top of them.
+## 9. Runtime compute design
 
-## 7. Implementation phases
+Training a sequence requires encoding all frames, but realtime inference must not naively recompute the whole window on every step.
 
-### Phase 0 — road pseudo-label feasibility
+Preferred steady-state runtime:
 
-Before building the v4 network, run the road-mask teacher on representative frames from all 15 videos and inspect overlays.
+```text
+new frame
+  ↓
+CNN once → z(t)
+  ↓
+GRU step with previous hidden state
+  ↓
+policy head
+```
 
-Acceptance criteria:
+Therefore the steady-state cost target is approximately one CNN forward plus one small GRU step per observation, not five CNN forwards per control tick.
 
-1. the road region is selected rather than the cyan background;
-2. the mask remains connected through bends and around the kart;
-3. UI elements do not become the dominant component;
-4. the row-wise centerline diagnostic follows the visible road where it is defined;
-5. failures can be grouped by visual theme so thresholds can be adjusted systematically.
+Implementation requirements:
 
-### Phase 1 — CNN geometry supervision
+- keep a feature/hidden-state cache;
+- reset temporal state on race/runtime reset;
+- never reuse features across incompatible preprocessing/model versions;
+- benchmark real end-to-end latency rather than only isolated model forward time.
 
-Train a shared per-frame MobileNetV3-Small encoder with a lightweight road segmentation decoder and latent feature output. Verify segmentation IoU/Dice on held-out videos and inspect predicted masks.
+Do not lower input resolution pre-emptively. After v4-A runtime exists, benchmark at least the useful resolution/thread combinations and choose the smallest input that preserves control quality.
 
-### Phase 2 — GRU state-conditioned policy
+For CPU inference, explicitly benchmark and pin a small PyTorch thread count (`1`, `2`, `4`) because small CNN latency can degrade badly with excessive CPU threads on this machine.
 
-Feed the ordered latent sequence into a GRU and combine its final state with the current-action embedding. Train the counterfactual KEEP/SWITCH objective from v3.
+## 10. Evaluation matrix
 
-### Phase 3 — joint fine-tuning and closed-loop
+Every v4 variant must be compared against the same v3 reference using the same held-out videos and runtime semantics.
 
-Jointly fine-tune the geometry and policy objectives, then repeat held-out replay and ADB closed-loop evaluation. If expert-only data still causes covariate shift, add closed-loop correction data after the structured model is working.
+Track separately:
 
-## 8. What v4 is not
+```text
+Representation quality
+- optional road Dice / IoU
+- geometry teacher/student disagreement
 
-v4 is not a hand-written geometric controller. The pseudo-label generator is a training tool, not the deployed policy.
+Policy quality
+- static switch precision / recall / F1
+- stateful target transition F1
+- stateful observation transition F1
+- short-correction recall
+- chatter <100ms / <200ms
+- PRESS / RELEASE timing errors
 
-v4 is also not simply "CNN + GRU" with the same weak action-only supervision. The important change is that the CNN is explicitly supervised to represent the road before the GRU learns temporal control.
+Runtime quality
+- input fps
+- control fps
+- inference mean / p95 / max
+- frame gap p95 / max
+
+Closed-loop quality
+- bends completed
+- time / distance before failure
+- first irreversible trajectory deviation
+- recovery success on small deviations
+```
+
+Offline metrics are gates and diagnostics, not proof of closed-loop success.
+
+## 11. Current implementation order
+
+The current order is intentionally:
+
+```text
+1. v4-A: per-frame shared CNN + GRU, 200ms, no geometry loss
+2. strict v3 vs v4-A replay + ADB comparison
+3. v4-B: 200 / 400 / 800ms history ablation
+4. continue pseudo-label quality audit in parallel
+5. v4-C: add audited road supervision and tune λ_road
+6. shadow-teacher diagnostics on closed-loop runs
+7. collect recovery/on-policy data and iterate
+```
+
+The existing geometry pseudo-label POC is retained; it is not discarded. It simply does not enter the policy training loss until v4-A/B isolate the temporal contribution and the teacher quality has been audited.
+
+## 12. What v4 is not
+
+v4 is not a hand-written geometric controller.
+
+v4 is not based on the claim that v3 had no temporal information. v3 used time implicitly through trainable channel positions; v4 makes the sequence explicit and gives the architecture a better temporal inductive bias.
+
+v4 is also not expected to solve expert-data covariate shift by architecture alone. Closed-loop correction data remains a separate requirement if recovery states are missing from expert demonstrations.

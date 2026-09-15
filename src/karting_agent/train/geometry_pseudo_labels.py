@@ -293,8 +293,11 @@ def detect_line_segments(
     if lines is None:
         return []
 
+    # OpenCV commonly returns (N, 1, 4), but some builds/bindings return
+    # (N, 4). Normalize both layouts before iterating.
+    normalized_lines = np.asarray(lines).reshape(-1, 4)
     segments: list[LineSegment] = []
-    for raw in lines[:, 0, :]:
+    for raw in normalized_lines:
         x1, y1, x2, y2 = (int(value) for value in raw)
         length = math.hypot(x2 - x1, y2 - y1)
         if length <= 0:

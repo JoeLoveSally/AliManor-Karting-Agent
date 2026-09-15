@@ -14,8 +14,11 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+SCRIPTS = ROOT / "scripts"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 from train_model_v3 import (  # noqa: E402
     control_horizon,

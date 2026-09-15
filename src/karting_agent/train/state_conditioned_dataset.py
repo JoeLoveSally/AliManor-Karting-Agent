@@ -1,4 +1,4 @@
-"""State-conditioned KEEP/SWITCH dataset for model v3."""
+"""State-conditioned KEEP/SWITCH datasets for v3 and sequential v4-A."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _optional_bool_tuple(raw: dict[str, object], key: str) -> tuple[bool, ...]:
 
 
 def load_v3_samples(path: Path) -> list[DatasetSample]:
-    """Load a v3 manifest and require the recorded action at observation time."""
+    """Load a v3-compatible manifest and require action at observation time."""
     samples: list[DatasetSample] = []
     with Path(path).open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -189,6 +189,68 @@ class StateConditionedVideoDataset:
                 width,
             ),
         }
+
+    def close(self) -> None:
+        self.base.close()
+
+    def __getstate__(self) -> dict[str, object]:
+        return self.__dict__.copy()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class SequentialStateConditionedVideoDataset:
+    """Expose the same v3 targets while keeping the RGB time axis explicit.
+
+    The existing frame cache remains reusable: the base dataset returns the
+    normalized temporal input as ``(3*T, H, W)`` and this adapter only reshapes
+    it to ``(T, 3, H, W)``. No spatial preprocessing or labels are changed.
+    """
+
+    def __init__(
+        self,
+        samples: Sequence[DatasetSample],
+        *,
+        frame_stack: int,
+        project_root: Path,
+        preprocess_config: PreprocessConfig = PreprocessConfig(),
+        cache_root: Path | None = None,
+        require_cache: bool = False,
+        counterfactual_states: bool = False,
+    ) -> None:
+        if frame_stack < 1:
+            raise ValueError("frame_stack must be >= 1")
+        self.frame_stack = frame_stack
+        self.base = StateConditionedVideoDataset(
+            samples,
+            project_root=project_root,
+            preprocess_config=preprocess_config,
+            cache_root=cache_root,
+            require_cache=require_cache,
+            counterfactual_states=counterfactual_states,
+        )
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        item = self.base[index]
+        stacked = np.asarray(item["input"], dtype=np.float32)
+        if stacked.ndim != 3:
+            raise ValueError(
+                f"stacked temporal input must be CxHxW, got {stacked.shape}"
+            )
+        channels, height, width = stacked.shape
+        expected_channels = self.frame_stack * 3
+        if channels != expected_channels:
+            raise ValueError(
+                f"expected {expected_channels} channels for {self.frame_stack} frames, "
+                f"got {channels}"
+            )
+        result = dict(item)
+        result["input"] = stacked.reshape(self.frame_stack, 3, height, width)
+        return result
 
     def close(self) -> None:
         self.base.close()

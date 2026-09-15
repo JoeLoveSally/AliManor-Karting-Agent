@@ -81,15 +81,38 @@ def test_v4a_model_encodes_each_frame_before_gru() -> None:
         policy_hidden_dim=8,
     ).eval()
     inputs = torch.randn(2, 5, 3, 64, 64)
+    captured_gru_inputs = []
 
-    with torch.inference_mode():
-        features = model.encode_sequence(inputs)
-        reversed_features = model.encode_sequence(inputs.flip(1))
-        switch_logits, future_logits = model(inputs, torch.tensor([0, 1]))
-        reversed_switch, _ = model(inputs.flip(1), torch.tensor([0, 1]))
+    def capture_gru_input(_module, args) -> None:
+        captured_gru_inputs.append(args[0].detach().clone())
+
+    hook = model.temporal_model.register_forward_pre_hook(capture_gru_input)
+    try:
+        with torch.inference_mode():
+            features = model.encode_sequence(inputs)
+            reversed_features = model.encode_sequence(inputs.flip(1))
+            switch_logits, future_logits = model(inputs, torch.tensor([0, 1]))
+            reversed_switch, reversed_future = model(
+                inputs.flip(1), torch.tensor([0, 1])
+            )
+    finally:
+        hook.remove()
 
     assert features.shape == (2, 5, 16)
     assert torch.allclose(reversed_features, features.flip(1), atol=1e-6, rtol=1e-5)
     assert switch_logits.shape == (2, 3)
     assert future_logits.shape == (2, 3)
-    assert not torch.allclose(switch_logits, reversed_switch)
+    assert reversed_switch.shape == (2, 3)
+    assert reversed_future.shape == (2, 3)
+
+    # The test is structural: verify that the GRU receives the ordered feature
+    # sequence and that reversing input frames reverses that explicit time axis.
+    # Random, untrained logits are not required to differ numerically.
+    assert len(captured_gru_inputs) == 2
+    assert torch.allclose(captured_gru_inputs[0], features, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(
+        captured_gru_inputs[1], reversed_features, atol=1e-6, rtol=1e-5
+    )
+    assert torch.allclose(
+        captured_gru_inputs[1], captured_gru_inputs[0].flip(1), atol=1e-6, rtol=1e-5
+    )

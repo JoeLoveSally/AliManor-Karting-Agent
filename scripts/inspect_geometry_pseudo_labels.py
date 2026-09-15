@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect v4 rectilinear track pseudo-labels on representative frames."""
+"""Inspect v4 road center-axis pseudo-labels on representative frames."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from karting_agent.train.geometry_pseudo_labels import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate sparse road-mask + straight-axis/corner previews for v4 geometry audit."
+            "Generate sparse road-mask + inferred center-axis/corner previews for v4 audit."
         )
     )
     parser.add_argument("videos", type=Path, nargs="+")
@@ -108,12 +108,21 @@ def load_config(
         canny_high=int(rectilinear.get("canny_high", 120)),
         hough_threshold=int(rectilinear.get("hough_threshold", 24)),
         min_line_length_fraction=float(
-            rectilinear.get("min_line_length_fraction", 0.10)
+            rectilinear.get("min_line_length_fraction", 0.16)
         ),
         max_line_gap_fraction=float(rectilinear.get("max_line_gap_fraction", 0.025)),
         axis_tolerance_deg=float(rectilinear.get("axis_tolerance_deg", 10.0)),
         min_axis_separation_deg=float(
             rectilinear.get("min_axis_separation_deg", 25.0)
+        ),
+        min_road_width_fraction=float(
+            rectilinear.get("min_road_width_fraction", 0.025)
+        ),
+        max_road_width_fraction=float(
+            rectilinear.get("max_road_width_fraction", 0.22)
+        ),
+        min_axis_overlap_fraction=float(
+            rectilinear.get("min_axis_overlap_fraction", 0.06)
         ),
         corner_extension_fraction=float(
             rectilinear.get("corner_extension_fraction", 0.08)
@@ -233,9 +242,14 @@ def inspect_video(
             )
 
             angle_text = (
-                f"a={geometry.primary_angle_deg:.0f}"
+                f"axis={geometry.primary_angle_deg:.0f}"
                 if geometry.primary_angle_deg is not None
-                else "a=NA"
+                else "axis=NA"
+            )
+            width_text = (
+                f"w={geometry.primary_center_axis.width_px:.0f}"
+                if geometry.primary_center_axis is not None
+                else "w=NA"
             )
             corner_text = (
                 f"corner={geometry.corner_distance_norm:.2f}"
@@ -246,11 +260,11 @@ def inspect_video(
                 overlay,
                 (
                     f"f={frame_index} road={metrics['road_area_fraction']:.2f} "
-                    f"{angle_text} {corner_text} {geometry.geometry_class}"
+                    f"{angle_text} {width_text} {corner_text} {geometry.geometry_class}"
                 ),
                 (8, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.46,
                 (0, 0, 0),
                 2,
                 cv2.LINE_AA,
@@ -325,17 +339,24 @@ def main() -> int:
         summaries.append(summary)
         previews = summary["previews"]
         areas = [float(row["road_area_fraction"]) for row in previews]
-        usable = [float(row["geometry_usable"]) for row in previews]
+        edges = [float(row["geometry_usable"]) for row in previews]
+        center_axes = [float(row["center_axis_usable"]) for row in previews]
+        secondary_axes = [
+            float(row["secondary_center_axis_usable"]) for row in previews
+        ]
         corners = [float(row["corner_visible"]) for row in previews]
-        straight = [float(row["straight_confidence"]) for row in previews]
         mean_area = sum(areas) / len(areas) if areas else 0.0
-        mean_usable = sum(usable) / len(usable) if usable else 0.0
+        mean_edges = sum(edges) / len(edges) if edges else 0.0
+        mean_center = sum(center_axes) / len(center_axes) if center_axes else 0.0
+        mean_secondary = (
+            sum(secondary_axes) / len(secondary_axes) if secondary_axes else 0.0
+        )
         mean_corner = sum(corners) / len(corners) if corners else 0.0
-        mean_straight = sum(straight) / len(straight) if straight else 0.0
         print(
             f"{video}: previews={len(areas)} road={mean_area:.3f} "
-            f"geometry_usable={mean_usable:.3f} corner_visible={mean_corner:.3f} "
-            f"straight_conf={mean_straight:.3f} sheet={summary['contact_sheet']}",
+            f"edge_axis={mean_edges:.3f} center_axis={mean_center:.3f} "
+            f"secondary_axis={mean_secondary:.3f} corner={mean_corner:.3f} "
+            f"sheet={summary['contact_sheet']}",
             flush=True,
         )
 
@@ -347,8 +368,10 @@ def main() -> int:
             {
                 "overview_contact_sheet": str(overview_path),
                 "teacher_semantics": {
-                    "track_model": "piecewise_straight_visible_axes",
-                    "corner": "nearest visible axis intersection from diagnostic anchor",
+                    "track_model": "piecewise_straight_center_axes",
+                    "edge_segments": "Hough evidence from road-mask boundaries",
+                    "center_axis": "midline inferred from paired parallel road edges",
+                    "corner": "intersection of inferred center axes",
                     "not_yet_labeled": [
                         "next_corner_direction",
                         "kart_center",

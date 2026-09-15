@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect v4 road pseudo-labels on representative video frames."""
+"""Inspect v4 rectilinear track pseudo-labels on representative frames."""
 
 from __future__ import annotations
 
@@ -18,17 +18,20 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from karting_agent.train.geometry_pseudo_labels import (  # noqa: E402
+    RectilinearGeometryConfig,
     RoadMaskConfig,
+    estimate_rectilinear_geometry,
     extract_road_mask,
     overlay_road_geometry,
     road_mask_metrics,
-    row_centerline,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate sparse road-mask/centerline previews for v4 pseudo-label inspection."
+        description=(
+            "Generate sparse road-mask + straight-axis/corner previews for v4 geometry audit."
+        )
     )
     parser.add_argument("videos", type=Path, nargs="+")
     parser.add_argument(
@@ -46,24 +49,80 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(path: Path) -> tuple[RoadMaskConfig, dict[str, object]]:
+def _triplet(values: object, *, name: str) -> tuple[int, int, int]:
+    if not isinstance(values, list) or len(values) != 3:
+        raise ValueError(f"{name} must contain exactly 3 values")
+    return tuple(int(value) for value in values)  # type: ignore[return-value]
+
+
+def load_config(
+    path: Path,
+) -> tuple[RoadMaskConfig, RectilinearGeometryConfig, dict[str, object]]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("geometry pseudo-label config root must be a mapping")
     road = raw.get("road_mask", {})
+    rectilinear = raw.get("rectilinear", {})
     preview = raw.get("preview", {})
-    if not isinstance(road, dict) or not isinstance(preview, dict):
-        raise ValueError("road_mask and preview config values must be mappings")
+    if not isinstance(road, dict):
+        raise ValueError("road_mask config must be a mapping")
+    if not isinstance(rectilinear, dict):
+        raise ValueError("rectilinear config must be a mapping")
+    if not isinstance(preview, dict):
+        raise ValueError("preview config must be a mapping")
 
-    config = RoadMaskConfig(
-        hsv_lower=tuple(int(value) for value in road.get("hsv_lower", [103, 90, 50])),
-        hsv_upper=tuple(int(value) for value in road.get("hsv_upper", [130, 255, 220])),
+    raw_ranges = road.get("hsv_ranges", [])
+    hsv_ranges = []
+    if raw_ranges:
+        if not isinstance(raw_ranges, list):
+            raise ValueError("road_mask.hsv_ranges must be a list")
+        for index, item in enumerate(raw_ranges):
+            if not isinstance(item, dict):
+                raise ValueError(f"road_mask.hsv_ranges[{index}] must be a mapping")
+            hsv_ranges.append(
+                (
+                    _triplet(item.get("lower"), name=f"hsv_ranges[{index}].lower"),
+                    _triplet(item.get("upper"), name=f"hsv_ranges[{index}].upper"),
+                )
+            )
+
+    road_config = RoadMaskConfig(
+        hsv_lower=_triplet(
+            road.get("hsv_lower", [103, 90, 50]), name="road_mask.hsv_lower"
+        ),
+        hsv_upper=_triplet(
+            road.get("hsv_upper", [130, 255, 220]), name="road_mask.hsv_upper"
+        ),
+        hsv_ranges=tuple(hsv_ranges),
         close_kernel=int(road.get("close_kernel", 9)),
         open_kernel=int(road.get("open_kernel", 3)),
-        min_component_area_fraction=float(road.get("min_component_area_fraction", 0.02)),
+        min_component_area_fraction=float(
+            road.get("min_component_area_fraction", 0.01)
+        ),
+        max_components=int(road.get("max_components", 4)),
     )
-    config.validate()
-    return config, preview
+    road_config.validate()
+
+    geometry_config = RectilinearGeometryConfig(
+        canny_low=int(rectilinear.get("canny_low", 40)),
+        canny_high=int(rectilinear.get("canny_high", 120)),
+        hough_threshold=int(rectilinear.get("hough_threshold", 24)),
+        min_line_length_fraction=float(
+            rectilinear.get("min_line_length_fraction", 0.10)
+        ),
+        max_line_gap_fraction=float(rectilinear.get("max_line_gap_fraction", 0.025)),
+        axis_tolerance_deg=float(rectilinear.get("axis_tolerance_deg", 10.0)),
+        min_axis_separation_deg=float(
+            rectilinear.get("min_axis_separation_deg", 25.0)
+        ),
+        corner_extension_fraction=float(
+            rectilinear.get("corner_extension_fraction", 0.08)
+        ),
+        anchor_x_norm=float(rectilinear.get("anchor_x_norm", 0.50)),
+        anchor_y_norm=float(rectilinear.get("anchor_y_norm", 0.58)),
+    )
+    geometry_config.validate()
+    return road_config, geometry_config, preview
 
 
 def write_contact_sheet(images: list[np.ndarray], path: Path, columns: int = 4) -> None:
@@ -139,7 +198,7 @@ def inspect_video(
     *,
     output_dir: Path,
     road_config: RoadMaskConfig,
-    preview_config: dict[str, object],
+    geometry_config: RectilinearGeometryConfig,
     sample_every_frames: int,
     max_previews: int,
 ) -> dict[str, object]:
@@ -152,8 +211,6 @@ def inspect_video(
     stem_dir = output_dir / video.stem
     stem_dir.mkdir(parents=True, exist_ok=True)
 
-    row_step = int(preview_config.get("row_step", 16))
-    min_run_width = int(preview_config.get("min_run_width", 12))
     rows: list[dict[str, object]] = []
     preview_images: list[np.ndarray] = []
     written = 0
@@ -166,19 +223,34 @@ def inspect_video(
                 break
 
             mask = extract_road_mask(frame, road_config)
-            centerline = row_centerline(
+            geometry = estimate_rectilinear_geometry(mask, geometry_config)
+            metrics = road_mask_metrics(mask, geometry=geometry)
+            overlay = overlay_road_geometry(
+                frame,
                 mask,
-                row_step=row_step,
-                min_run_width=min_run_width,
+                geometry=geometry,
+                geometry_config=geometry_config,
             )
-            metrics = road_mask_metrics(mask, centerline)
-            overlay = overlay_road_geometry(frame, mask, centerline)
+
+            angle_text = (
+                f"a={geometry.primary_angle_deg:.0f}"
+                if geometry.primary_angle_deg is not None
+                else "a=NA"
+            )
+            corner_text = (
+                f"corner={geometry.corner_distance_norm:.2f}"
+                if geometry.corner_distance_norm is not None
+                else "corner=NA"
+            )
             cv2.putText(
                 overlay,
-                f"frame={frame_index} road={metrics['road_area_fraction']:.2f}",
+                (
+                    f"f={frame_index} road={metrics['road_area_fraction']:.2f} "
+                    f"{angle_text} {corner_text} {geometry.geometry_class}"
+                ),
                 (8, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                0.48,
                 (0, 0, 0),
                 2,
                 cv2.LINE_AA,
@@ -198,11 +270,8 @@ def inspect_video(
                     "timestamp_ms": (frame_index / fps * 1000.0) if fps > 0 else None,
                     "preview": str(preview_path),
                     "mask": str(mask_path),
-                    "centerline": [
-                        {"y": int(y), "x_norm": float(x_norm)}
-                        for y, x_norm in centerline
-                    ],
                     **metrics,
+                    "geometry": geometry.to_dict(),
                 }
             )
             written += 1
@@ -232,7 +301,7 @@ def main() -> int:
     if args.max_previews_per_video < 1:
         raise ValueError("--max-previews-per-video must be >= 1")
 
-    road_config, preview_config = load_config(args.config.resolve())
+    road_config, geometry_config, preview_config = load_config(args.config.resolve())
     sample_every_frames = (
         int(args.sample_every_frames)
         if args.sample_every_frames is not None
@@ -249,19 +318,24 @@ def main() -> int:
             video.resolve(),
             output_dir=output_dir,
             road_config=road_config,
-            preview_config=preview_config,
+            geometry_config=geometry_config,
             sample_every_frames=sample_every_frames,
             max_previews=args.max_previews_per_video,
         )
         summaries.append(summary)
-        areas = [row["road_area_fraction"] for row in summary["previews"]]
-        centerline = [row["centerline_valid_fraction"] for row in summary["previews"]]
+        previews = summary["previews"]
+        areas = [float(row["road_area_fraction"]) for row in previews]
+        usable = [float(row["geometry_usable"]) for row in previews]
+        corners = [float(row["corner_visible"]) for row in previews]
+        straight = [float(row["straight_confidence"]) for row in previews]
         mean_area = sum(areas) / len(areas) if areas else 0.0
-        mean_centerline = sum(centerline) / len(centerline) if centerline else 0.0
+        mean_usable = sum(usable) / len(usable) if usable else 0.0
+        mean_corner = sum(corners) / len(corners) if corners else 0.0
+        mean_straight = sum(straight) / len(straight) if straight else 0.0
         print(
-            f"{video}: previews={len(areas)} mean_road_area={mean_area:.3f} "
-            f"mean_centerline_valid={mean_centerline:.3f} "
-            f"sheet={summary['contact_sheet']}",
+            f"{video}: previews={len(areas)} road={mean_area:.3f} "
+            f"geometry_usable={mean_usable:.3f} corner_visible={mean_corner:.3f} "
+            f"straight_conf={mean_straight:.3f} sheet={summary['contact_sheet']}",
             flush=True,
         )
 
@@ -272,6 +346,17 @@ def main() -> int:
         json.dumps(
             {
                 "overview_contact_sheet": str(overview_path),
+                "teacher_semantics": {
+                    "track_model": "piecewise_straight_visible_axes",
+                    "corner": "nearest visible axis intersection from diagnostic anchor",
+                    "not_yet_labeled": [
+                        "next_corner_direction",
+                        "kart_center",
+                        "kart_heading",
+                        "lateral_offset",
+                        "heading_error",
+                    ],
+                },
                 "videos": summaries,
             },
             indent=2,

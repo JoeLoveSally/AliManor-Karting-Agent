@@ -1,8 +1,9 @@
 # Offline geometry-teacher feasibility configuration.
 #
 # The kart tracks are mostly piecewise straight with discrete corners. The
-# teacher therefore focuses on road center axes + center-axis intersections,
-# not continuous centerline curvature. OpenCV HSV uses H=[0,179], S/V=[0,255].
+# teacher therefore focuses on road-axis orientation and later center-axis
+# geometry, not continuous centerline curvature. OpenCV HSV uses H=[0,179],
+# S/V=[0,255].
 road_mask:
   # Multiple ranges are OR-ed. These are broad POC ranges for the dark/medium
   # blue, cyan/teal, green and dark-neutral track themes in the 15 recordings.
@@ -34,20 +35,25 @@ rectilinear:
   min_axis_separation_deg: 25.0
 
   # Pair two roughly parallel, overlapping road edges to infer their midpoint
-  # center axis. Fractions are relative to image diagonal.
+  # center axis. Fractions are relative to image diagonal. These center axes are
+  # still diagnostic only because current real-frame coverage is sparse.
   min_road_width_fraction: 0.025
   max_road_width_fraction: 0.22
   min_axis_overlap_fraction: 0.06
 
-  # Allow inferred center axes to extend slightly when testing whether two
-  # center lines form a visible corner.
   corner_extension_fraction: 0.08
-
-  # Diagnostic anchor only. It is NOT claimed to be the kart center. Until a
-  # reliable kart/travel-direction teacher exists we report nearest visible
-  # center-axis intersection, not "next left/right corner".
   anchor_x_norm: 0.50
   anchor_y_norm: 0.58
+
+# v4-C1 does NOT require center-axis position. On a straight corridor, both road
+# boundaries have the same axial orientation as the unseen center line. We use
+# only high-confidence primary edge orientation and suppress ambiguous corner
+# frames. The target is encoded as (cos 2θ, sin 2θ), so θ and θ+180° are equal.
+axis_label:
+  min_straight_confidence: 0.65
+  max_corner_score: 0.20
+  min_road_area_fraction: 0.15
+  max_road_area_fraction: 0.65
 
 preview:
   sample_every_frames: 120

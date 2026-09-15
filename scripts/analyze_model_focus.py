@@ -27,6 +27,7 @@ if str(SRC) not in sys.path:
 
 from karting_agent.model.runner import ModelRunner  # noqa: E402
 from karting_agent.vision.preprocess import (  # noqa: E402
+    PreprocessConfig,
     prepare_frame,
     stack_prepared_frames,
 )
@@ -142,12 +143,39 @@ def read_video_frames(path: Path, frame_indices: list[int]) -> dict[int, np.ndar
     return frames
 
 
+def occlusion_valid_mask(
+    config: PreprocessConfig,
+    *,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Return prepared-image pixels that may be perturbed by occlusion.
+
+    Fixed preprocessing masks are already black in ``prepared_frames``. Replacing
+    those pixels with the mean-color occluder would introduce a synthetic patch
+    and falsely make a permanently masked HUD/touch region look important.
+    Preserve those pixels and perturb only model-visible image content.
+    """
+    valid = np.ones((height, width), dtype=bool)
+    rois = list(config.mask_rois)
+    if config.mask_touch_area:
+        rois.append(config.touch_roi)
+
+    for x0, y0, x1, y1 in rois:
+        left = max(0, min(width, round(x0 * width)))
+        top = max(0, min(height, round(y0 * height)))
+        right = max(left, min(width, round(x1 * width)))
+        bottom = max(top, min(height, round(y1 * height)))
+        valid[top:bottom, left:right] = False
+    return valid
+
+
 def occlusion_sensitivity(
     runner: ModelRunner,
     prepared_frames: list[np.ndarray],
     *,
     grid: int,
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray]:
     if grid < 2:
         raise ValueError("--grid must be >= 2")
 
@@ -156,7 +184,9 @@ def occlusion_sensitivity(
     baseline = runner.predict(baseline_input)
     height, width = prepared_frames[-1].shape[:2]
     sensitivity = np.zeros((grid, grid), dtype=np.float32)
+    unmasked_fraction = np.zeros((grid, grid), dtype=np.float32)
     fill_rgb = np.rint(np.asarray(config.mean) * 255.0).astype(np.uint8)
+    valid_mask = occlusion_valid_mask(config, height=height, width=width)
 
     y_edges = np.rint(np.linspace(0, height, grid + 1)).astype(int)
     x_edges = np.rint(np.linspace(0, width, grid + 1)).astype(int)
@@ -165,13 +195,19 @@ def occlusion_sensitivity(
         y0, y1 = y_edges[row], y_edges[row + 1]
         for col in range(grid):
             x0, x1 = x_edges[col], x_edges[col + 1]
+            cell_valid = valid_mask[y0:y1, x0:x1]
+            unmasked_fraction[row, col] = float(cell_valid.mean())
+            if not cell_valid.any():
+                continue
+
             occluded = [frame.copy() for frame in prepared_frames]
             for frame in occluded:
-                frame[y0:y1, x0:x1] = fill_rgb
+                patch = frame[y0:y1, x0:x1]
+                patch[cell_valid] = fill_rgb
             probability = runner.predict(stack_prepared_frames(occluded, config))
             sensitivity[row, col] = baseline - probability
 
-    return baseline, sensitivity
+    return baseline, sensitivity, unmasked_fraction
 
 
 def render_heatmap(image_rgb: np.ndarray, sensitivity: np.ndarray) -> np.ndarray:
@@ -197,11 +233,17 @@ def render_heatmap(image_rgb: np.ndarray, sensitivity: np.ndarray) -> np.ndarray
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
-def top_cells(sensitivity: np.ndarray, count: int = 5) -> dict[str, list[dict[str, object]]]:
+def top_cells(
+    sensitivity: np.ndarray,
+    unmasked_fraction: np.ndarray,
+    count: int = 5,
+) -> dict[str, list[dict[str, object]]]:
     grid = sensitivity.shape[0]
     cells: list[dict[str, object]] = []
     for row in range(grid):
         for col in range(grid):
+            if unmasked_fraction[row, col] <= 0.0:
+                continue
             cells.append(
                 {
                     "row": row,
@@ -210,6 +252,7 @@ def top_cells(sensitivity: np.ndarray, count: int = 5) -> dict[str, list[dict[st
                     "y0": row / grid,
                     "x1": (col + 1) / grid,
                     "y1": (row + 1) / grid,
+                    "unmasked_fraction": float(unmasked_fraction[row, col]),
                     "delta_press_probability": float(sensitivity[row, col]),
                 }
             )
@@ -291,7 +334,7 @@ def main() -> int:
             prepare_frame(source_frames[index], runner.spec.preprocess_config)
             for index in indices
         ]
-        recomputed, sensitivity = occlusion_sensitivity(
+        recomputed, sensitivity, unmasked_fraction = occlusion_sensitivity(
             runner,
             prepared,
             grid=args.grid,
@@ -318,7 +361,7 @@ def main() -> int:
                 "recomputed_probability": recomputed,
                 "absolute_probability_mismatch": mismatch,
                 "grid": args.grid,
-                **top_cells(sensitivity),
+                **top_cells(sensitivity, unmasked_fraction),
             }
         )
         print(title)
@@ -331,6 +374,7 @@ def main() -> int:
     print(f"Focus image: {output_path}")
     print(f"Focus data:  {report_path}")
     print("Legend: red supports PRESS; blue supports RELEASE.")
+    print("Fixed HUD/touch-mask pixels are preserved during occlusion.")
     print(
         "Important: if saved/recomputed probability differs materially, "
         "do not interpret the heatmap until recording/frame alignment is fixed."

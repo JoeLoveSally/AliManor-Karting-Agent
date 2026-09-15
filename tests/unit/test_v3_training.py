@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from karting_agent.train.dataset import DatasetConfig, DatasetSample, build_samples
@@ -21,6 +22,24 @@ def make_timeline(states: list[bool], fps: float = 100.0) -> ActionTimeline:
         events=segments_to_events(segments),
         segments=segments,
         cleaned_frames=0,
+    )
+
+
+def make_sample() -> DatasetSample:
+    return DatasetSample(
+        video="test.mp4",
+        input_frame_indices=(0, 1, 2, 3, 4),
+        input_timestamps_ms=(0.0, 50.0, 100.0, 150.0, 200.0),
+        target_frame_index=5,
+        target_timestamp_ms=300.0,
+        target_pressed=True,
+        transition_distance_ms=0.0,
+        near_transition=True,
+        near_short_correction=False,
+        target_frame_indices=(5, 6, 7),
+        target_timestamps_ms=(300.0, 400.0, 500.0),
+        target_pressed_by_horizon=(True, False, False),
+        current_pressed=True,
     )
 
 
@@ -47,23 +66,8 @@ def test_v3_samples_record_current_action() -> None:
 
 
 def test_counterfactual_dataset_emits_both_conditioning_states(tmp_path: Path) -> None:
-    sample = DatasetSample(
-        video="test.mp4",
-        input_frame_indices=(0, 1, 2, 3, 4),
-        input_timestamps_ms=(0.0, 50.0, 100.0, 150.0, 200.0),
-        target_frame_index=5,
-        target_timestamp_ms=300.0,
-        target_pressed=True,
-        transition_distance_ms=0.0,
-        near_transition=True,
-        near_short_correction=False,
-        target_frame_indices=(5, 6, 7),
-        target_timestamps_ms=(300.0, 400.0, 500.0),
-        target_pressed_by_horizon=(True, False, False),
-        current_pressed=True,
-    )
     dataset = StateConditionedVideoDataset(
-        [sample],
+        [make_sample()],
         project_root=tmp_path,
         counterfactual_states=True,
     )
@@ -71,6 +75,43 @@ def test_counterfactual_dataset_emits_both_conditioning_states(tmp_path: Path) -
         assert len(dataset) == 2
         assert dataset._resolve_index(0) == (0, False)
         assert dataset._resolve_index(1) == (0, True)
+    finally:
+        dataset.close()
+
+
+def test_counterfactual_switch_targets_are_complements(tmp_path: Path) -> None:
+    class FakeBase:
+        def __getitem__(self, index: int) -> dict[str, object]:
+            assert index == 0
+            return {
+                "input": np.zeros((15, 224, 224), dtype=np.float32),
+                "target": np.asarray((1.0, 0.0, 0.0), dtype=np.float32),
+            }
+
+        def close(self) -> None:
+            pass
+
+    dataset = StateConditionedVideoDataset(
+        [make_sample()],
+        project_root=tmp_path,
+        counterfactual_states=True,
+    )
+    dataset.base.close()
+    dataset.base = FakeBase()  # type: ignore[assignment]
+    try:
+        conditioned_release = dataset[0]
+        conditioned_press = dataset[1]
+
+        assert conditioned_release["current_pressed"] == 0
+        assert conditioned_press["current_pressed"] == 1
+        np.testing.assert_array_equal(
+            conditioned_release["switch_target"],
+            np.asarray((1.0, 0.0, 0.0), dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            conditioned_press["switch_target"],
+            np.asarray((0.0, 1.0, 1.0), dtype=np.float32),
+        )
     finally:
         dataset.close()
 

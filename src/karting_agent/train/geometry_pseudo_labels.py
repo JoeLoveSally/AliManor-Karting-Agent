@@ -19,12 +19,7 @@ HsvRange = tuple[HsvTriplet, HsvTriplet]
 
 @dataclass(frozen=True)
 class RoadMaskConfig:
-    """Theme-aware HSV road-mask configuration.
-
-    ``hsv_lower``/``hsv_upper`` are kept for backward compatibility with the
-    first blue-track POC. When ``hsv_ranges`` is non-empty, all configured
-    ranges are OR-ed before morphology and connected-component filtering.
-    """
+    """Theme-aware HSV road-mask configuration."""
 
     hsv_lower: HsvTriplet = (103, 90, 50)
     hsv_upper: HsvTriplet = (130, 255, 220)
@@ -62,15 +57,18 @@ class RoadMaskConfig:
 
 @dataclass(frozen=True)
 class RectilinearGeometryConfig:
-    """Line/corner diagnostics for piecewise-straight kart tracks."""
+    """Edge-pair and corner diagnostics for piecewise-straight kart tracks."""
 
     canny_low: int = 40
     canny_high: int = 120
     hough_threshold: int = 24
-    min_line_length_fraction: float = 0.10
+    min_line_length_fraction: float = 0.16
     max_line_gap_fraction: float = 0.025
     axis_tolerance_deg: float = 10.0
     min_axis_separation_deg: float = 25.0
+    min_road_width_fraction: float = 0.025
+    max_road_width_fraction: float = 0.22
+    min_axis_overlap_fraction: float = 0.06
     corner_extension_fraction: float = 0.08
     anchor_x_norm: float = 0.5
     anchor_y_norm: float = 0.58
@@ -88,6 +86,12 @@ class RectilinearGeometryConfig:
             raise ValueError("axis_tolerance_deg must be in (0, 90)")
         if not 0.0 < self.min_axis_separation_deg < 90.0:
             raise ValueError("min_axis_separation_deg must be in (0, 90)")
+        if not 0.0 < self.min_road_width_fraction < self.max_road_width_fraction <= 1.0:
+            raise ValueError(
+                "road width fractions must satisfy 0 < min < max <= 1"
+            )
+        if not 0.0 < self.min_axis_overlap_fraction <= 1.0:
+            raise ValueError("min_axis_overlap_fraction must be in (0, 1]")
         if not 0.0 <= self.corner_extension_fraction <= 1.0:
             raise ValueError("corner_extension_fraction must be in [0, 1]")
         if not 0.0 <= self.anchor_x_norm <= 1.0:
@@ -98,6 +102,8 @@ class RectilinearGeometryConfig:
 
 @dataclass(frozen=True)
 class LineSegment:
+    """One Hough road-edge segment."""
+
     x1: int
     y1: int
     x2: int
@@ -117,13 +123,38 @@ class LineSegment:
 
 
 @dataclass(frozen=True)
-class RectilinearGeometry:
-    """Theme-independent geometry distilled from a road mask.
+class CenterAxisSegment:
+    """Road center axis inferred from two approximately parallel road edges."""
 
-    The teacher deliberately does not claim to know *next turn direction* yet.
-    That requires a reliable travel/kart-heading estimate. For now it reports
-    visible straight axes and the nearest visible axis intersection relative to
-    a fixed diagnostic anchor.
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    angle_deg: float
+    length: float
+    width_px: float
+    pair_score: float
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "x1": self.x1,
+            "y1": self.y1,
+            "x2": self.x2,
+            "y2": self.y2,
+            "angle_deg": self.angle_deg,
+            "length": self.length,
+            "width_px": self.width_px,
+            "pair_score": self.pair_score,
+        }
+
+
+@dataclass(frozen=True)
+class RectilinearGeometry:
+    """Theme-independent geometry distilled from a road candidate mask.
+
+    Hough lines are treated as road *edges*. Center axes are inferred only when
+    two compatible, overlapping, parallel edge segments can be paired. Corner
+    diagnostics are intersections between center axes, never raw edge lines.
     """
 
     geometry_class: str
@@ -133,6 +164,8 @@ class RectilinearGeometry:
     secondary_support: float
     straight_confidence: float
     corner_score: float
+    primary_center_axis: CenterAxisSegment | None
+    secondary_center_axis: CenterAxisSegment | None
     corner_visible: bool
     corner_x_norm: float | None
     corner_y_norm: float | None
@@ -148,6 +181,17 @@ class RectilinearGeometry:
             "secondary_support": self.secondary_support,
             "straight_confidence": self.straight_confidence,
             "corner_score": self.corner_score,
+            "center_axis_usable": self.primary_center_axis is not None,
+            "primary_center_axis": (
+                self.primary_center_axis.to_dict()
+                if self.primary_center_axis is not None
+                else None
+            ),
+            "secondary_center_axis": (
+                self.secondary_center_axis.to_dict()
+                if self.secondary_center_axis is not None
+                else None
+            ),
             "corner_visible": self.corner_visible,
             "corner_x_norm": self.corner_x_norm,
             "corner_y_norm": self.corner_y_norm,
@@ -161,7 +205,7 @@ def _odd_kernel(value: int) -> int:
 
 
 def extract_road_mask(frame_bgr: np.ndarray, config: RoadMaskConfig) -> np.ndarray:
-    """Return a binary uint8 road mask from one or more theme HSV ranges."""
+    """Return a binary uint8 road candidate mask from multiple HSV ranges."""
 
     config.validate()
     if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
@@ -215,7 +259,7 @@ def row_centerline(
     row_step: int = 16,
     min_run_width: int = 12,
 ) -> list[tuple[int, float]]:
-    """Legacy diagnostic center points retained for comparison only."""
+    """Legacy row-center diagnostic retained for historical comparison."""
 
     if mask.ndim != 2:
         raise ValueError("mask must be HxW")
@@ -228,7 +272,6 @@ def row_centerline(
         xs = np.flatnonzero(mask[y] > 0)
         if xs.size == 0:
             continue
-
         breaks = np.where(np.diff(xs) > 1)[0]
         starts = np.concatenate(([0], breaks + 1))
         ends = np.concatenate((breaks, [xs.size - 1]))
@@ -257,7 +300,6 @@ def _weighted_axis_angle(
     if not members:
         return seed_angle, 0.0, []
 
-    # Angles are axial (0° == 180°), so average after doubling the angle.
     sin_sum = sum(
         math.sin(math.radians(2.0 * segment.angle_deg)) * segment.length
         for segment in members
@@ -293,8 +335,6 @@ def detect_line_segments(
     if lines is None:
         return []
 
-    # OpenCV commonly returns (N, 1, 4), but some builds/bindings return
-    # (N, 4). Normalize both layouts before iterating.
     normalized_lines = np.asarray(lines).reshape(-1, 4)
     segments: list[LineSegment] = []
     for raw in normalized_lines:
@@ -307,24 +347,87 @@ def detect_line_segments(
     return segments
 
 
-def _point_near_segment_extent(
-    x: float,
-    y: float,
+def _project_segment(
     segment: LineSegment,
-    extension: float,
-) -> bool:
-    return (
-        min(segment.x1, segment.x2) - extension
-        <= x
-        <= max(segment.x1, segment.x2) + extension
-        and min(segment.y1, segment.y2) - extension
-        <= y
-        <= max(segment.y1, segment.y2) + extension
-    )
+    tangent: tuple[float, float],
+    normal: tuple[float, float],
+) -> tuple[float, float, float]:
+    tx, ty = tangent
+    nx, ny = normal
+    t1 = segment.x1 * tx + segment.y1 * ty
+    t2 = segment.x2 * tx + segment.y2 * ty
+    n1 = segment.x1 * nx + segment.y1 * ny
+    n2 = segment.x2 * nx + segment.y2 * ny
+    return min(t1, t2), max(t1, t2), 0.5 * (n1 + n2)
 
 
-def _line_intersection(
-    first: LineSegment, second: LineSegment
+def _best_center_axis(
+    members: list[LineSegment],
+    axis_angle_deg: float,
+    *,
+    diag: float,
+    config: RectilinearGeometryConfig,
+) -> CenterAxisSegment | None:
+    """Pair parallel road edges and return the strongest center-axis candidate."""
+
+    if len(members) < 2:
+        return None
+    theta = math.radians(axis_angle_deg)
+    tangent = (math.cos(theta), math.sin(theta))
+    normal = (-math.sin(theta), math.cos(theta))
+    min_width = diag * config.min_road_width_fraction
+    max_width = diag * config.max_road_width_fraction
+    min_overlap = diag * config.min_axis_overlap_fraction
+
+    best: CenterAxisSegment | None = None
+    for first_index, first in enumerate(members):
+        first_start, first_end, first_offset = _project_segment(
+            first, tangent, normal
+        )
+        for second in members[first_index + 1 :]:
+            if _angle_distance_deg(first.angle_deg, second.angle_deg) > config.axis_tolerance_deg:
+                continue
+            second_start, second_end, second_offset = _project_segment(
+                second, tangent, normal
+            )
+            overlap_start = max(first_start, second_start)
+            overlap_end = min(first_end, second_end)
+            overlap = overlap_end - overlap_start
+            if overlap < min_overlap:
+                continue
+            road_width = abs(first_offset - second_offset)
+            if not min_width <= road_width <= max_width:
+                continue
+
+            center_offset = 0.5 * (first_offset + second_offset)
+            tx, ty = tangent
+            nx, ny = normal
+            x1 = overlap_start * tx + center_offset * nx
+            y1 = overlap_start * ty + center_offset * ny
+            x2 = overlap_end * tx + center_offset * nx
+            y2 = overlap_end * ty + center_offset * ny
+
+            # Longer overlap is more trustworthy. Mildly prefer narrower pairs
+            # because unrelated parallel track pieces are more likely far apart.
+            pair_score = overlap / max(1.0, road_width)
+            candidate = CenterAxisSegment(
+                x1=float(x1),
+                y1=float(y1),
+                x2=float(x2),
+                y2=float(y2),
+                angle_deg=float(axis_angle_deg),
+                length=float(overlap),
+                width_px=float(road_width),
+                pair_score=float(pair_score),
+            )
+            if best is None or candidate.pair_score > best.pair_score:
+                best = candidate
+    return best
+
+
+def _axis_intersection(
+    first: CenterAxisSegment,
+    second: CenterAxisSegment,
 ) -> tuple[float, float] | None:
     x1, y1, x2, y2 = first.x1, first.y1, first.x2, first.y2
     x3, y3, x4, y4 = second.x1, second.y1, second.x2, second.y2
@@ -338,16 +441,43 @@ def _line_intersection(
     return float(x), float(y)
 
 
+def _point_near_axis_extent(
+    x: float,
+    y: float,
+    axis: CenterAxisSegment,
+    extension: float,
+) -> bool:
+    length = max(axis.length, 1e-6)
+    tx = (axis.x2 - axis.x1) / length
+    ty = (axis.y2 - axis.y1) / length
+    projection = (x - axis.x1) * tx + (y - axis.y1) * ty
+    return -extension <= projection <= length + extension
+
+
+def _unknown_geometry() -> RectilinearGeometry:
+    return RectilinearGeometry(
+        geometry_class="unknown",
+        primary_angle_deg=None,
+        secondary_angle_deg=None,
+        primary_support=0.0,
+        secondary_support=0.0,
+        straight_confidence=0.0,
+        corner_score=0.0,
+        primary_center_axis=None,
+        secondary_center_axis=None,
+        corner_visible=False,
+        corner_x_norm=None,
+        corner_y_norm=None,
+        corner_distance_norm=None,
+        segments=(),
+    )
+
+
 def estimate_rectilinear_geometry(
     mask: np.ndarray,
     config: RectilinearGeometryConfig | None = None,
 ) -> RectilinearGeometry:
-    """Estimate visible piecewise-straight axes and nearest visible corner.
-
-    This is a feasibility diagnostic, not a final label definition. A reliable
-    *next corner left/right* label is intentionally deferred until kart/travel
-    direction can be estimated.
-    """
+    """Estimate road center axes and their nearest visible intersection."""
 
     config = config or RectilinearGeometryConfig()
     config.validate()
@@ -356,20 +486,7 @@ def estimate_rectilinear_geometry(
 
     segments = detect_line_segments(mask, config)
     if not segments:
-        return RectilinearGeometry(
-            geometry_class="unknown",
-            primary_angle_deg=None,
-            secondary_angle_deg=None,
-            primary_support=0.0,
-            secondary_support=0.0,
-            straight_confidence=0.0,
-            corner_score=0.0,
-            corner_visible=False,
-            corner_x_norm=None,
-            corner_y_norm=None,
-            corner_distance_norm=None,
-            segments=(),
-        )
+        return _unknown_geometry()
 
     seed_candidates = sorted(segments, key=lambda segment: segment.length, reverse=True)
     best_primary: tuple[float, float, list[LineSegment]] | None = None
@@ -409,49 +526,73 @@ def estimate_rectilinear_geometry(
 
     height, width = mask.shape
     diag = max(1.0, math.hypot(width, height))
-    extension = diag * config.corner_extension_fraction
-    anchor_x = config.anchor_x_norm * max(1, width - 1)
-    anchor_y = config.anchor_y_norm * max(1, height - 1)
-    intersections: list[tuple[float, float, float]] = []
-    for primary in primary_members:
-        for secondary in secondary_members:
-            point = _line_intersection(primary, secondary)
-            if point is None:
-                continue
-            x, y = point
-            if not (-extension <= x <= width - 1 + extension):
-                continue
-            if not (-extension <= y <= height - 1 + extension):
-                continue
-            if not _point_near_segment_extent(x, y, primary, extension):
-                continue
-            if not _point_near_segment_extent(x, y, secondary, extension):
-                continue
-            distance = math.hypot(x - anchor_x, y - anchor_y) / diag
-            intersections.append((distance, x, y))
+    primary_center = _best_center_axis(
+        primary_members,
+        primary_angle,
+        diag=diag,
+        config=config,
+    )
+    secondary_center = (
+        _best_center_axis(
+            secondary_members,
+            secondary_angle,
+            diag=diag,
+            config=config,
+        )
+        if secondary_angle is not None
+        else None
+    )
 
-    if intersections:
-        corner_distance, corner_x, corner_y = min(intersections, key=lambda item: item[0])
-        corner_visible = True
-        corner_x_norm = float(np.clip(corner_x / max(1, width - 1), 0.0, 1.0))
-        corner_y_norm = float(np.clip(corner_y / max(1, height - 1), 0.0, 1.0))
-        corner_distance_norm = float(corner_distance)
+    corner_visible = False
+    corner_x_norm = None
+    corner_y_norm = None
+    corner_distance_norm = None
+    if primary_center is not None and secondary_center is not None:
+        point = _axis_intersection(primary_center, secondary_center)
+        if point is not None:
+            x, y = point
+            extension = diag * config.corner_extension_fraction
+            in_frame = (
+                -extension <= x <= width - 1 + extension
+                and -extension <= y <= height - 1 + extension
+            )
+            if (
+                in_frame
+                and _point_near_axis_extent(x, y, primary_center, extension)
+                and _point_near_axis_extent(x, y, secondary_center, extension)
+            ):
+                anchor_x = config.anchor_x_norm * max(1, width - 1)
+                anchor_y = config.anchor_y_norm * max(1, height - 1)
+                corner_visible = True
+                corner_x_norm = float(np.clip(x / max(1, width - 1), 0.0, 1.0))
+                corner_y_norm = float(np.clip(y / max(1, height - 1), 0.0, 1.0))
+                corner_distance_norm = float(
+                    math.hypot(x - anchor_x, y - anchor_y) / diag
+                )
+
+    if corner_visible:
         geometry_class = "corner_visible"
+    elif primary_center is not None:
+        geometry_class = "straight" if secondary_center is None else "mixed_center_axes"
     else:
-        corner_visible = False
-        corner_x_norm = None
-        corner_y_norm = None
-        corner_distance_norm = None
-        geometry_class = "straight" if secondary_support == 0.0 else "mixed_axes"
+        geometry_class = "edge_only"
 
     return RectilinearGeometry(
         geometry_class=geometry_class,
-        primary_angle_deg=float(primary_angle),
-        secondary_angle_deg=(float(secondary_angle) if secondary_angle is not None else None),
+        primary_angle_deg=(
+            primary_center.angle_deg if primary_center is not None else float(primary_angle)
+        ),
+        secondary_angle_deg=(
+            secondary_center.angle_deg
+            if secondary_center is not None
+            else (float(secondary_angle) if secondary_angle is not None else None)
+        ),
         primary_support=float(primary_support),
         secondary_support=float(secondary_support),
         straight_confidence=float(straight_confidence),
         corner_score=float(corner_score),
+        primary_center_axis=primary_center,
+        secondary_center_axis=secondary_center,
         corner_visible=corner_visible,
         corner_x_norm=corner_x_norm,
         corner_y_norm=corner_y_norm,
@@ -483,9 +624,30 @@ def road_mask_metrics(
                 "geometry_usable": 1.0
                 if geometry.primary_angle_deg is not None
                 else 0.0,
+                "center_axis_usable": 1.0
+                if geometry.primary_center_axis is not None
+                else 0.0,
+                "secondary_center_axis_usable": 1.0
+                if geometry.secondary_center_axis is not None
+                else 0.0,
             }
         )
     return metrics
+
+
+def _draw_center_axis(
+    overlay: np.ndarray,
+    axis: CenterAxisSegment,
+    color: tuple[int, int, int],
+) -> None:
+    cv2.line(
+        overlay,
+        (int(round(axis.x1)), int(round(axis.y1))),
+        (int(round(axis.x2)), int(round(axis.y2))),
+        color,
+        4,
+        cv2.LINE_AA,
+    )
 
 
 def overlay_road_geometry(
@@ -495,7 +657,7 @@ def overlay_road_geometry(
     geometry: RectilinearGeometry | None = None,
     geometry_config: RectilinearGeometryConfig | None = None,
 ) -> np.ndarray:
-    """Render road mask plus rectilinear diagnostics for human inspection."""
+    """Render candidate road mask, edge evidence, center axes, and corner."""
 
     overlay = frame_bgr.copy()
     tint = np.zeros_like(frame_bgr)
@@ -515,24 +677,33 @@ def overlay_road_geometry(
     if geometry is None:
         return overlay
 
+    config = geometry_config or RectilinearGeometryConfig()
     primary = geometry.primary_angle_deg
     secondary = geometry.secondary_angle_deg
-    config = geometry_config or RectilinearGeometryConfig()
     for segment in geometry.segments:
-        if primary is not None and _angle_distance_deg(segment.angle_deg, primary) <= config.axis_tolerance_deg:
-            color = (0, 255, 255)  # primary axis: yellow
-        elif secondary is not None and _angle_distance_deg(segment.angle_deg, secondary) <= config.axis_tolerance_deg:
-            color = (255, 0, 255)  # secondary axis: magenta
+        if primary is not None and _angle_distance_deg(
+            segment.angle_deg, primary
+        ) <= config.axis_tolerance_deg:
+            color = (0, 190, 190)
+        elif secondary is not None and _angle_distance_deg(
+            segment.angle_deg, secondary
+        ) <= config.axis_tolerance_deg:
+            color = (180, 0, 180)
         else:
-            color = (255, 180, 0)
+            color = (120, 120, 120)
         cv2.line(
             overlay,
             (segment.x1, segment.y1),
             (segment.x2, segment.y2),
             color,
-            2,
+            1,
             cv2.LINE_AA,
         )
+
+    if geometry.primary_center_axis is not None:
+        _draw_center_axis(overlay, geometry.primary_center_axis, (255, 255, 0))
+    if geometry.secondary_center_axis is not None:
+        _draw_center_axis(overlay, geometry.secondary_center_axis, (255, 0, 255))
 
     height, width = frame_bgr.shape[:2]
     anchor = (

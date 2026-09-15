@@ -83,16 +83,15 @@ class DatasetSample:
     transition_distance_ms_by_horizon: tuple[float | None, ...] = ()
     near_transition_by_horizon: tuple[bool, ...] = ()
     near_short_correction_by_horizon: tuple[bool, ...] = ()
+    current_pressed: bool | None = None
 
     @property
     def target_states(self) -> tuple[bool, ...]:
         return self.target_pressed_by_horizon or (self.target_pressed,)
 
 
-
 def _nearest_frame_index(timestamp_ms: float, fps: float, frame_count: int) -> int:
     return min(frame_count - 1, max(0, round(timestamp_ms * fps / 1000.0)))
-
 
 
 def _nearest_transition_distance(
@@ -111,7 +110,6 @@ def _nearest_transition_distance(
     return min(candidates)
 
 
-
 def _short_corrections(
     segments: Sequence[ActionSegment], config: DatasetConfig
 ) -> tuple[ActionSegment, ...]:
@@ -123,7 +121,6 @@ def _short_corrections(
     )
 
 
-
 def _near_short_correction(
     timestamp_ms: float,
     corrections: Sequence[ActionSegment],
@@ -133,7 +130,6 @@ def _near_short_correction(
         segment.start_ms - window_ms <= timestamp_ms <= segment.end_ms + window_ms
         for segment in corrections
     )
-
 
 
 def build_samples(
@@ -166,6 +162,7 @@ def build_samples(
             for timestamp_ms in input_timestamps
         )
 
+        current_pressed = action_at_timestamp(timeline.events, current_ms)
         target_timestamps = tuple(current_ms + horizon for horizon in horizons)
         target_indices = tuple(
             _nearest_frame_index(timestamp_ms, timeline.fps, timeline.frame_count)
@@ -209,12 +206,12 @@ def build_samples(
                 transition_distance_ms_by_horizon=distances,
                 near_transition_by_horizon=near_transitions,
                 near_short_correction_by_horizon=near_short,
+                current_pressed=current_pressed,
             )
         )
         sample_index += 1
 
     return samples
-
 
 
 def build_dataset(

@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 import cv2
+import numpy as np
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,23 @@ def load_config(path: Path) -> tuple[RoadMaskConfig, dict[str, object]]:
     return config, preview
 
 
+def write_contact_sheet(images: list[np.ndarray], path: Path, columns: int = 4) -> None:
+    if not images:
+        return
+    thumb_width = 180
+    thumb_height = int(round(images[0].shape[0] * thumb_width / images[0].shape[1]))
+    thumbs = [cv2.resize(image, (thumb_width, thumb_height)) for image in images]
+    rows = (len(thumbs) + columns - 1) // columns
+    canvas = np.zeros((rows * thumb_height, columns * thumb_width, 3), dtype=np.uint8)
+    for index, image in enumerate(thumbs):
+        row, column = divmod(index, columns)
+        y0 = row * thumb_height
+        x0 = column * thumb_width
+        canvas[y0 : y0 + thumb_height, x0 : x0 + thumb_width] = image
+    if not cv2.imwrite(str(path), canvas):
+        raise RuntimeError(f"failed to write contact sheet: {path}")
+
+
 def inspect_video(
     video: Path,
     *,
@@ -86,6 +104,7 @@ def inspect_video(
     row_step = int(preview_config.get("row_step", 16))
     min_run_width = int(preview_config.get("min_run_width", 12))
     rows: list[dict[str, object]] = []
+    preview_images: list[np.ndarray] = []
     written = 0
     frame_index = 0
     try:
@@ -103,6 +122,16 @@ def inspect_video(
             )
             metrics = road_mask_metrics(mask, centerline)
             overlay = overlay_road_geometry(frame, mask, centerline)
+            cv2.putText(
+                overlay,
+                f"frame={frame_index} road={metrics['road_area_fraction']:.2f}",
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
             preview_path = stem_dir / f"frame_{frame_index:06d}.jpg"
             mask_path = stem_dir / f"frame_{frame_index:06d}_mask.png"
@@ -110,6 +139,7 @@ def inspect_video(
                 raise RuntimeError(f"failed to write preview: {preview_path}")
             if not cv2.imwrite(str(mask_path), mask):
                 raise RuntimeError(f"failed to write mask: {mask_path}")
+            preview_images.append(overlay)
 
             rows.append(
                 {
@@ -131,11 +161,14 @@ def inspect_video(
     finally:
         capture.release()
 
+    contact_sheet = stem_dir / "contact_sheet.jpg"
+    write_contact_sheet(preview_images, contact_sheet)
     summary = {
         "video": str(video),
         "fps": fps,
         "frame_count": frame_count,
         "sample_every_frames": sample_every_frames,
+        "contact_sheet": str(contact_sheet),
         "previews": rows,
     }
     summary_path = stem_dir / "summary.json"
@@ -176,7 +209,8 @@ def main() -> int:
         mean_centerline = sum(centerline) / len(centerline) if centerline else 0.0
         print(
             f"{video}: previews={len(areas)} mean_road_area={mean_area:.3f} "
-            f"mean_centerline_valid={mean_centerline:.3f}",
+            f"mean_centerline_valid={mean_centerline:.3f} "
+            f"sheet={summary['contact_sheet']}",
             flush=True,
         )
 

@@ -1,0 +1,13 @@
+# Initial v4 pseudo-label teacher for the current blue-track visual theme.
+# OpenCV HSV ranges: H=[0,179], S=[0,255], V=[0,255].
+road_mask:
+  hsv_lower: [103, 90, 50]
+  hsv_upper: [130, 255, 220]
+  close_kernel: 9
+  open_kernel: 3
+  min_component_area_fraction: 0.02
+
+preview:
+  sample_every_frames: 120
+  row_step: 16
+  min_run_width: 12

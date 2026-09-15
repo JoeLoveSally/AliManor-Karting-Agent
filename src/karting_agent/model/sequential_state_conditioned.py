@@ -2,22 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 import torch
 from torch import nn
-from torchvision.models import (
-    MobileNet_V3_Small_Weights,
-    ResNet18_Weights,
-    mobilenet_v3_small,
-    resnet18,
-)
 
-Architecture = Literal["mobilenet_v3_small", "resnet18"]
+from karting_agent.model.base import Architecture, build_model
 
 
 class SingleFrameEncoder(nn.Module):
-    """Encode one RGB frame into a compact visual feature vector."""
+    """Encode one RGB frame with the same classifier topology used by v3."""
 
     def __init__(
         self,
@@ -29,26 +21,11 @@ class SingleFrameEncoder(nn.Module):
         super().__init__()
         if output_dim < 1:
             raise ValueError("output_dim must be >= 1")
-
-        if architecture == "mobilenet_v3_small":
-            weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
-            backbone = mobilenet_v3_small(weights=weights)
-            self.features = backbone.features
-            self.pool = backbone.avgpool
-            in_features = backbone.classifier[0].in_features
-        elif architecture == "resnet18":
-            weights = ResNet18_Weights.DEFAULT if pretrained else None
-            backbone = resnet18(weights=weights)
-            self.features = nn.Sequential(*list(backbone.children())[:-1])
-            self.pool = nn.Identity()
-            in_features = backbone.fc.in_features
-        else:
-            raise ValueError(f"unsupported architecture: {architecture}")
-
-        self.projection = nn.Sequential(
-            nn.Flatten(1),
-            nn.Linear(in_features, output_dim),
-            nn.Hardswish(),
+        self.encoder = build_model(
+            architecture,
+            frame_stack=1,
+            pretrained=pretrained,
+            output_dim=output_dim,
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -57,9 +34,7 @@ class SingleFrameEncoder(nn.Module):
                 "single-frame encoder expects Bx3xHxW input, got "
                 f"{tuple(inputs.shape)}"
             )
-        features = self.features(inputs)
-        features = self.pool(features)
-        return self.projection(features)
+        return self.encoder(inputs)
 
 
 class SequentialStateConditionedPolicy(nn.Module):
@@ -146,8 +121,8 @@ class SequentialStateConditionedPolicy(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict from precomputed per-frame features.
 
-        Runtime uses this entry point with a small feature cache so overlapping
-        temporal windows do not repeatedly run the CNN on old frames.
+        Runtime can use this entry point with a feature cache so reused source
+        frames do not need to pass through the CNN again.
         """
         if sequence.ndim != 3:
             raise ValueError(

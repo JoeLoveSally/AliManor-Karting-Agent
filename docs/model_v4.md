@@ -109,8 +109,8 @@ The geometry priorities are now:
 
 ```text
 1. drivable-road / road-region representation
-2. visible local road axis / straight-segment direction
-3. visible corner presence and proximity
+2. visible local road center-axis direction
+3. visible center-axis corner presence and proximity
 4. later: travel-relative next-corner direction
 5. later: kart center / heading
 6. later: lateral offset and heading error relative to current road axis
@@ -160,41 +160,89 @@ The deployment path stays neural. Analytic CV is used only to create labels and 
 
 The first road-mask POC used one blue HSV range. The 15-video audit showed that this assumption was too narrow: several dark/blue/cyan/green/neutral themes produced effectively zero mask coverage while others worked.
 
-The teacher is therefore changed in two ways.
+The revised teacher uses two stages.
 
 ### 7.1 Multi-theme road candidate mask
 
-The POC now ORs several broad HSV bands covering:
+The POC ORs broad HSV bands covering:
 
 - blue;
 - cyan / teal;
 - green;
 - dark neutral road themes.
 
-Morphology and connected-component filtering are then applied. This is still only a teacher candidate and must be visually audited again; the ranges are intentionally not treated as ground truth.
+Morphology and connected-component filtering are then applied. This remains a teacher candidate rather than ground truth.
 
-### 7.2 Rectilinear geometry diagnostics
+### 7.2 Edge evidence → road center axis
 
-From the road candidate mask:
+A key audit result was that Hough lines extracted from `Canny(mask)` naturally lie on **road boundaries**, not road centers. That behavior is correct and useful as intermediate evidence, but raw edge lines must not become model targets.
+
+The current teacher therefore uses:
 
 ```text
-mask
-→ edge map
-→ Hough line segments
-→ weighted dominant screen-space road axis
-→ optional second axis
-→ finite-segment intersection candidates
-→ nearest visible corner diagnostic
+road candidate mask
+→ Canny boundary edges
+→ Hough long edge segments
+→ cluster approximately parallel edges by orientation
+→ pair overlapping parallel edges with plausible road width
+→ take the midpoint between each edge pair
+→ inferred road center axis
 ```
+
+For one straight corridor:
+
+```text
+road edge A  ─────────────────────
+
+             ===== center axis ====
+
+road edge B  ─────────────────────
+```
+
+Pair acceptance is constrained by:
+
+```text
+minimum/maximum road width
+minimum longitudinal overlap
+orientation tolerance
+```
+
+all normalized by image size where appropriate.
+
+This explicitly separates three concepts:
+
+```text
+Hough segment      = road-edge evidence
+center axis        = inferred training/diagnostic geometry
+corner             = intersection of inferred center axes
+```
+
+A raw edge intersection is no longer called a road corner.
+
+### 7.3 Center-axis corner diagnostic
+
+When both a primary and secondary road center axis can be inferred:
+
+```text
+primary center axis
+        ×
+secondary center axis
+        ↓
+visible center-axis intersection
+```
+
+The intersection is accepted only when it lies within the frame (with a small extension allowance) and near the finite extents of both inferred axes.
 
 Per frame the POC reports:
 
 ```text
 geometry_class:
-  unknown / straight / mixed_axes / corner_visible
+  unknown / edge_only / straight / mixed_center_axes / corner_visible
 
 primary_angle_deg
 secondary_angle_deg
+primary_center_axis
+secondary_center_axis
 straight_confidence
 corner_score
 corner_visible
@@ -202,17 +250,21 @@ corner_x_norm / corner_y_norm
 corner_distance_norm
 ```
 
-The overlay uses:
+The overlay now uses:
 
 ```text
-green   = road candidate mask
-yellow  = primary straight-axis segments
-magenta = secondary-axis segments
-red     = nearest visible axis intersection
-white X = diagnostic anchor
+green        = road candidate mask
+thin yellow  = primary road-edge evidence
+thin purple  = secondary road-edge evidence
+thick cyan   = inferred primary road center axis
+thick magenta= inferred secondary road center axis
+red circle   = center-axis intersection
+white X      = diagnostic anchor
 ```
 
-## 8. Important semantic limit: nearest visible corner is not next corner
+The center-axis lines, not the thin edge lines, are the important audit output.
+
+## 8. Important semantic limit: visible corner is not next corner
 
 The current teacher deliberately does **not** output:
 
@@ -222,7 +274,7 @@ next corner = left/right
 
 or claim that the white diagnostic anchor is the kart center.
 
-A road mask alone does not provide travel direction. The nearest visible intersection can be ahead, behind, or unrelated to the vehicle's current motion.
+A road mask alone does not provide travel direction. A visible center-axis intersection can still be ahead, behind, or unrelated to the vehicle's current motion.
 
 Reliable travel-relative labels require an additional teacher for at least one of:
 
@@ -235,7 +287,7 @@ kart motion vector from adjacent frames
 Only after that exists can we define:
 
 ```text
-current road direction
+current road direction relative to travel
 next corner distance
 next corner direction
 lateral offset
@@ -267,7 +319,18 @@ artifacts/geometry_pseudo_labels/
     └── summary.json
 ```
 
-`index.json` explicitly records that these labels are not yet available:
+Console summary now distinguishes:
+
+```text
+edge_axis
+center_axis
+secondary_axis
+corner
+```
+
+so high Hough coverage cannot be mistaken for high center-axis-label coverage.
+
+`index.json` also records that these labels are not yet available:
 
 ```text
 next_corner_direction
@@ -277,21 +340,21 @@ lateral_offset
 heading_error
 ```
 
-This prevents the POC diagnostic from silently becoming a stronger label claim later.
-
 ## 10. Gate before model training
 
-Do **not** generate full pseudo-labels or train v4-C until the revised teacher passes a second audit.
+Do **not** generate full pseudo-labels or train v4-C until the center-axis teacher passes audit.
 
 Inspect all 15 video themes for:
 
-1. road mask coverage on straight segments;
+1. road candidate coverage on straight segments;
 2. background/UI false positives;
-3. stability through visually patterned road themes;
-4. primary axis alignment with real road edges;
-5. second-axis detection around actual corners;
-6. false intersections caused by UI or unrelated fragments;
-7. geometry usability rate by video/theme.
+3. stability through patterned road themes;
+4. paired center axis lying between the two real road boundaries;
+5. plausible inferred road width;
+6. secondary center-axis detection around actual corners;
+7. false edge pairings between unrelated parallel road fragments;
+8. center-axis corner intersections near real topology changes;
+9. center-axis usability rate by video/theme.
 
 A label family only enters training if its teacher quality is high enough to be more informative than noisy.
 
@@ -299,18 +362,19 @@ A label family only enters training if its teacher quality is high enough to be 
 
 Do not add every geometry target at once.
 
-### v4-C1: road/axis supervision
+### v4-C1: center-axis orientation supervision
 
-First candidate after audit:
+The preferred first target is now the **inferred road center-axis orientation**, not raw segmentation and not raw Hough-edge angle.
+
+Conceptually:
 
 ```text
 L = L_switch
   + λ_action * L_future_action
-  + λ_road * L_road
-  + optional λ_axis * L_axis
+  + λ_axis * L_center_axis
 ```
 
-Possible axis target representation should avoid angle wrap ambiguity, e.g. predict axial orientation as:
+Axial orientation should avoid angle-wrap ambiguity by predicting:
 
 ```text
 (cos 2θ, sin 2θ)
@@ -318,9 +382,11 @@ Possible axis target representation should avoid angle wrap ambiguity, e.g. pred
 
 rather than direct degrees.
 
-### v4-C2: corner state
+Road segmentation may still be retained later as a weaker auxiliary task if its audit quality justifies it, but it is no longer the default first geometry loss.
 
-Only if visible-corner labels are reliable:
+### v4-C2: visible center-axis corner state
+
+Only if center-axis corner labels are reliable:
 
 ```text
 corner visible / not visible
@@ -351,9 +417,9 @@ Every auxiliary term is a hyperparameter, not a convention:
 ```text
 L = L_switch
   + λ_action * L_future_action
-  + λ_road * L_road
-  + λ_axis * L_axis
+  + λ_axis * L_center_axis
   + λ_corner * L_corner
+  + optional λ_road * L_road
   + later λ_pose * L_pose
 ```
 
@@ -380,7 +446,7 @@ Keep the analytic teacher after training for offline post-run diagnosis:
 ```text
 recorded MP4
    ├── learned structured visual prediction
-   ├── analytic teacher geometry
+   ├── analytic center-axis teacher geometry
    └── policy KEEP/SWITCH output
 ```
 
@@ -402,16 +468,17 @@ The teacher never controls the kart.
 ## 15. Current implementation order
 
 ```text
-1. run revised multi-theme + rectilinear teacher on all 15 videos
+1. run center-axis teacher on all 15 videos
 2. audit overview and suspicious per-video sheets
-3. quantify usable mask/axis/corner coverage by theme
-4. decide which label families are trustworthy
-5. only then implement full pseudo-label generation
-6. first model experiment: v3 + smallest trustworthy geometry auxiliary target(s)
-7. stateful offline comparison against v3 reference
-8. only if offline gate passes, run ADB closed-loop A/B
-9. add kart/travel-direction teacher before using travel-relative corner labels
-10. preserve failure/deviation runs for later DAgger-like iteration
+3. quantify edge-axis / center-axis / corner coverage by theme
+4. tune edge-pair thresholds only if visual failure modes are systematic
+5. decide whether center-axis orientation is trustworthy enough for v4-C1
+6. only then implement full pseudo-label generation
+7. first model experiment: v3 + center-axis orientation auxiliary head
+8. stateful offline comparison against v3 reference
+9. only if offline gate passes, run ADB closed-loop A/B
+10. add kart/travel-direction teacher before travel-relative corner labels
+11. preserve failure/deviation runs for later DAgger-like iteration
 ```
 
 ## 16. What v4 is not

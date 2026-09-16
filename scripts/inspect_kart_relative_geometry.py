@@ -76,7 +76,11 @@ def _triplet(values: object, *, name: str) -> tuple[int, int, int]:
     return tuple(int(value) for value in values)  # type: ignore[return-value]
 
 
-def _hsv_ranges(values: object, *, name: str) -> tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...]:
+def _hsv_ranges(
+    values: object,
+    *,
+    name: str,
+) -> tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...]:
     if not isinstance(values, list):
         raise ValueError(f"{name} must be a list")
     parsed = []
@@ -103,37 +107,69 @@ def load_kart_configs(path: Path) -> tuple[KartPoseConfig, KartRoadRelationConfi
 
     defaults = KartPoseConfig()
     warm_ranges = (
-        _hsv_ranges(pose_raw["warm_hsv_ranges"], name="kart_pose.warm_hsv_ranges")
+        _hsv_ranges(
+            pose_raw["warm_hsv_ranges"],
+            name="kart_pose.warm_hsv_ranges",
+        )
         if "warm_hsv_ranges" in pose_raw
         else defaults.warm_hsv_ranges
     )
     red_ranges = (
-        _hsv_ranges(pose_raw["red_hsv_ranges"], name="kart_pose.red_hsv_ranges")
+        _hsv_ranges(
+            pose_raw["red_hsv_ranges"],
+            name="kart_pose.red_hsv_ranges",
+        )
         if "red_hsv_ranges" in pose_raw
         else defaults.red_hsv_ranges
     )
     pose = KartPoseConfig(
         warm_hsv_ranges=warm_ranges,
         red_hsv_ranges=red_ranges,
-        search_x_min_norm=float(pose_raw.get("search_x_min_norm", defaults.search_x_min_norm)),
-        search_x_max_norm=float(pose_raw.get("search_x_max_norm", defaults.search_x_max_norm)),
-        search_y_min_norm=float(pose_raw.get("search_y_min_norm", defaults.search_y_min_norm)),
-        search_y_max_norm=float(pose_raw.get("search_y_max_norm", defaults.search_y_max_norm)),
+        search_x_min_norm=float(
+            pose_raw.get("search_x_min_norm", defaults.search_x_min_norm)
+        ),
+        search_x_max_norm=float(
+            pose_raw.get("search_x_max_norm", defaults.search_x_max_norm)
+        ),
+        search_y_min_norm=float(
+            pose_raw.get("search_y_min_norm", defaults.search_y_min_norm)
+        ),
+        search_y_max_norm=float(
+            pose_raw.get("search_y_max_norm", defaults.search_y_max_norm)
+        ),
         close_kernel=int(pose_raw.get("close_kernel", defaults.close_kernel)),
         min_component_area_fraction=float(
-            pose_raw.get("min_component_area_fraction", defaults.min_component_area_fraction)
+            pose_raw.get(
+                "min_component_area_fraction",
+                defaults.min_component_area_fraction,
+            )
         ),
         max_component_area_fraction=float(
-            pose_raw.get("max_component_area_fraction", defaults.max_component_area_fraction)
+            pose_raw.get(
+                "max_component_area_fraction",
+                defaults.max_component_area_fraction,
+            )
         ),
-        min_red_fraction=float(pose_raw.get("min_red_fraction", defaults.min_red_fraction)),
-        anchor_x_norm=float(pose_raw.get("anchor_x_norm", defaults.anchor_x_norm)),
-        anchor_y_norm=float(pose_raw.get("anchor_y_norm", defaults.anchor_y_norm)),
+        min_red_fraction=float(
+            pose_raw.get("min_red_fraction", defaults.min_red_fraction)
+        ),
+        anchor_x_norm=float(
+            pose_raw.get("anchor_x_norm", defaults.anchor_x_norm)
+        ),
+        anchor_y_norm=float(
+            pose_raw.get("anchor_y_norm", defaults.anchor_y_norm)
+        ),
         anchor_distance_weight=float(
-            pose_raw.get("anchor_distance_weight", defaults.anchor_distance_weight)
+            pose_raw.get(
+                "anchor_distance_weight",
+                defaults.anchor_distance_weight,
+            )
         ),
         join_distance_fraction=float(
-            pose_raw.get("join_distance_fraction", defaults.join_distance_fraction)
+            pose_raw.get(
+                "join_distance_fraction",
+                defaults.join_distance_fraction,
+            )
         ),
         min_heading_quality=float(
             pose_raw.get("min_heading_quality", defaults.min_heading_quality)
@@ -143,7 +179,8 @@ def load_kart_configs(path: Path) -> tuple[KartPoseConfig, KartRoadRelationConfi
 
     relation_defaults = KartRoadRelationConfig()
     offsets = relation_raw.get(
-        "tangent_offsets_fraction", relation_defaults.tangent_offsets_fraction
+        "tangent_offsets_fraction",
+        relation_defaults.tangent_offsets_fraction,
     )
     if not isinstance(offsets, (list, tuple)):
         raise ValueError("kart_relation.tangent_offsets_fraction must be a list")
@@ -156,10 +193,28 @@ def load_kart_configs(path: Path) -> tuple[KartPoseConfig, KartRoadRelationConfi
             )
         ),
         min_road_width_fraction=float(
-            relation_raw.get("min_road_width_fraction", relation_defaults.min_road_width_fraction)
+            relation_raw.get(
+                "min_road_width_fraction",
+                relation_defaults.min_road_width_fraction,
+            )
         ),
         max_road_width_fraction=float(
-            relation_raw.get("max_road_width_fraction", relation_defaults.max_road_width_fraction)
+            relation_raw.get(
+                "max_road_width_fraction",
+                relation_defaults.max_road_width_fraction,
+            )
+        ),
+        local_axis_tolerance_deg=float(
+            relation_raw.get(
+                "local_axis_tolerance_deg",
+                relation_defaults.local_axis_tolerance_deg,
+            )
+        ),
+        local_axis_radius_fraction=float(
+            relation_raw.get(
+                "local_axis_radius_fraction",
+                relation_defaults.local_axis_radius_fraction,
+            )
         ),
     )
     relation.validate()
@@ -205,12 +260,7 @@ def nearest_run_step(
     return steps[best] if abs(frames[best] - frame_index) <= max_delta else None
 
 
-def _text(
-    image: np.ndarray,
-    value: str,
-    *,
-    y: int,
-) -> None:
+def _text(image: np.ndarray, value: str, *, y: int) -> None:
     cv2.putText(
         image,
         value,
@@ -253,9 +303,15 @@ def inspect_video(
         raise RuntimeError(f"failed to open video: {video}")
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = float(capture.get(cv2.CAP_PROP_FPS))
-    last_frame = frame_count - 1 if frame_end is None else min(frame_end, frame_count - 1)
+    last_frame = (
+        frame_count - 1
+        if frame_end is None
+        else min(frame_end, frame_count - 1)
+    )
     if frame_start < 0 or frame_start > last_frame:
-        raise ValueError(f"invalid frame range for {video}: {frame_start}..{last_frame}")
+        raise ValueError(
+            f"invalid frame range for {video}: {frame_start}..{last_frame}"
+        )
 
     stem_dir = output_dir / video.stem
     stem_dir.mkdir(parents=True, exist_ok=True)
@@ -263,7 +319,11 @@ def inspect_video(
     rows: list[dict[str, object]] = []
 
     try:
-        for frame_index in range(frame_start, last_frame + 1, sample_every_frames):
+        for frame_index in range(
+            frame_start,
+            last_frame + 1,
+            sample_every_frames,
+        ):
             if len(rows) >= max_previews:
                 break
             capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
@@ -290,7 +350,12 @@ def inspect_video(
                 geometry=geometry,
                 geometry_config=geometry_config,
             )
-            overlay = overlay_kart_relative_geometry(overlay, kart_mask, pose, relation)
+            overlay = overlay_kart_relative_geometry(
+                overlay,
+                kart_mask,
+                pose,
+                relation,
+            )
 
             pose_text = "kart=NA"
             if pose is not None:
@@ -310,14 +375,11 @@ def inspect_video(
                     if relation.heading_error_deg is not None
                     else "NA"
                 )
-                lateral = (
-                    f"{relation.lateral_offset_norm:+.2f}w"
-                    if relation.lateral_offset_norm is not None
-                    else "NA"
-                )
                 relation_text = (
-                    f"road={relation.road_angle_deg:.0f} herr={heading_error} "
-                    f"lat={lateral} relq={relation.confidence:.2f}"
+                    f"road={relation.road_angle_deg:.0f} "
+                    f"herr={heading_error} "
+                    f"lat={relation.lateral_offset_norm:+.2f}w "
+                    f"relq={relation.confidence:.2f}"
                 )
             _text(overlay, f"f={frame_index} {pose_text}", y=22)
             _text(overlay, relation_text, y=42)
@@ -328,9 +390,10 @@ def inspect_video(
                 probability = float(run_step.get("probability", 0.0))
                 action = str(run_step.get("action", "?"))
                 pressed = bool(run_step.get("pressed", False))
+                state = "PRESS" if pressed else "RELEASE"
                 _text(
                     overlay,
-                    f"policy p={probability:.3f} action={action} state={'PRESS' if pressed else 'RELEASE'}",
+                    f"policy p={probability:.3f} action={action} state={state}",
                     y=62,
                 )
                 run_payload = {
@@ -346,11 +409,15 @@ def inspect_video(
             rows.append(
                 {
                     "frame_index": frame_index,
-                    "timestamp_ms": frame_index / fps * 1000.0 if fps > 0 else None,
+                    "timestamp_ms": (
+                        frame_index / fps * 1000.0 if fps > 0 else None
+                    ),
                     "preview": str(preview_path),
                     "geometry": geometry.to_dict(),
                     "kart_pose": pose.to_dict() if pose is not None else None,
-                    "kart_road_relation": relation.to_dict() if relation is not None else None,
+                    "kart_road_relation": (
+                        relation.to_dict() if relation is not None else None
+                    ),
                     "policy": run_payload,
                 }
             )
@@ -370,7 +437,8 @@ def inspect_video(
         "previews": rows,
     }
     (stem_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
     )
     return summary
 
@@ -379,14 +447,17 @@ def summarize(summary: dict[str, object]) -> str:
     previews = summary["previews"]
     assert isinstance(previews, list)
     count = len(previews)
-    poses = [row["kart_pose"] for row in previews if row["kart_pose"] is not None]
+    poses = [
+        row["kart_pose"]
+        for row in previews
+        if row["kart_pose"] is not None
+    ]
     headings = [pose for pose in poses if pose["heading_usable"]]
     relations = [
         row["kart_road_relation"]
         for row in previews
         if row["kart_road_relation"] is not None
     ]
-    local = [relation for relation in relations if relation["local_road_usable"]]
     heading_errors = [
         float(relation["abs_heading_error_deg"])
         for relation in relations
@@ -394,10 +465,11 @@ def summarize(summary: dict[str, object]) -> str:
     ]
     lateral = [
         abs(float(relation["lateral_offset_norm"]))
-        for relation in local
-        if relation["lateral_offset_norm"] is not None
+        for relation in relations
     ]
-    offroad = [relation for relation in local if relation["inside_road"] is False]
+    offroad = [
+        relation for relation in relations if relation["inside_road"] is False
+    ]
 
     def ratio(value: int) -> float:
         return value / count if count else 0.0
@@ -406,9 +478,11 @@ def summarize(summary: dict[str, object]) -> str:
     mean_lateral = float(np.mean(lateral)) if lateral else 0.0
     return (
         f"previews={count} kart={ratio(len(poses)):.3f} "
-        f"heading={ratio(len(headings)):.3f} relation={ratio(len(local)):.3f} "
-        f"offroad={len(offroad) / len(local) if local else 0.0:.3f} "
-        f"mean_abs_herr={mean_heading:.1f}deg mean_abs_lat={mean_lateral:.2f}w"
+        f"heading={ratio(len(headings)):.3f} "
+        f"relation={ratio(len(relations)):.3f} "
+        f"offroad={len(offroad) / len(relations) if relations else 0.0:.3f} "
+        f"mean_abs_herr={mean_heading:.1f}deg "
+        f"mean_abs_lat={mean_lateral:.2f}w"
     )
 
 
@@ -427,7 +501,9 @@ def main() -> int:
 
     road_config, geometry_config, _ = load_road_config(args.config.resolve())
     kart_config, relation_config = load_kart_configs(args.config.resolve())
-    run_frames, run_steps = load_run_steps(args.run_json.resolve() if args.run_json else None)
+    run_frames, run_steps = load_run_steps(
+        args.run_json.resolve() if args.run_json else None
+    )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -449,7 +525,8 @@ def main() -> int:
         )
         summaries.append(summary)
         print(
-            f"{video}: {summarize(summary)} sheet={summary['contact_sheet']}",
+            f"{video}: {summarize(summary)} "
+            f"sheet={summary['contact_sheet']}",
             flush=True,
         )
 
@@ -458,14 +535,30 @@ def main() -> int:
         json.dumps(
             {
                 "teacher_semantics": {
-                    "kart_center": "centroid of merged red/orange chassis evidence",
-                    "kart_heading": "axial PCA direction of merged chassis evidence",
-                    "road_orientation": "dominant road-edge axial orientation",
-                    "lateral_offset": "kart displacement from local road cross-section center, normalized by half road width",
-                    "heading_error": "signed axial kart-heading minus road-axis difference",
-                    "training_status": "diagnostic_only_not_approved_for_supervision",
+                    "kart_center": (
+                        "centroid of merged red/orange chassis evidence"
+                    ),
+                    "kart_heading": (
+                        "axial PCA direction of merged chassis evidence"
+                    ),
+                    "road_orientation": (
+                        "local Hough-axis candidate selected by corridor fit, "
+                        "kart-heading compatibility and nearby edge support"
+                    ),
+                    "lateral_offset": (
+                        "kart displacement from local road cross-section center, "
+                        "normalized by half road width"
+                    ),
+                    "heading_error": (
+                        "signed axial kart-heading minus local road-axis difference"
+                    ),
+                    "training_status": (
+                        "diagnostic_only_not_approved_for_supervision"
+                    ),
                 },
-                "run_json": str(args.run_json.resolve()) if args.run_json else None,
+                "run_json": (
+                    str(args.run_json.resolve()) if args.run_json else None
+                ),
                 "videos": summaries,
             },
             indent=2,

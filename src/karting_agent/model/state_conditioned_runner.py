@@ -15,19 +15,30 @@ from karting_agent.model.state_conditioned import build_state_conditioned_model
 _SUPPORTED_MODEL_FAMILIES = {
     "state_conditioned_transition_v3",
     "state_conditioned_axis_v4c1",
+    "state_conditioned_kart_relative_v4c2",
+}
+
+_AUXILIARY_HEAD_PREFIXES = {
+    "state_conditioned_axis_v4c1": ("axis_head.",),
+    "state_conditioned_kart_relative_v4c2": (
+        "lateral_head.",
+        "heading_error_head.",
+        "edge_risk_head.",
+    ),
 }
 
 
 def _control_state_dict(state_dict: dict[str, object], model_family: str) -> dict[str, object]:
     """Return only parameters required by the deployed v3 control path."""
 
-    if model_family == "state_conditioned_axis_v4c1":
-        return {
-            key: value
-            for key, value in state_dict.items()
-            if not key.startswith("axis_head.")
-        }
-    return state_dict
+    prefixes = _AUXILIARY_HEAD_PREFIXES.get(model_family, ())
+    if not prefixes:
+        return state_dict
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith(prefixes)
+    }
 
 
 class StateConditionedModelRunner:

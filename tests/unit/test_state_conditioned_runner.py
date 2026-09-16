@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("torch")
 pytest.importorskip("torchvision")
 
+from karting_agent.model.runner import _runtime_spec
 from karting_agent.model.state_conditioned_runner import (
     _SUPPORTED_MODEL_FAMILIES,
     _control_state_dict,
@@ -40,3 +43,37 @@ def test_v4c2_runtime_strips_only_auxiliary_heads() -> None:
         "heading_error_head.weight",
         "edge_risk_head.weight",
     }
+
+
+def test_runtime_spec_accepts_legacy_config_path(tmp_path: Path) -> None:
+    config = tmp_path / "train_v4c2.yaml"
+    config.write_text(
+        """
+model:
+  architecture: mobilenet_v3_small
+  frame_stack: 5
+dataset:
+  history_ms: 200
+  frame_interval_ms: 50
+  prediction_horizons_ms: [100, 200, 300]
+  control_horizon_ms: 100
+preprocess:
+  mask_touch_area: true
+  touch_roi: [0.78, 0.82, 0.98, 0.98]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    spec = _runtime_spec(
+        {
+            "config": str(config),
+            "architecture": "mobilenet_v3_small",
+            "frame_stack": 5,
+            "prediction_horizons_ms": [100, 200, 300],
+            "control_horizon_ms": 100,
+        }
+    )
+
+    assert spec.frame_offsets_ms == (-200.0, -150.0, -100.0, -50.0, 0.0)
+    assert spec.control_horizon_ms == 100.0

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 from karting_agent.vision.preprocess import PreprocessConfig, preprocess_config_from_mapping
 
@@ -36,10 +37,37 @@ class ModelRuntimeSpec:
         return self.prediction_horizons_ms.index(self.control_horizon_ms)
 
 
-def _runtime_spec(metadata: dict[str, object]) -> ModelRuntimeSpec:
+def _training_config(metadata: dict[str, object]) -> dict[str, object]:
+    """Return the embedded config or resolve legacy metadata that stored a path."""
+
     raw_config = metadata.get("config")
-    if not isinstance(raw_config, dict):
+    if isinstance(raw_config, dict):
+        return raw_config
+    if not isinstance(raw_config, str) or not raw_config:
         raise ValueError("model metadata must contain the training config")
+
+    configured_path = Path(raw_config)
+    candidates = [configured_path]
+    if not configured_path.is_file():
+        project_root = Path(__file__).resolve().parents[3]
+        candidates.append(project_root / "configs" / configured_path.name)
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        loaded = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"training config must be a mapping: {candidate}")
+        return loaded
+
+    raise ValueError(
+        "model metadata contains a training-config path that is unavailable locally: "
+        f"{raw_config}"
+    )
+
+
+def _runtime_spec(metadata: dict[str, object]) -> ModelRuntimeSpec:
+    raw_config = _training_config(metadata)
     model_config = raw_config.get("model", {})
     dataset_config = raw_config.get("dataset", {})
     if not isinstance(model_config, dict) or not isinstance(dataset_config, dict):

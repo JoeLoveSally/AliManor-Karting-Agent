@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Probe whether a temporal model actually depends on motion/history order."""
+"""Probe whether a temporal transition policy actually depends on motion/history order."""
 
 from __future__ import annotations
 
@@ -17,8 +17,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from analyze_model_focus import load_run, read_video_frames, selected_steps  # noqa: E402
-from karting_agent.model.runner import ModelRunner  # noqa: E402
+from analyze_model_focus import (  # noqa: E402
+    load_diagnostic_runner,
+    load_run,
+    pre_action_pressed,
+    predict_probability,
+    read_video_frames,
+    selected_steps,
+)
 from karting_agent.vision.preprocess import prepare_frame, stack_prepared_frames  # noqa: E402
 
 
@@ -48,18 +54,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def predict(runner: ModelRunner, frames: list[np.ndarray]) -> float:
-    return runner.predict(stack_prepared_frames(frames, runner.spec.preprocess_config))
+def predict(runner, frames: list[np.ndarray], *, current_pressed: bool) -> float:
+    inputs = stack_prepared_frames(frames, runner.spec.preprocess_config)
+    return predict_probability(
+        runner,
+        inputs,
+        current_pressed=current_pressed,
+    )
 
 
 def temporal_probe(
-    runner: ModelRunner,
+    runner,
     prepared_frames: list[np.ndarray],
+    *,
+    current_pressed: bool,
 ) -> dict[str, object]:
     if len(prepared_frames) < 2:
         raise ValueError("temporal probe requires at least two frames")
 
-    baseline = predict(runner, prepared_frames)
+    baseline = predict(
+        runner,
+        prepared_frames,
+        current_pressed=current_pressed,
+    )
     latest = prepared_frames[-1]
     oldest = prepared_frames[0]
 
@@ -70,7 +87,11 @@ def temporal_probe(
     }
     variant_results: dict[str, dict[str, float | bool]] = {}
     for name, frames in variants.items():
-        probability = predict(runner, frames)
+        probability = predict(
+            runner,
+            frames,
+            current_pressed=current_pressed,
+        )
         variant_results[name] = {
             "probability": probability,
             "delta_from_baseline": baseline - probability,
@@ -82,7 +103,11 @@ def temporal_probe(
         replacement_index = index - 1 if index > 0 else 1
         frames = list(prepared_frames)
         frames[index] = prepared_frames[replacement_index]
-        probability = predict(runner, frames)
+        probability = predict(
+            runner,
+            frames,
+            current_pressed=current_pressed,
+        )
         slice_replacement.append(
             {
                 "index": index,
@@ -156,7 +181,7 @@ def aggregate_report(steps: list[dict[str, object]]) -> dict[str, object]:
 
 def main() -> int:
     args = parse_args()
-    runner = ModelRunner(
+    runner = load_diagnostic_runner(
         args.model,
         metadata_path=args.metadata,
         device=args.device,
@@ -180,7 +205,12 @@ def main() -> int:
             prepare_frame(source_frames[index], runner.spec.preprocess_config)
             for index in indices
         ]
-        probe = temporal_probe(runner, prepared)
+        current_pressed = pre_action_pressed(step)
+        probe = temporal_probe(
+            runner,
+            prepared,
+            current_pressed=current_pressed,
+        )
         saved_probability = float(step["probability"])
         baseline = float(probe["baseline_probability"])
         mismatch = abs(saved_probability - baseline)
@@ -192,6 +222,8 @@ def main() -> int:
                 "frame_offsets_ms": list(runner.spec.frame_offsets_ms),
                 "observation_timestamp_ms": float(step["observation_timestamp_ms"]),
                 "action": action,
+                "current_pressed": current_pressed,
+                "pressed_after_action": bool(step["pressed"]),
                 "saved_probability": saved_probability,
                 "recomputed_probability": baseline,
                 "absolute_probability_mismatch": mismatch,
@@ -200,8 +232,9 @@ def main() -> int:
         )
         repeat_latest = probe["variants"]["repeat_latest"]
         reverse = probe["variants"]["reverse"]
+        state_label = "P" if current_pressed else "R"
         print(
-            f"src={indices[-1]} action={action:<7} "
+            f"src={indices[-1]} state={state_label} action={action:<7} "
             f"p={baseline:.3f} diff={mismatch:.3f} "
             f"repeat_latest={repeat_latest['probability']:.3f} "
             f"reverse={reverse['probability']:.3f}",
@@ -227,6 +260,7 @@ def main() -> int:
                 "steps": report_steps,
                 "note": (
                     "Counterfactual temporal probes measure sensitivity to history/order. "
+                    "They preserve the runtime control state for state-conditioned models. "
                     "They are diagnostic perturbations, not causal feature attribution."
                 ),
             },

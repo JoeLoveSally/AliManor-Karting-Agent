@@ -15,7 +15,7 @@ from typing import Sequence
 import cv2
 import numpy as np
 
-from karting_agent.train.geometry_pseudo_labels import RectilinearGeometry
+from karting_agent.train.geometry_pseudo_labels import LineSegment, RectilinearGeometry
 
 
 HsvTriplet = tuple[int, int, int]
@@ -67,7 +67,10 @@ class KartPoseConfig:
             raise ValueError("kart component area fractions must satisfy 0 < min < max <= 1")
         if not 0.0 <= self.min_red_fraction <= 1.0:
             raise ValueError("min_red_fraction must be in [0,1]")
-        if not 0.0 <= self.anchor_x_norm <= 1.0 or not 0.0 <= self.anchor_y_norm <= 1.0:
+        if not (
+            0.0 <= self.anchor_x_norm <= 1.0
+            and 0.0 <= self.anchor_y_norm <= 1.0
+        ):
             raise ValueError("kart anchor must be normalized to [0,1]")
         if self.anchor_distance_weight < 0:
             raise ValueError("anchor_distance_weight must be >= 0")
@@ -79,12 +82,14 @@ class KartPoseConfig:
 
 @dataclass(frozen=True)
 class KartRoadRelationConfig:
-    """Local road cross-section configuration around the detected kart."""
+    """Local road-axis and cross-section configuration around the kart."""
 
     tangent_offsets_fraction: tuple[float, ...] = (-0.05, 0.05)
     max_normal_distance_fraction: float = 0.30
     min_road_width_fraction: float = 0.025
     max_road_width_fraction: float = 0.35
+    local_axis_tolerance_deg: float = 10.0
+    local_axis_radius_fraction: float = 0.30
 
     def validate(self) -> None:
         if not self.tangent_offsets_fraction:
@@ -93,8 +98,17 @@ class KartRoadRelationConfig:
             raise ValueError("tangent offsets must be fractions in [-1,1]")
         if not 0.0 < self.max_normal_distance_fraction <= 1.0:
             raise ValueError("max_normal_distance_fraction must be in (0,1]")
-        if not 0.0 < self.min_road_width_fraction < self.max_road_width_fraction <= 1.0:
+        if not (
+            0.0
+            < self.min_road_width_fraction
+            < self.max_road_width_fraction
+            <= 1.0
+        ):
             raise ValueError("road width fractions must satisfy 0 < min < max <= 1")
+        if not 0.0 < self.local_axis_tolerance_deg < 90.0:
+            raise ValueError("local_axis_tolerance_deg must be in (0,90)")
+        if not 0.0 < self.local_axis_radius_fraction <= 1.0:
+            raise ValueError("local_axis_radius_fraction must be in (0,1]")
 
 
 @dataclass(frozen=True)
@@ -139,25 +153,27 @@ class KartPose:
 @dataclass(frozen=True)
 class KartRoadRelation:
     road_angle_deg: float
+    road_support_fraction: float
     heading_error_deg: float | None
     abs_heading_error_deg: float | None
-    local_road_center_x: float | None
-    local_road_center_y: float | None
-    local_road_width_px: float | None
-    lateral_offset_px: float | None
-    lateral_offset_norm: float | None
-    inside_road: bool | None
+    local_road_center_x: float
+    local_road_center_y: float
+    local_road_width_px: float
+    lateral_offset_px: float
+    lateral_offset_norm: float
+    inside_road: bool
     valid_cross_sections: int
     cross_section_count: int
     confidence: float
 
     @property
     def local_road_usable(self) -> bool:
-        return self.lateral_offset_norm is not None
+        return True
 
     def to_dict(self) -> dict[str, float | int | bool | None]:
         return {
             "road_angle_deg": self.road_angle_deg,
+            "road_support_fraction": self.road_support_fraction,
             "heading_error_deg": self.heading_error_deg,
             "abs_heading_error_deg": self.abs_heading_error_deg,
             "local_road_center_x": self.local_road_center_x,
@@ -166,7 +182,7 @@ class KartRoadRelation:
             "lateral_offset_px": self.lateral_offset_px,
             "lateral_offset_norm": self.lateral_offset_norm,
             "inside_road": self.inside_road,
-            "local_road_usable": self.local_road_usable,
+            "local_road_usable": True,
             "valid_cross_sections": self.valid_cross_sections,
             "cross_section_count": self.cross_section_count,
             "confidence": self.confidence,
@@ -226,8 +242,12 @@ def extract_kart_color_masks(
     warm = cv2.bitwise_and(warm, roi)
     red = cv2.bitwise_and(red, roi)
 
-    kernel_size = config.close_kernel if config.close_kernel % 2 else config.close_kernel + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    kernel_size = (
+        config.close_kernel if config.close_kernel % 2 else config.close_kernel + 1
+    )
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
     warm = cv2.morphologyEx(warm, cv2.MORPH_CLOSE, kernel)
     return warm, red
 
@@ -236,13 +256,7 @@ def estimate_kart_pose(
     frame_bgr: np.ndarray,
     config: KartPoseConfig | None = None,
 ) -> tuple[KartPose | None, np.ndarray]:
-    """Estimate kart center and axial heading from its red/orange chassis pixels.
-
-    The detector intentionally ignores the mostly white chicken body. Warm kart
-    pieces are first filtered by red support, then nearby pieces are merged so
-    PCA operates on the chassis rather than one disconnected decorative part.
-    The heading is axial (modulo 180 degrees); front/back is not inferred here.
-    """
+    """Estimate kart center and axial heading from red/orange chassis pixels."""
 
     config = config or KartPoseConfig()
     config.validate()
@@ -253,16 +267,23 @@ def estimate_kart_pose(
 
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(warm, 8)
     anchor = np.asarray(
-        [config.anchor_x_norm * width, config.anchor_y_norm * height], dtype=np.float64
+        [config.anchor_x_norm * width, config.anchor_y_norm * height],
+        dtype=np.float64,
     )
     candidates: list[tuple[float, int, int, np.ndarray, float]] = []
     for label in range(1, count):
         area = int(stats[label, cv2.CC_STAT_AREA])
         area_fraction = area / image_area
-        if not config.min_component_area_fraction <= area_fraction <= config.max_component_area_fraction:
+        if not (
+            config.min_component_area_fraction
+            <= area_fraction
+            <= config.max_component_area_fraction
+        ):
             continue
         component = labels == label
-        red_fraction = float(np.count_nonzero((red > 0) & component) / max(1, area))
+        red_fraction = float(
+            np.count_nonzero((red > 0) & component) / max(1, area)
+        )
         if red_fraction < config.min_red_fraction:
             continue
         center = centroids[label].astype(np.float64)
@@ -295,14 +316,22 @@ def estimate_kart_pose(
     major_index = int(np.argmax(eigenvalues))
     major = float(max(eigenvalues[major_index], 0.0))
     minor = float(max(eigenvalues[1 - major_index], 0.0))
-    heading_quality = 0.0 if major <= 1e-9 else float(np.clip(1.0 - minor / major, 0.0, 1.0))
+    heading_quality = (
+        0.0
+        if major <= 1e-9
+        else float(np.clip(1.0 - minor / major, 0.0, 1.0))
+    )
     heading_angle: float | None = None
     if heading_quality >= config.min_heading_quality:
         vector = eigenvectors[:, major_index]
-        heading_angle = float(math.degrees(math.atan2(vector[1], vector[0])) % 180.0)
+        heading_angle = float(
+            math.degrees(math.atan2(vector[1], vector[0])) % 180.0
+        )
 
     selected_area = int(xs.size)
-    red_fraction = float(np.count_nonzero((red > 0) & selected) / max(1, selected_area))
+    red_fraction = float(
+        np.count_nonzero((red > 0) & selected) / max(1, selected_area)
+    )
     anchor_distance = float(np.linalg.norm(center - anchor) / diag)
     x_min = int(xs.min())
     x_max = int(xs.max())
@@ -330,6 +359,83 @@ def signed_axial_difference_deg(angle: float, reference: float) -> float:
     """Return signed minimum axial difference in [-90, 90)."""
 
     return float((angle - reference + 90.0) % 180.0 - 90.0)
+
+
+def _angle_distance_deg(left: float, right: float) -> float:
+    return abs(signed_axial_difference_deg(left, right))
+
+
+def _point_segment_distance(
+    x: float,
+    y: float,
+    segment: LineSegment,
+) -> float:
+    start = np.asarray([segment.x1, segment.y1], dtype=np.float64)
+    end = np.asarray([segment.x2, segment.y2], dtype=np.float64)
+    point = np.asarray([x, y], dtype=np.float64)
+    delta = end - start
+    denominator = float(np.dot(delta, delta))
+    if denominator <= 1e-9:
+        return float(np.linalg.norm(point - start))
+    fraction = float(np.clip(np.dot(point - start, delta) / denominator, 0.0, 1.0))
+    nearest = start + fraction * delta
+    return float(np.linalg.norm(point - nearest))
+
+
+def _local_axis_candidates(
+    geometry: RectilinearGeometry,
+    pose: KartPose,
+    *,
+    diag: float,
+    config: KartRoadRelationConfig,
+) -> list[tuple[float, float]]:
+    """Return distinct local road-axis candidates as (angle, support_fraction)."""
+
+    if not geometry.segments:
+        return []
+    radius = max(1.0, diag * config.local_axis_radius_fraction)
+    weighted: list[tuple[LineSegment, float]] = []
+    total_length = max(1e-6, sum(segment.length for segment in geometry.segments))
+    for segment in geometry.segments:
+        distance = _point_segment_distance(pose.center_x, pose.center_y, segment)
+        proximity = 1.0 / (1.0 + distance / radius)
+        weighted.append((segment, segment.length * proximity))
+
+    raw: list[tuple[float, float]] = []
+    for seed, _ in weighted:
+        members = [
+            item
+            for item in weighted
+            if _angle_distance_deg(item[0].angle_deg, seed.angle_deg)
+            <= config.local_axis_tolerance_deg
+        ]
+        if not members:
+            continue
+        sin_sum = sum(
+            math.sin(math.radians(2.0 * segment.angle_deg)) * weight
+            for segment, weight in members
+        )
+        cos_sum = sum(
+            math.cos(math.radians(2.0 * segment.angle_deg)) * weight
+            for segment, weight in members
+        )
+        angle = float(
+            (0.5 * math.degrees(math.atan2(sin_sum, cos_sum))) % 180.0
+        )
+        support_fraction = float(
+            np.clip(sum(weight for _, weight in members) / total_length, 0.0, 1.0)
+        )
+        raw.append((angle, support_fraction))
+
+    distinct: list[tuple[float, float]] = []
+    for angle, support in sorted(raw, key=lambda item: item[1], reverse=True):
+        if all(
+            _angle_distance_deg(angle, existing_angle)
+            > config.local_axis_tolerance_deg
+            for existing_angle, _ in distinct
+        ):
+            distinct.append((angle, support))
+    return distinct
 
 
 def _nearest_road_run(
@@ -365,7 +471,9 @@ def _nearest_road_run(
         road_width = last - first + 1.0
         if not min_width <= road_width <= max_width:
             continue
-        distance = 0.0 if first <= 0.0 <= last else min(abs(first), abs(last))
+        distance = (
+            0.0 if first <= 0.0 <= last else min(abs(first), abs(last))
+        )
         center = 0.5 * (first + last)
         candidates.append((distance, -road_width, center))
     if not candidates:
@@ -375,35 +483,13 @@ def _nearest_road_run(
     return center, -negative_width
 
 
-def estimate_kart_road_relation(
+def _cross_sections_for_angle(
     road_mask: np.ndarray,
-    geometry: RectilinearGeometry,
     pose: KartPose,
-    config: KartRoadRelationConfig | None = None,
-) -> KartRoadRelation | None:
-    """Estimate road-relative heading and lateral displacement near the kart.
-
-    Lateral offset is obtained from local cross-sections perpendicular to the
-    dominant road axis. Cross-sections are shifted slightly forward/backward
-    along the road tangent so the kart sprite itself does not create a large
-    hole in the road mask.
-    """
-
-    config = config or KartRoadRelationConfig()
-    config.validate()
-    if road_mask.ndim != 2:
-        raise ValueError("road_mask must be HxW")
-    if geometry.primary_angle_deg is None:
-        return None
-
-    road_angle = float(geometry.primary_angle_deg)
-    heading_error = (
-        signed_axial_difference_deg(pose.heading_angle_deg, road_angle)
-        if pose.heading_angle_deg is not None
-        else None
-    )
-    abs_heading_error = abs(heading_error) if heading_error is not None else None
-
+    road_angle: float,
+    *,
+    config: KartRoadRelationConfig,
+) -> tuple[list[tuple[float, float]], np.ndarray, np.ndarray, float]:
     height, width = road_mask.shape
     diag = max(1.0, math.hypot(width, height))
     theta = math.radians(road_angle)
@@ -427,44 +513,127 @@ def estimate_kart_road_relation(
         )
         if candidate is not None:
             cross_sections.append(candidate)
+    return cross_sections, tangent, normal, diag
 
-    local_center_x: float | None = None
-    local_center_y: float | None = None
-    local_width: float | None = None
-    lateral_px: float | None = None
-    lateral_norm: float | None = None
-    inside_road: bool | None = None
-    if cross_sections:
+
+def estimate_kart_road_relation(
+    road_mask: np.ndarray,
+    geometry: RectilinearGeometry,
+    pose: KartPose,
+    config: KartRoadRelationConfig | None = None,
+) -> KartRoadRelation | None:
+    """Estimate the locally relevant road axis and kart-relative state.
+
+    Global dominant orientation is insufficient near an intersection because a
+    long but distant road segment can win the Hough-support vote. This function
+    therefore evaluates multiple Hough orientation clusters around the kart.
+    A candidate is preferred when local normal cross-sections form a plausible
+    corridor near the kart, its axis is compatible with kart heading, and it has
+    stronger nearby edge support. If no candidate yields a plausible local road
+    cross-section, the relation fails closed instead of emitting a label.
+    """
+
+    config = config or KartRoadRelationConfig()
+    config.validate()
+    if road_mask.ndim != 2:
+        raise ValueError("road_mask must be HxW")
+    if not geometry.segments:
+        return None
+
+    height, width = road_mask.shape
+    diag = max(1.0, math.hypot(width, height))
+    candidates = _local_axis_candidates(
+        geometry,
+        pose,
+        diag=diag,
+        config=config,
+    )
+    if not candidates:
+        return None
+
+    selected: tuple[
+        float,
+        float,
+        list[tuple[float, float]],
+        np.ndarray,
+        float,
+        float,
+    ] | None = None
+    for road_angle, support_fraction in candidates:
+        cross_sections, _, normal, _ = _cross_sections_for_angle(
+            road_mask,
+            pose,
+            road_angle,
+            config=config,
+        )
+        if not cross_sections:
+            continue
         center_offset = float(np.median([item[0] for item in cross_sections]))
-        local_width = float(np.median([item[1] for item in cross_sections]))
-        local_center = kart_center + normal * center_offset
-        local_center_x = float(local_center[0])
-        local_center_y = float(local_center[1])
-        lateral_px = float(-center_offset)
-        lateral_norm = float(lateral_px / max(1.0, 0.5 * local_width))
-        inside_road = abs(lateral_norm) <= 1.0
+        road_width = float(np.median([item[1] for item in cross_sections]))
+        lateral_norm = float(-center_offset / max(1.0, 0.5 * road_width))
+        heading_error = (
+            abs(signed_axial_difference_deg(pose.heading_angle_deg, road_angle))
+            if pose.heading_angle_deg is not None
+            else 0.0
+        )
 
+        # The score is intentionally simple and auditable. Lateral proximity is
+        # primary, heading compatibility breaks ambiguous intersection cases,
+        # while nearby edge support and two valid probes provide small bonuses.
+        score = (
+            abs(lateral_norm)
+            + 0.65 * (heading_error / 90.0)
+            - 0.25 * support_fraction
+            - 0.10 * len(cross_sections)
+        )
+        candidate = (
+            score,
+            road_angle,
+            cross_sections,
+            normal,
+            support_fraction,
+            road_width,
+        )
+        if selected is None or candidate[0] < selected[0]:
+            selected = candidate
+
+    if selected is None:
+        return None
+
+    _, road_angle, cross_sections, normal, support_fraction, road_width = selected
+    center_offset = float(np.median([item[0] for item in cross_sections]))
+    kart_center = np.asarray([pose.center_x, pose.center_y], dtype=np.float64)
+    local_center = kart_center + normal * center_offset
+    lateral_px = float(-center_offset)
+    lateral_norm = float(lateral_px / max(1.0, 0.5 * road_width))
+    heading_error = (
+        signed_axial_difference_deg(pose.heading_angle_deg, road_angle)
+        if pose.heading_angle_deg is not None
+        else None
+    )
     valid_fraction = len(cross_sections) / len(config.tangent_offsets_fraction)
+    corner_factor = max(0.25, 1.0 - geometry.corner_score)
     confidence = float(
         np.clip(
             pose.heading_quality
-            * geometry.straight_confidence
-            * max(0.0, 1.0 - geometry.corner_score)
-            * valid_fraction,
+            * support_fraction
+            * valid_fraction
+            * corner_factor,
             0.0,
             1.0,
         )
     )
     return KartRoadRelation(
-        road_angle_deg=road_angle,
+        road_angle_deg=float(road_angle),
+        road_support_fraction=float(support_fraction),
         heading_error_deg=heading_error,
-        abs_heading_error_deg=abs_heading_error,
-        local_road_center_x=local_center_x,
-        local_road_center_y=local_center_y,
-        local_road_width_px=local_width,
+        abs_heading_error_deg=(abs(heading_error) if heading_error is not None else None),
+        local_road_center_x=float(local_center[0]),
+        local_road_center_y=float(local_center[1]),
+        local_road_width_px=float(road_width),
         lateral_offset_px=lateral_px,
         lateral_offset_norm=lateral_norm,
-        inside_road=inside_road,
+        inside_road=abs(lateral_norm) <= 1.0,
         valid_cross_sections=len(cross_sections),
         cross_section_count=len(config.tangent_offsets_fraction),
         confidence=confidence,
@@ -501,7 +670,10 @@ def overlay_kart_relative_geometry(
     cv2.rectangle(
         overlay,
         (pose.bbox_x, pose.bbox_y),
-        (pose.bbox_x + pose.bbox_width - 1, pose.bbox_y + pose.bbox_height - 1),
+        (
+            pose.bbox_x + pose.bbox_width - 1,
+            pose.bbox_y + pose.bbox_height - 1,
+        ),
         (0, 165, 255),
         1,
         cv2.LINE_AA,
@@ -510,12 +682,17 @@ def overlay_kart_relative_geometry(
         theta = math.radians(pose.heading_angle_deg)
         half_length = 45.0
         delta = np.asarray([math.cos(theta), math.sin(theta)]) * half_length
-        start = (int(round(pose.center_x - delta[0])), int(round(pose.center_y - delta[1])))
-        end = (int(round(pose.center_x + delta[0])), int(round(pose.center_y + delta[1])))
+        start = (
+            int(round(pose.center_x - delta[0])),
+            int(round(pose.center_y - delta[1])),
+        )
+        end = (
+            int(round(pose.center_x + delta[0])),
+            int(round(pose.center_y + delta[1])),
+        )
         cv2.line(overlay, start, end, (255, 0, 255), 3, cv2.LINE_AA)
 
-    if relation is not None and relation.local_road_center_x is not None:
-        assert relation.local_road_center_y is not None
+    if relation is not None:
         road_center = (
             int(round(relation.local_road_center_x)),
             int(round(relation.local_road_center_y)),

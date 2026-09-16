@@ -87,15 +87,19 @@ kart_pose:
   join_distance_fraction: 0.075
   min_heading_quality: 0.35
 
-# Estimate a local road center at the kart by probing cross-sections normal to
-# the dominant road axis. The probes are shifted along the road tangent so the
-# kart sprite itself does not split the road mask. The resulting offset is
-# normalized by half road width: 0=center, |1|=edge, >1=outside.
+# Estimate a local road relation at the kart. Do not blindly use the globally
+# dominant Hough orientation near an intersection: evaluate local orientation
+# clusters and prefer a plausible corridor that is close to the kart and
+# compatible with the kart heading. Cross-sections are shifted along the road
+# tangent so the kart sprite itself does not split the road mask. The lateral
+# offset is normalized by half road width: 0=center, |1|=edge, >1=outside.
 kart_relation:
   tangent_offsets_fraction: [-0.05, 0.05]
   max_normal_distance_fraction: 0.30
   min_road_width_fraction: 0.025
   max_road_width_fraction: 0.35
+  local_axis_tolerance_deg: 10.0
+  local_axis_radius_fraction: 0.30
 
 preview:
   sample_every_frames: 120

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
-import math
 from pathlib import Path
 import re
 from statistics import mean
@@ -220,7 +219,13 @@ def _pair_summary(
     }
 
 
-def _print_row(name: str, split: str, v1: dict[str, object], v2: dict[str, object], pair: dict[str, object]) -> None:
+def _print_row(
+    name: str,
+    split: str,
+    v1: dict[str, object],
+    v2: dict[str, object],
+    pair: dict[str, object],
+) -> None:
     print(
         f"{name:>6} {split:>10} "
         f"accept={v1['accepted_rate']:.3f}->{v2['accepted_rate']:.3f} "

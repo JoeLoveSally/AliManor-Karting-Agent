@@ -58,11 +58,66 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "data" / "processed" / "v3" / "samples.jsonl",
     )
     parser.add_argument("--axis-labels", type=Path, default=None)
+    parser.add_argument(
+        "--axis-weight",
+        type=float,
+        default=None,
+        help="Override loss.axis_weight for one ablation run.",
+    )
+    parser.add_argument(
+        "--artifact-name",
+        type=str,
+        default=None,
+        help="Override artifact directory name under artifacts/models/.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override the maximum epoch count.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Stop after this many validation-switch-loss non-improvements; 0 disables.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=None,
+        help="Minimum validation switch-loss decrease counted as an improvement.",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--require-cache", action="store_true")
     parser.add_argument("--num-workers", type=int, default=None)
     return parser.parse_args()
+
+
+def axis_weight_slug(value: float) -> str:
+    """Return a filesystem-friendly compact representation for an axis weight."""
+
+    if value < 0:
+        raise ValueError("axis weight must be >= 0")
+    return f"{value:g}".replace("-", "m").replace(".", "p")
+
+
+def should_stop_early(epochs_without_improvement: int, patience: int) -> bool:
+    """Return whether validation-switch-loss patience has been exhausted."""
+
+    if epochs_without_improvement < 0 or patience < 0:
+        raise ValueError("early-stopping counters must be >= 0")
+    return patience > 0 and epochs_without_improvement >= patience
+
+
+def write_json_atomic(path: Path, payload: object) -> None:
+    """Persist small training metadata without leaving a partial JSON file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def weighted_axis_loss(axis_vector, axis_target, axis_weight):
@@ -116,16 +171,24 @@ def run_epoch(
                 break
             inputs = batch["input"].to(device=device, dtype=torch.float32)
             current_pressed = batch["current_pressed"].to(device=device)
-            switch_targets = batch["switch_target"].to(device=device, dtype=torch.float32)
-            future_targets = batch["future_action_target"].to(device=device, dtype=torch.float32)
+            switch_targets = batch["switch_target"].to(
+                device=device, dtype=torch.float32
+            )
+            future_targets = batch["future_action_target"].to(
+                device=device, dtype=torch.float32
+            )
             axis_targets = batch["axis_target"].to(device=device, dtype=torch.float32)
             axis_weights = batch["axis_weight"].to(device=device, dtype=torch.float32)
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
             switch_logits, future_logits, axis_vector = model(inputs, current_pressed)
-            switch_loss = F.binary_cross_entropy_with_logits(switch_logits, switch_targets)
-            future_loss = F.binary_cross_entropy_with_logits(future_logits, future_targets)
+            switch_loss = F.binary_cross_entropy_with_logits(
+                switch_logits, switch_targets
+            )
+            future_loss = F.binary_cross_entropy_with_logits(
+                future_logits, future_targets
+            )
             axis_loss, axis_prediction, normalized_axis_weights = weighted_axis_loss(
                 axis_vector, axis_targets, axis_weights
             )
@@ -147,7 +210,7 @@ def run_epoch(
 
             target_unit = F.normalize(axis_targets, dim=1, eps=1e-6)
             dots = torch.sum(axis_prediction * target_unit, dim=1).clamp(-1.0, 1.0)
-            # axial vector encodes 2*theta, so orientation error is half the
+            # Axial vector encodes 2*theta, so orientation error is half the
             # angular error between encoded unit vectors.
             angle_error_deg = 0.5 * torch.rad2deg(torch.acos(dots))
             axis_angle_weighted_sum += float(
@@ -156,25 +219,43 @@ def run_epoch(
             axis_weight_sum += float(normalized_axis_weights.sum().detach().item())
             axis_labeled_samples += int((normalized_axis_weights > 0).sum().item())
 
-            switch_probabilities = torch.sigmoid(switch_logits).detach().cpu().numpy()
-            future_probabilities = torch.sigmoid(future_logits).detach().cpu().numpy()
+            switch_probabilities = (
+                torch.sigmoid(switch_logits).detach().cpu().numpy()
+            )
+            future_probabilities = (
+                torch.sigmoid(future_logits).detach().cpu().numpy()
+            )
             switch_values = switch_targets.detach().cpu().numpy()
             future_values = future_targets.detach().cpu().numpy()
             output_count = int(switch_logits.shape[1])
             if switch_metrics is None:
-                switch_metrics = [BinaryMetricAccumulator(threshold) for _ in range(output_count)]
-                future_metrics = [BinaryMetricAccumulator(threshold) for _ in range(output_count)]
+                switch_metrics = [
+                    BinaryMetricAccumulator(threshold) for _ in range(output_count)
+                ]
+                future_metrics = [
+                    BinaryMetricAccumulator(threshold) for _ in range(output_count)
+                ]
             assert future_metrics is not None
             for output_index in range(output_count):
                 switch_metrics[output_index].update(
-                    switch_probabilities[:, output_index], switch_values[:, output_index]
+                    switch_probabilities[:, output_index],
+                    switch_values[:, output_index],
                 )
                 future_metrics[output_index].update(
-                    future_probabilities[:, output_index], future_values[:, output_index]
+                    future_probabilities[:, output_index],
+                    future_values[:, output_index],
                 )
 
-            transition_masks = batch["near_transition_by_horizon"].detach().cpu().numpy().astype(bool)
-            short_masks = batch["near_short_correction_by_horizon"].detach().cpu().numpy().astype(bool)
+            transition_masks = (
+                batch["near_transition_by_horizon"].detach().cpu().numpy().astype(bool)
+            )
+            short_masks = (
+                batch["near_short_correction_by_horizon"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(bool)
+            )
             primary_probabilities = switch_probabilities[:, primary_output_index]
             primary_values = switch_values[:, primary_output_index]
             primary_transition.update(
@@ -198,7 +279,9 @@ def run_epoch(
         "axis_loss": total_axis_loss / total_samples,
         "axis_labeled_samples": axis_labeled_samples,
         "axis_weight_sum": axis_weight_sum,
-        "axis_mean_error_deg": axis_angle_weighted_sum / axis_weight_sum if axis_weight_sum else 0.0,
+        "axis_mean_error_deg": (
+            axis_angle_weighted_sum / axis_weight_sum if axis_weight_sum else 0.0
+        ),
         "primary_switch": switch_results[primary_output_index],
         "primary_switch_false_positive_rate": false_positive_rate(primary_metric),
         "primary_transition": primary_transition.result().to_dict(),
@@ -208,7 +291,12 @@ def run_epoch(
     }
 
 
-def print_summary(prefix: str, summary: dict[str, object], horizons, primary_index: int) -> None:
+def print_summary(
+    prefix: str,
+    summary: dict[str, object],
+    horizons,
+    primary_index: int,
+) -> None:
     primary = summary["primary_switch"]
     transition = summary["primary_transition"]
     short = summary["primary_short_correction"]
@@ -223,9 +311,12 @@ def print_summary(prefix: str, summary: dict[str, object], horizons, primary_ind
         for h, metrics in zip(horizons, future_outputs, strict=False)
     )
     print(
-        f"{prefix}: loss={summary['loss']:.4f}, switch_loss={summary['switch_loss']:.4f}, "
-        f"aux_loss={summary['future_action_loss']:.4f}, axis_loss={summary['axis_loss']:.4f}, "
-        f"axis_err={summary['axis_mean_error_deg']:.2f}deg, axis_n={summary['axis_labeled_samples']}, "
+        f"{prefix}: loss={summary['loss']:.4f}, "
+        f"switch_loss={summary['switch_loss']:.4f}, "
+        f"aux_loss={summary['future_action_loss']:.4f}, "
+        f"axis_loss={summary['axis_loss']:.4f}, "
+        f"axis_err={summary['axis_mean_error_deg']:.2f}deg, "
+        f"axis_n={summary['axis_labeled_samples']}, "
         f"switch_h{horizons[primary_index]:g}_p={primary['precision']:.3f}, "
         f"r={primary['recall']:.3f}, f1={primary['f1']:.3f}, "
         f"transition_f1={transition['f1']:.3f}, short_f1={short['f1']:.3f}, "
@@ -251,11 +342,15 @@ def main() -> int:
     cache_root = frame_cache_root_from_config(raw, ROOT)
 
     model_config = raw.get("model", {})
+    train_config = raw.get("train", {})
     dataset_config = raw.get("dataset", {})
     loss_config = raw.get("loss", {})
     axis_config = raw.get("axis_supervision", {})
-    if not all(isinstance(value, dict) for value in (model_config, dataset_config, loss_config, axis_config)):
-        raise ValueError("model/dataset/loss/axis_supervision configs must be mappings")
+    configs = (model_config, train_config, dataset_config, loss_config, axis_config)
+    if not all(isinstance(value, dict) for value in configs):
+        raise ValueError(
+            "model/train/dataset/loss/axis_supervision configs must be mappings"
+        )
 
     architecture = str(model_config.get("architecture", "mobilenet_v3_small"))
     frame_stack = int(model_config.get("frame_stack", 5))
@@ -263,17 +358,47 @@ def main() -> int:
     visual_feature_dim = int(model_config.get("visual_feature_dim", 128))
     state_embedding_dim = int(model_config.get("state_embedding_dim", 8))
     hidden_dim = int(model_config.get("hidden_dim", 128))
-    counterfactual_train = bool(dataset_config.get("counterfactual_train_states", True))
+    counterfactual_train = bool(
+        dataset_config.get("counterfactual_train_states", True)
+    )
     auxiliary_action_weight = float(loss_config.get("auxiliary_action_weight", 0.5))
-    axis_weight_multiplier = float(loss_config.get("axis_weight", 0.1))
+    configured_axis_weight = float(loss_config.get("axis_weight", 0.1))
+    axis_weight_multiplier = (
+        configured_axis_weight if args.axis_weight is None else float(args.axis_weight)
+    )
+    max_epochs = loop_config.epochs if args.epochs is None else int(args.epochs)
+    early_stopping_patience = (
+        int(train_config.get("early_stopping_patience", 0))
+        if args.early_stopping_patience is None
+        else int(args.early_stopping_patience)
+    )
+    early_stopping_min_delta = (
+        float(train_config.get("early_stopping_min_delta", 0.0))
+        if args.early_stopping_min_delta is None
+        else float(args.early_stopping_min_delta)
+    )
+    if auxiliary_action_weight < 0 or axis_weight_multiplier < 0:
+        raise ValueError("loss weights must be >= 0")
+    if max_epochs < 1:
+        raise ValueError("epochs must be >= 1")
+    if early_stopping_patience < 0:
+        raise ValueError("early-stopping patience must be >= 0")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early-stopping min delta must be >= 0")
+
     axis_labels_path = (
         args.axis_labels.resolve()
         if args.axis_labels
-        else (ROOT / str(axis_config.get("labels", "data/processed/v4c1/axis_labels.jsonl"))).resolve()
+        else (
+            ROOT
+            / str(axis_config.get("labels", "data/processed/v4c1/axis_labels.jsonl"))
+        ).resolve()
     )
     axis_labels = load_axis_pseudo_labels(axis_labels_path)
 
     num_workers = loop_config.num_workers if args.num_workers is None else args.num_workers
+    if num_workers < 0:
+        raise ValueError("--num-workers must be >= 0")
     samples = load_v3_samples(args.samples.resolve())
     partitions = partition_samples(samples, split)
 
@@ -290,7 +415,16 @@ def main() -> int:
         f"counterfactual_train={counterfactual_train}",
         flush=True,
     )
-    print(f"Axis labels: {axis_labels_path} ({len(axis_labels)} unique frames)", flush=True)
+    print(
+        f"Training: max_epochs={max_epochs} "
+        f"early_stopping_patience={early_stopping_patience} "
+        f"min_delta={early_stopping_min_delta:g}",
+        flush=True,
+    )
+    print(
+        f"Axis labels: {axis_labels_path} ({len(axis_labels)} unique frames)",
+        flush=True,
+    )
 
     datasets = {
         name: AxisSupervisedVideoDataset(
@@ -354,7 +488,9 @@ def main() -> int:
         hidden_dim=hidden_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=loop_config.learning_rate, weight_decay=loop_config.weight_decay
+        model.parameters(),
+        lr=loop_config.learning_rate,
+        weight_decay=loop_config.weight_decay,
     )
 
     try:
@@ -379,20 +515,38 @@ def main() -> int:
                 max_batches=1,
             )
             print_summary("smoke/train", train_summary, horizons, primary_index)
-            print_summary("smoke/validation", validation_summary, horizons, primary_index)
+            print_summary(
+                "smoke/validation", validation_summary, horizons, primary_index
+            )
             print("V4-C1 smoke test passed.", flush=True)
             return 0
 
         artifact = raw.get("artifact", {})
         if not isinstance(artifact, dict):
             raise ValueError("artifact config must be a mapping")
-        artifact_dir = ROOT / "artifacts" / "models" / str(artifact.get("name", "mobilenet_v3_small_v4c1"))
+        base_artifact_name = str(
+            artifact.get("name", "mobilenet_v3_small_v4c1")
+        )
+        if args.artifact_name:
+            artifact_name = args.artifact_name
+        elif args.axis_weight is not None:
+            artifact_name = (
+                f"{base_artifact_name}_aw{axis_weight_slug(axis_weight_multiplier)}"
+            )
+        else:
+            artifact_name = base_artifact_name
+        artifact_dir = ROOT / "artifacts" / "models" / artifact_name
         artifact_dir.mkdir(parents=True, exist_ok=True)
         model_path = artifact_dir / "model.pt"
+        history_path = artifact_dir / "history.json"
+        state_path = artifact_dir / "training_state.json"
+
         best_val_switch_loss = float("inf")
         best_epoch = 0
-        history = []
-        for epoch in range(1, loop_config.epochs + 1):
+        epochs_without_improvement = 0
+        stopped_early = False
+        history: list[dict[str, object]] = []
+        for epoch in range(1, max_epochs + 1):
             started = time.perf_counter()
             train_summary = run_epoch(
                 model,
@@ -412,17 +566,68 @@ def main() -> int:
                 primary_output_index=primary_index,
             )
             elapsed = time.perf_counter() - started
-            print_summary(f"epoch {epoch:02d}/train", train_summary, horizons, primary_index)
-            print_summary(f"epoch {epoch:02d}/validation", validation_summary, horizons, primary_index)
-            print(f"epoch {epoch:02d}/time: {elapsed:.1f}s", flush=True)
-            history.append(
-                {"epoch": epoch, "elapsed_seconds": elapsed, "train": train_summary, "validation": validation_summary}
+            print_summary(
+                f"epoch {epoch:02d}/train", train_summary, horizons, primary_index
             )
+            print_summary(
+                f"epoch {epoch:02d}/validation",
+                validation_summary,
+                horizons,
+                primary_index,
+            )
+            print(f"epoch {epoch:02d}/time: {elapsed:.1f}s", flush=True)
+
             val_switch_loss = float(validation_summary["switch_loss"])
-            if val_switch_loss < best_val_switch_loss:
+            improved = (
+                val_switch_loss
+                < best_val_switch_loss - early_stopping_min_delta
+            )
+            if improved:
                 best_val_switch_loss = val_switch_loss
                 best_epoch = epoch
+                epochs_without_improvement = 0
                 torch.save(model.state_dict(), model_path)
+            else:
+                epochs_without_improvement += 1
+
+            history.append(
+                {
+                    "epoch": epoch,
+                    "elapsed_seconds": elapsed,
+                    "improved": improved,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "train": train_summary,
+                    "validation": validation_summary,
+                }
+            )
+            write_json_atomic(history_path, history)
+            write_json_atomic(
+                state_path,
+                {
+                    "status": "running",
+                    "last_completed_epoch": epoch,
+                    "max_epochs": max_epochs,
+                    "best_epoch": best_epoch,
+                    "best_validation_switch_loss": best_val_switch_loss,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "early_stopping_patience": early_stopping_patience,
+                    "early_stopping_min_delta": early_stopping_min_delta,
+                    "axis_weight": axis_weight_multiplier,
+                },
+            )
+
+            if should_stop_early(
+                epochs_without_improvement, early_stopping_patience
+            ):
+                stopped_early = True
+                print(
+                    "Early stopping: "
+                    f"best_epoch={best_epoch} "
+                    f"best_validation_switch_loss={best_val_switch_loss:.6f} "
+                    f"patience={early_stopping_patience}",
+                    flush=True,
+                )
+                break
 
         try:
             state_dict = torch.load(model_path, map_location=device, weights_only=True)
@@ -451,13 +656,33 @@ def main() -> int:
             "axis_weight": axis_weight_multiplier,
             "axis_encoding": "cos_2theta_sin_2theta",
             "axis_labels": str(axis_labels_path),
+            "artifact_name": artifact_name,
+            "max_epochs": max_epochs,
+            "epochs_completed": len(history),
+            "stopped_early": stopped_early,
+            "early_stopping_patience": early_stopping_patience,
+            "early_stopping_min_delta": early_stopping_min_delta,
             "best_epoch": best_epoch,
             "best_validation_switch_loss": best_val_switch_loss,
             "test": test_summary,
             "config": raw,
         }
-        (artifact_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        (artifact_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        write_json_atomic(artifact_dir / "metadata.json", metadata)
+        write_json_atomic(history_path, history)
+        write_json_atomic(
+            state_path,
+            {
+                "status": "complete",
+                "last_completed_epoch": len(history),
+                "max_epochs": max_epochs,
+                "best_epoch": best_epoch,
+                "best_validation_switch_loss": best_val_switch_loss,
+                "stopped_early": stopped_early,
+                "early_stopping_patience": early_stopping_patience,
+                "early_stopping_min_delta": early_stopping_min_delta,
+                "axis_weight": axis_weight_multiplier,
+            },
+        )
         print(f"Artifact: {artifact_dir}", flush=True)
         return 0
     finally:

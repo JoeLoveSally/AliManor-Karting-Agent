@@ -1,0 +1,25 @@
+# Offline-only temporal corridor tracker for the v4-C2 teacher follow-up.
+# Runtime control remains model-only; these parameters affect diagnostics and
+# future pseudo-label generation only.
+temporal_road_tracker:
+  # Penalize large single-frame orientation jumps away from the tracked corridor.
+  continuity_weight: 0.75
+
+  # Axial orientation changes larger than this are treated as a new-segment
+  # challenge and must pass hysteresis before replacing the stable corridor.
+  switch_angle_deg: 25.0
+
+  # Require this many consecutive sampled observations supporting the same new
+  # orientation cluster before committing a segment switch.
+  switch_confirm_samples: 3
+
+  # Lower candidate scores are better. A challenger must beat the currently
+  # tracked candidate by at least this margin before confirmation begins.
+  switch_score_margin: 0.05
+
+  # Reset temporal state after this many consecutive samples without a usable
+  # kart/road relation.
+  reset_gap_samples: 3
+
+  # EMA-like axial-angle update while remaining on the same corridor.
+  stable_angle_alpha: 0.25

@@ -1,4 +1,4 @@
-"""Runtime loader for the v3 state-conditioned transition policy."""
+"""Runtime loader for state-conditioned transition policies."""
 
 from __future__ import annotations
 
@@ -12,8 +12,26 @@ from karting_agent.model.runner import _runtime_spec, _select_device
 from karting_agent.model.state_conditioned import build_state_conditioned_model
 
 
+_SUPPORTED_MODEL_FAMILIES = {
+    "state_conditioned_transition_v3",
+    "state_conditioned_axis_v4c1",
+}
+
+
+def _control_state_dict(state_dict: dict[str, object], model_family: str) -> dict[str, object]:
+    """Return only parameters required by the deployed v3 control path."""
+
+    if model_family == "state_conditioned_axis_v4c1":
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("axis_head.")
+        }
+    return state_dict
+
+
 class StateConditionedModelRunner:
-    """Load one v3 artifact and predict KEEP/SWITCH probability."""
+    """Load a state-conditioned artifact and predict KEEP/SWITCH probability."""
 
     def __init__(
         self,
@@ -43,10 +61,15 @@ class StateConditionedModelRunner:
         metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
         if not isinstance(metadata, dict):
             raise ValueError("model metadata root must be a mapping")
-        if metadata.get("model_family") != "state_conditioned_transition_v3":
-            raise ValueError("metadata is not a v3 state-conditioned artifact")
+        model_family = str(metadata.get("model_family", ""))
+        if model_family not in _SUPPORTED_MODEL_FAMILIES:
+            raise ValueError(
+                "metadata is not a supported state-conditioned artifact: "
+                f"{model_family or '<missing>'}"
+            )
 
         self.metadata = metadata
+        self.model_family = model_family
         self.spec = _runtime_spec(metadata)
         self._torch = torch
         self.device = _select_device(torch, device)
@@ -68,7 +91,9 @@ class StateConditionedModelRunner:
             )
         except TypeError:
             state_dict = torch.load(self.model_path, map_location=self.device)
-        self.model.load_state_dict(state_dict)
+        if not isinstance(state_dict, dict):
+            raise ValueError("model checkpoint must contain a state dict mapping")
+        self.model.load_state_dict(_control_state_dict(state_dict, model_family))
         self.model.eval()
 
     @property

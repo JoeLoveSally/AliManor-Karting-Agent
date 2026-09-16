@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
 import time
@@ -228,13 +227,22 @@ def run_epoch(
             relation_weight_sum += float(weights.sum().detach().item())
             relation_labeled_samples += int((weights > 0).sum().item())
             lateral_abs_error_sum += float(
-                (torch.abs(lateral_prediction.reshape(-1) - lateral_targets.reshape(-1)) * weights)
+                (
+                    torch.abs(
+                        lateral_prediction.reshape(-1) - lateral_targets.reshape(-1)
+                    )
+                    * weights
+                )
                 .sum()
                 .detach()
                 .item()
             )
             heading_target_unit = F.normalize(heading_targets, dim=1, eps=1e-6)
-            dots = (heading_unit * heading_target_unit).sum(dim=1).clamp(-1.0, 1.0)
+            dots = (
+                (heading_unit * heading_target_unit)
+                .sum(dim=1)
+                .clamp(-1.0, 1.0)
+            )
             heading_errors = 0.5 * torch.rad2deg(torch.acos(dots))
             heading_angle_weighted_sum += float(
                 (heading_errors * weights).sum().detach().item()
@@ -247,8 +255,12 @@ def run_epoch(
                     edge_targets.detach().cpu().numpy()[labeled],
                 )
 
-            switch_probabilities = torch.sigmoid(switch_logits).detach().cpu().numpy()
-            future_probabilities = torch.sigmoid(future_logits).detach().cpu().numpy()
+            switch_probabilities = (
+                torch.sigmoid(switch_logits).detach().cpu().numpy()
+            )
+            future_probabilities = (
+                torch.sigmoid(future_logits).detach().cpu().numpy()
+            )
             switch_values = switch_targets.detach().cpu().numpy()
             future_values = future_targets.detach().cpu().numpy()
             output_count = int(switch_logits.shape[1])
@@ -262,14 +274,20 @@ def run_epoch(
             assert future_metrics is not None
             for output_index in range(output_count):
                 switch_metrics[output_index].update(
-                    switch_probabilities[:, output_index], switch_values[:, output_index]
+                    switch_probabilities[:, output_index],
+                    switch_values[:, output_index],
                 )
                 future_metrics[output_index].update(
-                    future_probabilities[:, output_index], future_values[:, output_index]
+                    future_probabilities[:, output_index],
+                    future_values[:, output_index],
                 )
 
             transition_masks = (
-                batch["near_transition_by_horizon"].detach().cpu().numpy().astype(bool)
+                batch["near_transition_by_horizon"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(bool)
             )
             short_masks = (
                 batch["near_short_correction_by_horizon"]
@@ -321,21 +339,31 @@ def run_epoch(
     return result
 
 
-def print_summary(prefix: str, summary: dict[str, object], horizons, primary_index: int) -> None:
+def print_summary(
+    prefix: str,
+    summary: dict[str, object],
+    horizons,
+    primary_index: int,
+) -> None:
     primary = summary["primary_switch"]
     transition = summary["primary_transition"]
     short = summary["primary_short_correction"]
     edge = summary["edge_risk"]
     print(
-        f"{prefix}: loss={summary['loss']:.4f}, switch_loss={summary['switch_loss']:.4f}, "
-        f"aux_loss={summary['future_action_loss']:.4f}, lat_loss={summary['lateral_loss']:.4f}, "
-        f"head_loss={summary['heading_loss']:.4f}, risk_loss={summary['edge_risk_loss']:.4f}, "
+        f"{prefix}: loss={summary['loss']:.4f}, "
+        f"switch_loss={summary['switch_loss']:.4f}, "
+        f"aux_loss={summary['future_action_loss']:.4f}, "
+        f"lat_loss={summary['lateral_loss']:.4f}, "
+        f"head_loss={summary['heading_loss']:.4f}, "
+        f"risk_loss={summary['edge_risk_loss']:.4f}, "
         f"lat_mae={summary['lateral_mae']:.3f}w, "
         f"head_err={summary['heading_mean_error_deg']:.1f}deg, "
-        f"risk_f1={edge['f1']:.3f}, relation_n={summary['relation_labeled_samples']}, "
+        f"risk_f1={edge['f1']:.3f}, "
+        f"relation_n={summary['relation_labeled_samples']}, "
         f"switch_h{horizons[primary_index]:g}_p={primary['precision']:.3f}, "
         f"r={primary['recall']:.3f}, f1={primary['f1']:.3f}, "
-        f"transition_f1={transition['f1']:.3f}, short_f1={short['f1']:.3f}",
+        f"transition_f1={transition['f1']:.3f}, "
+        f"short_f1={short['f1']:.3f}",
         flush=True,
     )
 
@@ -379,28 +407,65 @@ def main() -> int:
     visual_feature_dim = int(model_config.get("visual_feature_dim", 128))
     state_embedding_dim = int(model_config.get("state_embedding_dim", 8))
     hidden_dim = int(model_config.get("hidden_dim", 128))
-    counterfactual_train = bool(dataset_config.get("counterfactual_train_states", True))
+    counterfactual_train = bool(
+        dataset_config.get("counterfactual_train_states", True)
+    )
     auxiliary_action_weight = float(loss_config.get("auxiliary_action_weight", 0.5))
-    lateral_weight = float(loss_config.get("lateral_weight", 0.03)) if args.lateral_weight is None else args.lateral_weight
-    heading_weight = float(loss_config.get("heading_weight", 0.03)) if args.heading_weight is None else args.heading_weight
-    edge_risk_weight = float(loss_config.get("edge_risk_weight", 0.01)) if args.edge_risk_weight is None else args.edge_risk_weight
-    weights = (auxiliary_action_weight, lateral_weight, heading_weight, edge_risk_weight)
+    lateral_weight = (
+        float(loss_config.get("lateral_weight", 0.03))
+        if args.lateral_weight is None
+        else args.lateral_weight
+    )
+    heading_weight = (
+        float(loss_config.get("heading_weight", 0.03))
+        if args.heading_weight is None
+        else args.heading_weight
+    )
+    edge_risk_weight = (
+        float(loss_config.get("edge_risk_weight", 0.01))
+        if args.edge_risk_weight is None
+        else args.edge_risk_weight
+    )
+    weights = (
+        auxiliary_action_weight,
+        lateral_weight,
+        heading_weight,
+        edge_risk_weight,
+    )
     if any(value < 0 for value in weights):
         raise ValueError("loss weights must be >= 0")
 
     max_epochs = loop_config.epochs if args.epochs is None else int(args.epochs)
-    patience = int(train_config.get("early_stopping_patience", 0)) if args.early_stopping_patience is None else args.early_stopping_patience
-    min_delta = float(train_config.get("early_stopping_min_delta", 0.0)) if args.early_stopping_min_delta is None else args.early_stopping_min_delta
+    patience = (
+        int(train_config.get("early_stopping_patience", 0))
+        if args.early_stopping_patience is None
+        else args.early_stopping_patience
+    )
+    min_delta = (
+        float(train_config.get("early_stopping_min_delta", 0.0))
+        if args.early_stopping_min_delta is None
+        else args.early_stopping_min_delta
+    )
     if max_epochs < 1 or patience < 0 or min_delta < 0:
         raise ValueError("invalid epoch/early-stopping configuration")
-    num_workers = loop_config.num_workers if args.num_workers is None else args.num_workers
+    num_workers = (
+        loop_config.num_workers if args.num_workers is None else args.num_workers
+    )
     if num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
 
     relation_labels_path = (
         args.relation_labels.resolve()
         if args.relation_labels
-        else (ROOT / str(supervision_config.get("labels", "data/processed/v4c2/kart_relative_labels.jsonl"))).resolve()
+        else (
+            ROOT
+            / str(
+                supervision_config.get(
+                    "labels",
+                    "data/processed/v4c2/kart_relative_labels.jsonl",
+                )
+            )
+        ).resolve()
     )
     relation_labels = load_kart_relative_pseudo_labels(relation_labels_path)
     samples = load_v3_samples(args.samples.resolve())
@@ -414,12 +479,18 @@ def main() -> int:
     device = select_device(torch)
     print(f"Device: {device}", flush=True)
     print(
-        f"V4-C2: lateral_weight={lateral_weight:g} heading_weight={heading_weight:g} "
+        f"V4-C2: lateral_weight={lateral_weight:g} "
+        f"heading_weight={heading_weight:g} "
         f"edge_risk_weight={edge_risk_weight:g} horizons={horizons} "
-        f"control_horizon={control_ms:g}ms counterfactual_train={counterfactual_train}",
+        f"control_horizon={control_ms:g}ms "
+        f"counterfactual_train={counterfactual_train}",
         flush=True,
     )
-    print(f"Relation labels: {relation_labels_path} ({len(relation_labels)} unique frames)", flush=True)
+    print(
+        f"Relation labels: {relation_labels_path} "
+        f"({len(relation_labels)} unique frames)",
+        flush=True,
+    )
 
     datasets = {
         name: KartRelativeSupervisedVideoDataset(
@@ -429,7 +500,9 @@ def main() -> int:
             preprocess_config=preprocess_config,
             cache_root=cache_root,
             require_cache=args.require_cache,
-            counterfactual_states=(counterfactual_train if name == "train" else False),
+            counterfactual_states=(
+                counterfactual_train if name == "train" else False
+            ),
         )
         for name in ("train", "validation", "test")
     }
@@ -495,13 +568,27 @@ def main() -> int:
     }
     if args.smoke:
         train_summary = run_epoch(
-            model, loaders["train"], device, optimizer=optimizer, max_batches=1, **kwargs
+            model,
+            loaders["train"],
+            device,
+            optimizer=optimizer,
+            max_batches=1,
+            **kwargs,
         )
         validation_summary = run_epoch(
-            model, loaders["validation"], device, max_batches=1, **kwargs
+            model,
+            loaders["validation"],
+            device,
+            max_batches=1,
+            **kwargs,
         )
         print_summary("smoke/train", train_summary, horizons, primary_index)
-        print_summary("smoke/validation", validation_summary, horizons, primary_index)
+        print_summary(
+            "smoke/validation",
+            validation_summary,
+            horizons,
+            primary_index,
+        )
         for dataset in datasets.values():
             dataset.close()
         print("V4-C2 smoke test passed.", flush=True)
@@ -527,13 +614,22 @@ def main() -> int:
         for epoch in range(1, max_epochs + 1):
             start = time.perf_counter()
             train_summary = run_epoch(
-                model, loaders["train"], device, optimizer=optimizer, **kwargs
+                model,
+                loaders["train"],
+                device,
+                optimizer=optimizer,
+                **kwargs,
             )
             validation_summary = run_epoch(
-                model, loaders["validation"], device, **kwargs
+                model,
+                loaders["validation"],
+                device,
+                **kwargs,
             )
             elapsed = time.perf_counter() - start
-            print_summary(f"epoch {epoch:02d}/train", train_summary, horizons, primary_index)
+            print_summary(
+                f"epoch {epoch:02d}/train", train_summary, horizons, primary_index
+            )
             print_summary(
                 f"epoch {epoch:02d}/validation",
                 validation_summary,
@@ -575,13 +671,18 @@ def main() -> int:
             if should_stop_early(without_improvement, patience):
                 print(
                     f"Early stopping: best_epoch={best_epoch} "
-                    f"best_validation_switch_loss={best_loss:.6f} patience={patience}",
+                    f"best_validation_switch_loss={best_loss:.6f} "
+                    f"patience={patience}",
                     flush=True,
                 )
                 break
 
         try:
-            state_dict = torch.load(model_path, map_location=device, weights_only=True)
+            state_dict = torch.load(
+                model_path,
+                map_location=device,
+                weights_only=True,
+            )
         except TypeError:
             state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)

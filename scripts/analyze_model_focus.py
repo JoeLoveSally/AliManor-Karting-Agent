@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Inspect which image regions drive PRESS/RELEASE predictions.
+"""Inspect which image regions drive transition-policy predictions.
 
 This is an architecture-agnostic occlusion-sensitivity diagnostic. It reads the
 same temporal source-frame indices saved by ``run_adb_closed_loop.py`` or
 ``replay_video.py``, rebuilds the model input, masks one spatial grid cell across
 all temporal frames, and measures the resulting probability change.
 
-Positive sensitivity means the region supports PRESS. Negative sensitivity
-means the region suppresses PRESS (evidence for RELEASE).
+For state-conditioned policies the probability is KEEP/SWITCH probability, so
+the current control state is reconstructed from each RuntimeStep before
+recomputing a saved prediction.
 """
 
 from __future__ import annotations
@@ -26,6 +27,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from karting_agent.model.runner import ModelRunner  # noqa: E402
+from karting_agent.model.state_conditioned_runner import (  # noqa: E402
+    StateConditionedModelRunner,
+    _SUPPORTED_MODEL_FAMILIES,
+)
 from karting_agent.vision.preprocess import (  # noqa: E402
     PreprocessConfig,
     prepare_frame,
@@ -98,14 +103,7 @@ def selected_steps(
 
 
 def read_video_frames(path: Path, frame_indices: list[int]) -> dict[int, np.ndarray]:
-    """Decode requested MP4 frames sequentially using decoder-order indices.
-
-    Runtime ``source_frame`` is the sequential frame number emitted by FFmpeg's
-    rawvideo output. Debug MP4 files are fragmented stream copies whose H.264
-    timestamps can be unusual, so OpenCV random seeking with
-    ``CAP_PROP_POS_FRAMES`` is not a reliable way to recover that same ordinal
-    frame. Decode once from the beginning and select by decoder order instead.
-    """
+    """Decode requested MP4 frames sequentially using decoder-order indices."""
     requested = sorted(set(int(index) for index in frame_indices))
     if not requested:
         return {}
@@ -143,19 +141,66 @@ def read_video_frames(path: Path, frame_indices: list[int]) -> dict[int, np.ndar
     return frames
 
 
+def load_diagnostic_runner(
+    model_path: Path,
+    *,
+    metadata_path: Path | None,
+    device: str | None,
+):
+    """Load either a legacy temporal classifier or a state-conditioned policy."""
+    resolved_model = Path(model_path).resolve()
+    resolved_metadata = (
+        Path(metadata_path).resolve()
+        if metadata_path is not None
+        else resolved_model.with_name("metadata.json")
+    )
+    metadata = json.loads(resolved_metadata.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError("model metadata root must be a mapping")
+
+    model_family = str(metadata.get("model_family", ""))
+    if model_family in _SUPPORTED_MODEL_FAMILIES:
+        return StateConditionedModelRunner(
+            resolved_model,
+            metadata_path=resolved_metadata,
+            device=device,
+        )
+    return ModelRunner(
+        resolved_model,
+        metadata_path=resolved_metadata,
+        device=device,
+    )
+
+
+def pre_action_pressed(step: dict[str, object]) -> bool:
+    """Recover the control state supplied to the model before this decision."""
+    action = str(step.get("action", "HOLD")).upper()
+    post_action_pressed = bool(step.get("pressed", False))
+    if action == "PRESS":
+        return False
+    if action == "RELEASE":
+        return True
+    return post_action_pressed
+
+
+def predict_probability(
+    runner,
+    inputs: np.ndarray,
+    *,
+    current_pressed: bool,
+) -> float:
+    if isinstance(runner, StateConditionedModelRunner):
+        return runner.predict_switch(inputs, current_pressed=current_pressed)
+    return runner.predict(inputs)
+
+
 def occlusion_valid_mask(
     config: PreprocessConfig,
     *,
     height: int,
     width: int,
 ) -> np.ndarray:
-    """Return prepared-image pixels that may be perturbed by occlusion.
-
-    Fixed preprocessing masks are already black in ``prepared_frames``. Replacing
-    those pixels with the mean-color occluder would introduce a synthetic patch
-    and falsely make a permanently masked HUD/touch region look important.
-    Preserve those pixels and perturb only model-visible image content.
-    """
+    """Return prepared-image pixels that may be perturbed by occlusion."""
     valid = np.ones((height, width), dtype=bool)
     rois = list(config.mask_rois)
     if config.mask_touch_area:
@@ -171,9 +216,10 @@ def occlusion_valid_mask(
 
 
 def occlusion_sensitivity(
-    runner: ModelRunner,
+    runner,
     prepared_frames: list[np.ndarray],
     *,
+    current_pressed: bool,
     grid: int,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     if grid < 2:
@@ -181,7 +227,11 @@ def occlusion_sensitivity(
 
     config = runner.spec.preprocess_config
     baseline_input = stack_prepared_frames(prepared_frames, config)
-    baseline = runner.predict(baseline_input)
+    baseline = predict_probability(
+        runner,
+        baseline_input,
+        current_pressed=current_pressed,
+    )
     height, width = prepared_frames[-1].shape[:2]
     sensitivity = np.zeros((grid, grid), dtype=np.float32)
     unmasked_fraction = np.zeros((grid, grid), dtype=np.float32)
@@ -204,7 +254,11 @@ def occlusion_sensitivity(
             for frame in occluded:
                 patch = frame[y0:y1, x0:x1]
                 patch[cell_valid] = fill_rgb
-            probability = runner.predict(stack_prepared_frames(occluded, config))
+            probability = predict_probability(
+                runner,
+                stack_prepared_frames(occluded, config),
+                current_pressed=current_pressed,
+            )
             sensitivity[row, col] = baseline - probability
 
     return baseline, sensitivity, unmasked_fraction
@@ -225,7 +279,7 @@ def render_heatmap(image_rgb: np.ndarray, sensitivity: np.ndarray) -> np.ndarray
     )
     overlay = image_rgb.astype(np.float32) * 0.55
 
-    # RGB: red = PRESS evidence, blue = RELEASE evidence.
+    # RGB: red = SWITCH evidence, blue = KEEP evidence.
     positive = np.clip(expanded, 0.0, 1.0)[..., None]
     negative = np.clip(-expanded, 0.0, 1.0)[..., None]
     overlay += positive * np.array([115.0, 0.0, 0.0], dtype=np.float32)
@@ -236,6 +290,8 @@ def render_heatmap(image_rgb: np.ndarray, sensitivity: np.ndarray) -> np.ndarray
 def top_cells(
     sensitivity: np.ndarray,
     unmasked_fraction: np.ndarray,
+    *,
+    current_pressed: bool,
     count: int = 5,
 ) -> dict[str, list[dict[str, object]]]:
     grid = sensitivity.shape[0]
@@ -253,19 +309,30 @@ def top_cells(
                     "x1": (col + 1) / grid,
                     "y1": (row + 1) / grid,
                     "unmasked_fraction": float(unmasked_fraction[row, col]),
-                    "delta_press_probability": float(sensitivity[row, col]),
+                    "delta_switch_probability": float(sensitivity[row, col]),
                 }
             )
+
+    switch_evidence = sorted(
+        cells,
+        key=lambda item: float(item["delta_switch_probability"]),
+        reverse=True,
+    )[:count]
+    keep_evidence = sorted(
+        cells,
+        key=lambda item: float(item["delta_switch_probability"]),
+    )[:count]
+    if current_pressed:
+        press_evidence = keep_evidence
+        release_evidence = switch_evidence
+    else:
+        press_evidence = switch_evidence
+        release_evidence = keep_evidence
     return {
-        "press_evidence": sorted(
-            cells,
-            key=lambda item: float(item["delta_press_probability"]),
-            reverse=True,
-        )[:count],
-        "release_evidence": sorted(
-            cells,
-            key=lambda item: float(item["delta_press_probability"]),
-        )[:count],
+        "switch_evidence": switch_evidence,
+        "keep_evidence": keep_evidence,
+        "press_evidence": press_evidence,
+        "release_evidence": release_evidence,
     }
 
 
@@ -302,7 +369,7 @@ def main() -> int:
 
     run_path = args.run_json.resolve()
     video_path = args.video.resolve()
-    runner = ModelRunner(
+    runner = load_diagnostic_runner(
         args.model,
         metadata_path=args.metadata,
         device=args.device,
@@ -334,9 +401,11 @@ def main() -> int:
             prepare_frame(source_frames[index], runner.spec.preprocess_config)
             for index in indices
         ]
+        current_pressed = pre_action_pressed(step)
         recomputed, sensitivity, unmasked_fraction = occlusion_sensitivity(
             runner,
             prepared,
+            current_pressed=current_pressed,
             grid=args.grid,
         )
         saved_probability = float(step["probability"])
@@ -344,8 +413,9 @@ def main() -> int:
         latest = indices[-1]
         heatmap = render_heatmap(prepared[-1], sensitivity)
         action = str(step.get("action", "?"))
+        state_label = "P" if current_pressed else "R"
         title = (
-            f"src={latest} action={action} "
+            f"src={latest} state={state_label} action={action} "
             f"saved={saved_probability:.3f} recomputed={recomputed:.3f} "
             f"diff={mismatch:.3f}"
         )
@@ -356,12 +426,17 @@ def main() -> int:
                 "input_frame_indices": indices,
                 "observation_timestamp_ms": float(step["observation_timestamp_ms"]),
                 "action": action,
-                "pressed": bool(step["pressed"]),
+                "current_pressed": current_pressed,
+                "pressed_after_action": bool(step["pressed"]),
                 "saved_probability": saved_probability,
                 "recomputed_probability": recomputed,
                 "absolute_probability_mismatch": mismatch,
                 "grid": args.grid,
-                **top_cells(sensitivity, unmasked_fraction),
+                **top_cells(
+                    sensitivity,
+                    unmasked_fraction,
+                    current_pressed=current_pressed,
+                ),
             }
         )
         print(title)
@@ -373,7 +448,8 @@ def main() -> int:
 
     print(f"Focus image: {output_path}")
     print(f"Focus data:  {report_path}")
-    print("Legend: red supports PRESS; blue supports RELEASE.")
+    print("Legend: red supports SWITCH; blue supports KEEP.")
+    print("For state=P: SWITCH=RELEASE. For state=R: SWITCH=PRESS.")
     print("Fixed HUD/touch-mask pixels are preserved during occlusion.")
     print(
         "Important: if saved/recomputed probability differs materially, "

@@ -335,9 +335,9 @@ def main() -> int:
         print(
             f"threshold={threshold:.2f}/stateful-target: "
             f"transition_f1={target_transition['f1']:.3f}, "
-            f"matched={target_transition['matched_predicted_transitions']}/"
-            f"{target_transition['target_transitions']}, "
-            f"predicted={target_transition['predicted_transitions']}, "
+            f"matched={target_transition['matched']}/"
+            f"{target_transition['ground_truth']}, "
+            f"predicted={target_transition['predicted']}, "
             f"short_recall={target_short['recall']:.3f}, "
             f"chatter_lt100={chatter['lt_100ms']}, chatter_lt200={chatter['lt_200ms']}",
             flush=True,
@@ -345,9 +345,9 @@ def main() -> int:
         print(
             f"threshold={threshold:.2f}/stateful-observation: "
             f"transition_f1={observation_transition['f1']:.3f}, "
-            f"matched={observation_transition['matched_predicted_transitions']}/"
-            f"{observation_transition['target_transitions']}, "
-            f"predicted={observation_transition['predicted_transitions']}",
+            f"matched={observation_transition['matched']}/"
+            f"{observation_transition['ground_truth']}, "
+            f"predicted={observation_transition['predicted']}",
             flush=True,
         )
         threshold_results[f"{threshold:.2f}"] = {

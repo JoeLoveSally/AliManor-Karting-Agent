@@ -85,6 +85,30 @@ def test_tracker_switches_after_confirmed_challenger_sequence() -> None:
     assert switched.relation.road_angle_deg == pytest.approx(25.0)
 
 
+def test_tracker_fails_closed_while_current_corridor_is_missing() -> None:
+    tracker = _tracker()
+    tracker.update_candidates([_candidate(130.0, 0.20)])
+
+    first = tracker.update_candidates([_candidate(25.0, 0.10)])
+    assert first.mode == "pending_no_current"
+    assert first.pending_count == 1
+    assert first.relation is None
+    assert first.stable_angle_deg == pytest.approx(130.0)
+
+    second = tracker.update_candidates([_candidate(25.0, 0.10)])
+    assert second.mode == "pending_no_current"
+    assert second.pending_count == 2
+    assert second.relation is None
+    assert second.stable_angle_deg == pytest.approx(130.0)
+
+    switched = tracker.update_candidates([_candidate(25.0, 0.10)])
+    assert switched.mode == "switch_confirmed"
+    assert switched.pending_count == 0
+    assert switched.relation is not None
+    assert switched.relation.road_angle_deg == pytest.approx(25.0)
+    assert switched.stable_angle_deg == pytest.approx(25.0)
+
+
 def test_tracker_requires_score_margin_before_starting_switch() -> None:
     tracker = _tracker()
     tracker.update_candidates([_candidate(130.0, 0.20)])

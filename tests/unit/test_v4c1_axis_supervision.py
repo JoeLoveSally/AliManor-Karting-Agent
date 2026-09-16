@@ -85,3 +85,23 @@ def test_weighted_axis_loss_ignores_zero_weight_samples() -> None:
 
     assert loss.item() == pytest.approx(0.0, abs=1e-7)
     assert normalized_weights.tolist() == pytest.approx([1.0, 0.0])
+
+
+def test_axis_weight_slug_is_artifact_safe() -> None:
+    from scripts.train_model_v4c1 import axis_weight_slug
+
+    assert axis_weight_slug(0.03) == "0p03"
+    assert axis_weight_slug(0.1) == "0p1"
+    assert axis_weight_slug(0.0) == "0"
+    with pytest.raises(ValueError):
+        axis_weight_slug(-0.1)
+
+
+def test_early_stopping_patience_can_be_disabled() -> None:
+    from scripts.train_model_v4c1 import should_stop_early
+
+    assert not should_stop_early(100, 0)
+    assert not should_stop_early(3, 4)
+    assert should_stop_early(4, 4)
+    with pytest.raises(ValueError):
+        should_stop_early(-1, 4)

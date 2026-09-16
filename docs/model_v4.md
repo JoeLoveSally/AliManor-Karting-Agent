@@ -5,31 +5,26 @@
 v4 keeps deployment fully model-driven while separating two questions:
 
 1. temporal representation;
-2. visual supervision that encourages causal road/kart geometry instead of shortcut features.
+2. visual supervision that encourages causal road/kart state instead of shortcut features.
 
-Analytic CV is offline teacher/debug tooling only. It never sends runtime actions.
+Analytic CV is an offline teacher/debugger only. It never sends runtime actions.
 
 ## 2. v3 reference
 
-v3 remains the reference control formulation:
+The reference control formulation remains:
 
 ```text
-5 RGB frames
+5 RGB frames at t-200,-150,-100,-50,t
 → concatenate as 15 channels
 → MobileNetV3-Small
 → visual feature
 + current PRESS / RELEASE embedding
-→ KEEP / SWITCH
+→ KEEP / SWITCH at +100/+200/+300ms
 ```
 
-The first 15-channel convolution is only temporal-average-equivalent at initialization; it remains trainable. Temporal counterfactual tests confirmed learned frame-order use:
+Future action is retained as a visual-only auxiliary task. Counterfactual training pairs each expert visual observation with both current controller states.
 
-```text
-repeat_latest flip rate = 0.351
-reverse       flip rate = 0.622
-```
-
-Relevant original-v3 stateful reference at threshold `0.60`:
+Original-v3 stateful test reference at threshold `0.60`:
 
 ```text
 target transition F1 = 0.918
@@ -43,15 +38,15 @@ observation F1       = 0.753
 
 ## 3. Temporal ablation conclusion
 
-The controlled v3 → v4-A → v4-A2 experiment kept the same data, video split, 200ms/5-frame history, targets, state conditioning, sampling and training semantics.
+The controlled v3 → v4-A → v4-A2 experiments kept data, split, 200ms/5-frame history, targets, state conditioning, sampling and training semantics fixed.
 
 ```text
-v3 15-channel temporal CNN         → best overall baseline
-v4-A per-frame CNN + GRU           → smoother but worse short corrections
-v4-A2 per-frame CNN + temporal MLP → close to v3, still no net win
+v3 15-channel temporal CNN         → best reference formulation
+v4-A per-frame CNN + GRU           → smoother, worse short corrections
+v4-A2 per-frame CNN + temporal MLP → close, no net win
 ```
 
-Representative best stateful results:
+Representative stateful results:
 
 ```text
                  v3@0.60   v4-A@0.50   v4-A2@0.70
@@ -60,271 +55,111 @@ short recall       0.778       0.722        0.722
 observation F1     0.753       0.554        0.744
 ```
 
-Therefore temporal architecture search is paused. v4-C returns to the v3 control formulation and changes visual supervision only.
+Temporal architecture search is therefore paused. v4-C keeps the v3 control architecture and changes supervision.
 
 ## 4. Track geometry model
 
-The tracks are better modeled as piecewise-straight corridors with discrete corners than as continuously curved racing roads:
+Tracks are better treated as piecewise-straight corridors with discrete corners than as continuously curved centerlines. The curved trajectory during drift describes vehicle motion more than road curvature.
+
+Priority is therefore:
 
 ```text
-straight segment
-→ discrete corner
-→ straight segment
-→ discrete corner
-```
-
-The curved trajectories visible during drifting mostly describe vehicle motion rather than a continuously curved road centerline.
-
-Geometry priorities are therefore:
-
-```text
-1. local straight-road orientation
+1. local road orientation
 2. kart center / heading
-3. lateral offset and heading error
+3. kart-relative lateral offset / heading error
 4. later: visible corner state
-5. later: travel-relative next-corner distance/direction
+5. later: travel-relative next-corner semantics
 ```
 
-Continuous curvature is not a primary target.
+## 5. Road teacher findings
 
-## 5. Geometry teacher findings
+A multi-theme HSV mask covers the blue, teal, green and dark-neutral road themes. `Canny(mask) → HoughLinesP` naturally detects road boundaries. For orientation, a straight boundary has the same axial tangent as the road center line.
 
-### 5.1 Multi-theme road mask
-
-The first blue-only HSV teacher failed on several themes. A multi-theme candidate mask now covers blue, cyan/teal, green and dark-neutral road appearances.
-
-The second 15-video audit showed that long road-edge evidence is available almost everywhere.
-
-### 5.2 Hough lines are road edges
-
-`Canny(mask) → HoughLinesP` naturally produces road-boundary segments. That is expected:
+A stricter parallel-edge pairing experiment attempted to infer center-axis position. Across 180 audit frames:
 
 ```text
-edge A  ─────────────────
-
-        center direction
-
-edge B  ─────────────────
+edge-axis detected     ≈ 98.9%
+primary center axis    ≈ 22.2%
+secondary center axis  ≈ 6.1%
+center-axis corner     = 0%
 ```
 
-For orientation only, a straight road edge and the corresponding road center line share the same tangent orientation. For road *position* or corner *location*, raw edges are not sufficient.
+Therefore center-axis position and corner location are not approved training targets.
 
-### 5.3 Center-axis pairing audit
+## 6. v4-C1: road-axis auxiliary
 
-A stricter teacher paired roughly parallel overlapping road edges and inferred their midpoint center axis. On 180 audited frames (12 × 15 videos), observed coverage was approximately:
-
-```text
-edge-axis detected     = 98.9%
-primary center axis    = 22.2%
-secondary center axis  = 6.1%
-center-axis corner     = 0.0%
-```
-
-The low center-axis coverage is intentional precision-first behavior, but it is too sparse for the first auxiliary task. The corner teacher is not ready at all.
-
-Therefore:
-
-- do **not** train global center-axis position;
-- do **not** train corner location yet;
-- do **not** loosen pairing thresholds just to inflate label coverage;
-- retain center-axis inference only as diagnostic work.
-
-## 6. v4-C1: straight-road axial orientation supervision
-
-The first structured supervision experiment uses only the reliable part of the teacher: dominant straight-road orientation.
-
-The control path is unchanged from v3:
-
-```text
-15-channel v3 visual history
-        ↓
-MobileNetV3-Small
-        ↓
-shared visual feature
-   ┌──────────────┬─────────────────┬──────────────────┐
-   ↓              ↓                 ↓
-KEEP/SWITCH   future-action     road-axis auxiliary
-   head           head               head
-   ↑
-current PRESS / RELEASE
-```
-
-The road-axis head is training supervision only.
-
-### 6.1 Why edge orientation is acceptable here
-
-v4-C1 predicts orientation, not road location. On a locally straight corridor, both side boundaries have the same axial orientation as the center line. Therefore high-confidence dominant edge orientation is a valid weak label for this specific task.
-
-Frames with ambiguous geometry are down-weighted or ignored.
-
-### 6.2 Label gate
-
-The full-label builder uses the current observation frame `t` and accepts a teacher target only when:
-
-```text
-primary axis exists
-straight_confidence >= configured threshold
-corner_score        <= configured threshold
-road area            within plausible range
-```
-
-Accepted labels receive a continuous confidence weight:
-
-```text
-weight = straight_confidence × (1 - corner_score)
-```
-
-The full v3 manifest contains `19,844` observation frames. The full-label audit produced:
-
-```text
-overall detected rate = 0.967
-overall accepted rate = 0.343
-```
-
-Per-video accepted rates are approximately `0.274–0.461`, with no held-out visual-theme collapse:
-
-```text
-validation:
-video_20260130_173545  accepted = 0.349
-video_20260130_174012  accepted = 0.461
-
-test:
-video_20260130_173426  accepted = 0.333
-video_20260130_173835  accepted = 0.304
-```
-
-Per-video mean accepted weight is approximately `0.864–0.941`. This label gate passes.
-
-### 6.3 Axial target representation
-
-A road orientation is axial: `θ` and `θ + 180°` are equivalent. v4-C1 therefore predicts:
+v4-C1 preserved the v3 control path and added a visual-only axial road-orientation head encoded as:
 
 ```text
 (cos 2θ, sin 2θ)
 ```
 
-rather than direct degrees.
-
-## 7. v4-C1 loss
+The full 19,844-frame label gate produced:
 
 ```text
-L = L_switch
-  + 0.5 * L_future_action
-  + λ_axis * L_axis
+axis detected = 0.967
+accepted      = 0.343
 ```
 
-`L_axis` is confidence-weighted cosine loss on `(cos 2θ, sin 2θ)`.
+with no held-out visual-theme collapse.
 
-Checkpoint selection remains **lowest validation switch loss**. Geometry quality is diagnostic; it does not replace the control objective.
-
-## 8. λ_axis = 0.10 result
-
-The first full Spark run completed all 30 epochs. Best validation switch loss occurred at epoch 1:
+The loss was:
 
 ```text
-best epoch                   = 1
-best validation switch loss = 0.19249
+L = L_switch + 0.5 L_future + λ_axis L_axis
 ```
 
-Best-checkpoint test metrics:
+### λ_axis = 0.10
 
 ```text
-switch@100 F1         = 0.811
-transition subset F1  = 0.818
-short subset F1       = 0.818
-future-action F1 h100 = 0.968
-future-action F1 h200 = 0.964
-future-action F1 h300 = 0.949
-axis mean error       = 26.21°
+axis error             = 26.21°
+stateful target F1@.60 = 0.906
+short recall           = 0.778
+observation F1         = 0.612
 ```
 
-Stateful test result at threshold `0.60`:
+### λ_axis = 0.03
+
+Early stopping selected epoch 1. At threshold `0.60`:
 
 ```text
-original v3                 v4-C1 λ=0.10
-transition F1  0.918        0.906
-matched        78 / 88      77 / 88
-predicted      82           82
-short recall   0.778        0.778
-chatter <100   1            0
-chatter <200   9            10
-observation F1 0.753        0.612
+axis error             = 27.49°
+stateful target F1     = 0.849
+matched                = 79 / 88
+predicted              = 98
+short recall           = 0.833
+chatter <100/<200ms    = 8 / 21
+observation F1         = 0.667
 ```
 
-The axis task is learned, but control does not improve.
+### λ_axis = 0 control ablation
 
-## 9. λ_axis = 0.03 result
-
-Early stopping reduced the run to five epochs because validation switch loss stopped improving after epoch 1:
+Validation selected threshold `0.70`:
 
 ```text
-best epoch                   = 1
-best validation switch loss = 0.201525
+validation target F1 = 0.933
+matched              = 70 / 72
+predicted            = 78
+short recall         = 0.917
+chatter <100/<200ms  = 0 / 3
 ```
 
-Selected-checkpoint test metrics:
+On test at that validation-selected threshold:
 
 ```text
-axis error = 27.49°
+target F1            = 0.913
+matched              = 84 / 88
+predicted            = 96
+short recall         = 0.944
+chatter <100/<200ms  = 8 / 12
+observation F1       = 0.696
 ```
 
-At threshold `0.60`:
+This checkpoint is more aggressive than original v3, not a clean offline replacement.
 
-```text
-stateful target F1 = 0.849
-matched            = 79 / 88
-predicted          = 98
-short recall       = 0.833
-chatter <100ms     = 8
-chatter <200ms     = 21
-observation F1     = 0.667
-```
+## 7. Closed-loop result of λ_axis = 0
 
-Reducing the road-axis weight did not recover control. The checkpoint became substantially more trigger-happy and chatters more often.
-
-## 10. λ_axis = 0 control ablation
-
-The v4-C1 harness was also trained with the axis objective disabled. The axis head still exists structurally but receives no loss.
-
-```text
-best epoch                   = 3
-best validation switch loss = 0.227882
-axis error                   = 37.36°  # untrained head; diagnostic only
-```
-
-Threshold selection was performed on validation, not test. Validation `0.60` and `0.70` tied on target metrics:
-
-```text
-threshold 0.60 / 0.70
-stateful target F1 = 0.933
-matched            = 70 / 72
-predicted          = 78
-short recall       = 0.917
-chatter <100ms     = 0
-chatter <200ms     = 3
-```
-
-`0.70` was selected because it preserved the same target/short/chatter result with slightly better observation alignment.
-
-On test at the validation-selected `0.70`:
-
-```text
-stateful target F1 = 0.913
-matched            = 84 / 88
-predicted          = 96
-short recall       = 0.944
-chatter <100ms     = 8
-chatter <200ms     = 12
-observation F1     = 0.696
-```
-
-This is not a clean improvement over the original v3 checkpoint. It is a more aggressive controller: it catches more short corrections but also emits more extra transitions.
-
-## 11. Closed-loop result of λ_axis = 0
-
-The `λ_axis=0` checkpoint was loaded through the ordinary v3 runtime after dropping the unused `axis_head.*` parameters. It was run on the real device at threshold `0.70`.
-
-Runtime health was good:
+The checkpoint was loaded through the ordinary v3 runtime, dropping the unused axis-head parameters. Runtime health was good:
 
 ```text
 input fps       ≈ 55.6
@@ -334,7 +169,7 @@ inference p95   ≈ 9.2 ms
 dropped frames  = 1
 ```
 
-Observed state changes:
+State changes:
 
 ```text
 PRESS    source frame 399
@@ -342,113 +177,173 @@ RELEASE  source frame 516
 PRESS    source frame 595
 ```
 
-The critical failure is the long KEEP-RELEASE interval after frame 516. Dense video/JSON inspection shows the useful pre-failure region is approximately:
+The important failure is the long KEEP-RELEASE interval. In approximately frames `532–548`, the kart is already deviating while correction can still matter, but switch probability remains very low. By roughly frame 560 the kart is already outside the useful correction regime.
 
-```text
-frame 532 → frame 548
-```
+This is not primarily a runtime-throughput or threshold problem.
 
-During this window the kart is still in a state where an earlier correction could matter, but `p_switch` remains very low. By roughly frame 560 the kart is already outside the useful correction regime. The later PRESS near frame 595 happens after the failure state is visually established.
+## 8. Road-only conclusion
 
-Therefore this failure is not mainly a runtime-throughput problem and is not plausibly fixed by another threshold sweep.
-
-## 12. Road-only supervision conclusion
-
-The road-axis experiments now answer the main question:
+The road-axis experiment now answers the intended question:
 
 ```text
 road orientation is learnable
-but
-road orientation alone does not solve the second-bend control failure
+but road orientation alone does not solve the second-bend failure
 ```
 
-Do not continue `λ_axis` sweeping. Do not add more road-only heads before testing kart-relative state.
+No further `λ_axis` sweep is planned. The next experiment targets kart-relative state.
 
-The missing state is better described as:
+## 9. Kart-relative teacher
 
-```text
-kart center
-kart heading
-road orientation
-→ lateral offset
-→ heading error
-```
-
-## 13. Kart-relative teacher POC
-
-The next offline teacher is implemented separately and documented in:
+The offline teacher is implemented in:
 
 ```text
-docs/kart_relative_teacher.md
 src/karting_agent/train/kart_pose_pseudo_labels.py
 scripts/inspect_kart_relative_geometry.py
+configs/geometry_pseudo_labels.yaml
 ```
 
-The first POC uses:
+Pipeline:
 
 ```text
-red/orange chassis evidence
-→ kart center
-→ PCA axial kart heading
-
-road mask + dominant road orientation
-→ local cross-sections around kart
-→ local road center/width
-→ lateral offset
-→ road-relative heading error
+red/orange chassis → kart center → axial PCA heading
+road mask + local Hough evidence → locally relevant road corridor
+kart + corridor → lateral offset + heading error
 ```
 
-The local road relation intentionally does **not** depend on the low-coverage global center-axis pairing teacher.
+The road axis is selected locally around the kart. The teacher does not blindly use the globally dominant road orientation at intersections.
 
-No kart-relative model head is approved yet. The teacher must first pass a visual audit on the known closed-loop failure and then on sparse samples across all expert videos.
-
-## 14. Covariate shift remains independent
-
-Structured perception does not solve expert-only behavior-cloning distribution shift. Closed-loop deviations still require valid pre-failure correction data through iterative behavior cloning or a DAgger-like process.
-
-The frame `532–548` region in the latest run is useful because the kart is deviating but not yet irreversibly lost. Do not fabricate recovery supervision from later fully off-road/failure frames.
-
-## 15. Shadow teacher
-
-Analytic geometry is now intended to be a shadow debugger:
+Dense audit of the known failed run over frames `500–570` produced:
 
 ```text
-recorded MP4
-   ├── road orientation
-   ├── kart center / axial heading
-   ├── local lateral offset / heading error
-   └── policy p_switch / KEEP/SWITCH
+previews           = 18
+kart detected      = 1.000
+heading usable     = 1.000
+relation usable    = 0.833
+offroad            = 0.133
+mean |heading err| = 39.2°
+mean |lateral|     = 0.49 road-half-widths
 ```
 
-This can distinguish:
+This passes the critical-run POC, but the teacher still requires a sparse 15-video visual audit and full-label distribution gate before training.
+
+## 10. v4-C2: kart-relative auxiliary supervision
+
+v4-C2 is implemented but **not yet approved for full training**.
+
+Implementation:
 
 ```text
-perception/state error
-vs
-control mapping error
-vs
-closed-loop distribution shift
+scripts/build_kart_relative_pseudo_labels.py
+src/karting_agent/train/kart_relative_labels.py
+src/karting_agent/model/kart_relative_supervised.py
+scripts/train_model_v4c2.py
+scripts/evaluate_model_v4c2.py
+configs/train_v4c2.yaml
 ```
 
-## 16. Current implementation order
+The v3 control path is unchanged. From the shared visual feature, v4-C2 additionally predicts:
 
 ```text
-1. pytest + Ruff for kart-relative teacher POC
-2. dense audit of adb_20260916T003536Z frames 500–570
-3. inspect whether center/heading/offset become abnormal before frame 548
-4. sparse kart-relative audit across all 15 expert videos
-5. only if teacher precision is acceptable, design a kart-relative auxiliary target
-6. keep deployment fully neural; analytic geometry remains offline only
+lateral offset
+axial heading-error vector
+edge-risk logit
 ```
 
-## 17. What v4 is not
+### 10.1 Lateral target
 
-v4 is not a hand-written geometry controller.
+```text
+lateral_target = clip(offset / (road_width/2), -1.25, +1.25)
+```
 
-v4 is not based on the claim that v3 lacked temporal information.
+Loss: confidence-weighted Smooth-L1.
 
-v4-C1 does not train the model to reproduce road-edge pixel locations. It uses road-edge evidence only to derive a weak straight-road orientation target.
+### 10.2 Heading-error target
 
-The kart-relative teacher is not part of runtime deployment.
+Because kart and road heading are axial, heading error is encoded as:
+
+```text
+(cos 2e, sin 2e)
+```
+
+Loss: confidence-weighted cosine loss.
+
+### 10.3 Edge-risk target
+
+Expert demonstrations should contain few true off-road frames, so a pure `offroad` classifier would be almost all-negative. The first auxiliary therefore predicts a pre-failure edge-risk condition:
+
+```text
+edge_risk = |lateral_offset_norm| >= 0.70
+```
+
+This is training supervision only, not a hard-coded controller.
+
+### 10.4 Initial loss weights
+
+```text
+L = L_switch
+  + 0.50 L_future_action
+  + 0.03 L_lateral
+  + 0.03 L_heading
+  + 0.01 L_edge_risk
+```
+
+These weights are intentionally conservative after v4-C1 showed that an auxiliary can be learnable while still harming control. Checkpoint selection and early stopping monitor validation **switch loss**.
+
+## 11. v4-C2 gate
+
+Before Spark training, build pseudo-labels for all v3 observation frames and inspect:
+
+```text
+pose rate
+heading rate
+relation rate
+accepted rate
+edge-risk positive rate
+true off-road rate
+mean teacher weight
+mean |lateral offset|
+mean |heading error|
+```
+
+Held-out videos must not collapse:
+
+```text
+validation: 173545, 174012
+test:       173426, 173835
+```
+
+Then perform a sparse overlay audit across all 15 expert recordings. If a visual theme or local-road selector is systematically wrong, fix the teacher before training.
+
+After the gate, v4-C2 evaluation reports both the existing static/stateful control metrics and:
+
+```text
+weighted lateral MAE
+weighted heading-error degrees
+edge-risk F1
+```
+
+Control threshold selection remains validation-only; test is final reporting.
+
+## 12. Covariate shift remains independent
+
+Structured state supervision does not solve expert-only behavior-cloning distribution shift. If v4-C2 learns kart-relative state but closed-loop failure remains, the next data step is iterative collection of valid pre-failure correction states. Do not fabricate recovery supervision after the kart is already irreversibly off track.
+
+## 13. Current implementation order
+
+```text
+1. pytest + Ruff for v4-C2 code
+2. build full kart-relative pseudo-label manifest on PC
+3. check per-video distribution, especially held-out themes
+4. sparse overlay audit across all 15 expert videos
+5. if the teacher gate passes, run PC smoke
+6. rsync code + small v4-C2 label files to Spark
+7. Spark smoke → full train with early stopping
+8. select threshold on validation, then report test
+9. only if offline gate is credible, run closed-loop A/B
+```
+
+## 14. What v4 is not
+
+v4 is not a hand-written geometry controller. It is not based on the claim that v3 lacked all temporal information. The analytic teachers generate structured supervision and diagnostics only.
 
 Deployment remains neural perception plus learned control.

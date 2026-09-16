@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from karting_agent.train.geometry_pseudo_labels import RectilinearGeometry
+from karting_agent.train.geometry_pseudo_labels import LineSegment, RectilinearGeometry
 from karting_agent.train.kart_pose_pseudo_labels import (
     KartPose,
     KartPoseConfig,
@@ -16,11 +16,15 @@ from karting_agent.train.kart_pose_pseudo_labels import (
 
 
 def _geometry(angle_deg: float) -> RectilinearGeometry:
+    segments = (
+        LineSegment(20, 80, 219, 80, angle_deg, 199.0),
+        LineSegment(20, 119, 219, 119, angle_deg, 199.0),
+    )
     return RectilinearGeometry(
         geometry_class="edge_only",
         primary_angle_deg=angle_deg,
         secondary_angle_deg=None,
-        primary_support=100.0,
+        primary_support=398.0,
         secondary_support=0.0,
         straight_confidence=0.9,
         corner_score=0.05,
@@ -30,7 +34,7 @@ def _geometry(angle_deg: float) -> RectilinearGeometry:
         corner_x_norm=None,
         corner_y_norm=None,
         corner_distance_norm=None,
-        segments=(),
+        segments=segments,
     )
 
 

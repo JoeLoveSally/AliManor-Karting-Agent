@@ -36,7 +36,10 @@ from karting_agent.train.axis_labels import (  # noqa: E402
     load_axis_pseudo_labels,
 )
 from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa: E402
-from karting_agent.train.sequence_evaluator import combine_evaluations, evaluate_sequence  # noqa: E402
+from karting_agent.train.sequence_evaluator import (  # noqa: E402
+    combine_evaluations,
+    evaluate_sequence,
+)
 from karting_agent.train.state_conditioned_dataset import load_v3_samples  # noqa: E402
 from karting_agent.train.trainer import (  # noqa: E402
     load_train_loop_config,
@@ -52,20 +55,35 @@ def parse_args() -> argparse.Namespace:
         "--config", type=Path, default=ROOT / "configs" / "train_v4c1.yaml"
     )
     parser.add_argument(
-        "--samples", type=Path, default=ROOT / "data" / "processed" / "v3" / "samples.jsonl"
+        "--samples",
+        type=Path,
+        default=ROOT / "data" / "processed" / "v3" / "samples.jsonl",
     )
     parser.add_argument(
-        "--labels-dir", type=Path, default=ROOT / "data" / "processed" / "v3" / "labels"
+        "--labels-dir",
+        type=Path,
+        default=ROOT / "data" / "processed" / "v3" / "labels",
     )
     parser.add_argument("--axis-labels", type=Path, default=None)
     parser.add_argument("--split", choices=("validation", "test"), default="test")
+    parser.add_argument(
+        "--artifact-name",
+        type=str,
+        default=None,
+        help="Artifact directory name under artifacts/models/.",
+    )
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--require-cache", action="store_true")
-    parser.add_argument("--thresholds", type=float, nargs="+", default=(0.5, 0.6, 0.7, 0.8, 0.9))
+    parser.add_argument(
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=(0.5, 0.6, 0.7, 0.8, 0.9),
+    )
     parser.add_argument("--tolerance-ms", type=float, default=None)
     return parser.parse_args()
 
@@ -74,7 +92,9 @@ def artifact_dir_from_config(raw: dict[str, object]) -> Path:
     artifact = raw.get("artifact", {})
     if not isinstance(artifact, dict):
         raise ValueError("artifact config must be a mapping")
-    return ROOT / "artifacts" / "models" / str(artifact.get("name", "mobilenet_v3_small_v4c1"))
+    return ROOT / "artifacts" / "models" / str(
+        artifact.get("name", "mobilenet_v3_small_v4c1")
+    )
 
 
 def simulate_video(
@@ -88,7 +108,10 @@ def simulate_video(
     horizon_ms: float,
     threshold: float,
 ) -> list[StatefulDecision]:
-    ordered = sorted(sample_indices, key=lambda index: float(samples[index].input_timestamps_ms[-1]))
+    ordered = sorted(
+        sample_indices,
+        key=lambda index: float(samples[index].input_timestamps_ms[-1]),
+    )
     if not ordered:
         return []
     initial = samples[ordered[0]].current_pressed
@@ -176,10 +199,18 @@ def stateful_sequence_summary(
     }
 
 
-def axis_metrics(predictions: np.ndarray, targets: np.ndarray, weights: np.ndarray) -> dict[str, float | int]:
+def axis_metrics(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    weights: np.ndarray,
+) -> dict[str, float | int]:
     selected = weights > 0
     if not np.any(selected):
-        return {"samples": 0, "weighted_mean_error_deg": 0.0, "mean_error_deg": 0.0}
+        return {
+            "samples": 0,
+            "weighted_mean_error_deg": 0.0,
+            "mean_error_deg": 0.0,
+        }
     pred = predictions[selected]
     target = targets[selected]
     pred /= np.maximum(np.linalg.norm(pred, axis=1, keepdims=True), 1e-8)
@@ -190,7 +221,9 @@ def axis_metrics(predictions: np.ndarray, targets: np.ndarray, weights: np.ndarr
     return {
         "samples": int(selected.sum()),
         "mean_error_deg": float(errors.mean()),
-        "weighted_mean_error_deg": float(np.sum(errors * selected_weights) / np.sum(selected_weights)),
+        "weighted_mean_error_deg": float(
+            np.sum(errors * selected_weights) / np.sum(selected_weights)
+        ),
     }
 
 
@@ -205,9 +238,15 @@ def main() -> int:
     preprocess_config = preprocess_config_from_mapping(raw)
     cache_root = frame_cache_root_from_config(raw, ROOT)
     tolerance_ms = evaluation_tolerance(raw, args.tolerance_ms)
-    artifact_dir = artifact_dir_from_config(raw)
+    artifact_dir = (
+        ROOT / "artifacts" / "models" / args.artifact_name
+        if args.artifact_name
+        else artifact_dir_from_config(raw)
+    )
     model_path = args.model.resolve() if args.model else artifact_dir / "model.pt"
-    metadata_path = args.metadata.resolve() if args.metadata else artifact_dir / "metadata.json"
+    metadata_path = (
+        args.metadata.resolve() if args.metadata else artifact_dir / "metadata.json"
+    )
     output_path = (
         args.output.resolve()
         if args.output
@@ -256,6 +295,8 @@ def main() -> int:
         counterfactual_states=False,
     )
     num_workers = loop_config.num_workers if args.num_workers is None else args.num_workers
+    if num_workers < 0:
+        raise ValueError("--num-workers must be >= 0")
     loader_kwargs = {
         "batch_size": loop_config.batch_size,
         "shuffle": False,
@@ -276,11 +317,19 @@ def main() -> int:
     try:
         with torch.inference_mode():
             for batch in loader:
-                inputs = batch["input"].to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
+                inputs = batch["input"].to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=device.type == "cuda",
+                )
                 batch_size = int(inputs.shape[0])
-                release_states = torch.zeros(batch_size, device=device, dtype=torch.long)
+                release_states = torch.zeros(
+                    batch_size, device=device, dtype=torch.long
+                )
                 press_states = torch.ones(batch_size, device=device, dtype=torch.long)
-                release_logits, future_logits, axis_vector = model(inputs, release_states)
+                release_logits, future_logits, axis_vector = model(
+                    inputs, release_states
+                )
                 press_logits, _, _ = model(inputs, press_states)
                 release_batches.append(torch.sigmoid(release_logits).cpu().numpy())
                 press_batches.append(torch.sigmoid(press_logits).cpu().numpy())
@@ -297,17 +346,31 @@ def main() -> int:
     axis_prediction = np.concatenate(axis_batches, axis=0)
     axis_target = np.concatenate(axis_target_batches, axis=0)
     axis_weight = np.concatenate(axis_weight_batches, axis=0).reshape(-1)
-    expert_states = np.asarray([bool(sample.current_pressed) for sample in samples], dtype=bool)
-    future_targets = np.asarray([sample.target_states for sample in samples], dtype=np.float32)
-    switch_targets = np.not_equal(future_targets >= 0.5, expert_states[:, None]).astype(np.float32)
-    expert_switch_probabilities = np.where(expert_states[:, None], switch_if_press, switch_if_release)
+    expert_states = np.asarray(
+        [bool(sample.current_pressed) for sample in samples], dtype=bool
+    )
+    future_targets = np.asarray(
+        [sample.target_states for sample in samples], dtype=np.float32
+    )
+    switch_targets = np.not_equal(
+        future_targets >= 0.5, expert_states[:, None]
+    ).astype(np.float32)
+    expert_switch_probabilities = np.where(
+        expert_states[:, None], switch_if_press, switch_if_release
+    )
     near_transition = np.asarray(
-        [sample.near_transition_by_horizon or tuple(sample.near_transition for _ in horizons) for sample in samples],
+        [
+            sample.near_transition_by_horizon
+            or tuple(sample.near_transition for _ in horizons)
+            for sample in samples
+        ],
         dtype=bool,
     )
     axis_result = axis_metrics(axis_prediction, axis_target, axis_weight)
     auxiliary = {
-        f"{h:g}ms": binary_metrics(future_probabilities[:, index], future_targets[:, index], 0.5)
+        f"{h:g}ms": binary_metrics(
+            future_probabilities[:, index], future_targets[:, index], 0.5
+        )
         for index, h in enumerate(horizons)
     }
     label_data = {
@@ -316,12 +379,15 @@ def main() -> int:
     }
     print(
         f"Device: {device}; split={args.split}; samples={len(samples)}; "
-        f"axis_n={axis_result['samples']}; axis_err={axis_result['weighted_mean_error_deg']:.2f}deg",
+        f"axis_n={axis_result['samples']}; "
+        f"axis_err={axis_result['weighted_mean_error_deg']:.2f}deg",
         flush=True,
     )
     print(
         "Aux future-action F1: "
-        + ", ".join(f"h{h:g}={auxiliary[f'{h:g}ms']['f1']:.3f}" for h in horizons),
+        + ", ".join(
+            f"h{h:g}={auxiliary[f'{h:g}ms']['f1']:.3f}" for h in horizons
+        ),
         flush=True,
     )
 
@@ -331,7 +397,9 @@ def main() -> int:
     stable_mask = ~near_transition[:, control_index]
     for threshold in (float(value) for value in args.thresholds):
         static = binary_metrics(primary_probabilities, primary_targets, threshold)
-        stable_fpr = false_positive_rate(primary_probabilities, primary_targets, stable_mask, threshold)
+        stable_fpr = false_positive_rate(
+            primary_probabilities, primary_targets, stable_mask, threshold
+        )
         all_negative_fpr = false_positive_rate(
             primary_probabilities,
             primary_targets,
@@ -349,25 +417,36 @@ def main() -> int:
             label_data=label_data,
         )
         target_transition = stateful["target_timeline"]["transition"]["all"]
-        observation_transition = stateful["observation_timeline"]["transition"]["all"]
-        target_short = stateful["target_timeline"]["release_segment_recall"]["short_100_300ms"]
+        observation_transition = stateful["observation_timeline"]["transition"][
+            "all"
+        ]
+        target_short = stateful["target_timeline"]["release_segment_recall"][
+            "short_100_300ms"
+        ]
         chatter = stateful["chatter"]
         print(
-            f"threshold={threshold:.2f}/static: p={static['precision']:.3f}, r={static['recall']:.3f}, "
-            f"f1={static['f1']:.3f}, pred_pos={static['predicted_positive_rate']:.3f}, "
-            f"stable_fpr={stable_fpr:.3f}, all_negative_fpr={all_negative_fpr:.3f}",
+            f"threshold={threshold:.2f}/static: p={static['precision']:.3f}, "
+            f"r={static['recall']:.3f}, f1={static['f1']:.3f}, "
+            f"pred_pos={static['predicted_positive_rate']:.3f}, "
+            f"stable_fpr={stable_fpr:.3f}, "
+            f"all_negative_fpr={all_negative_fpr:.3f}",
             flush=True,
         )
         print(
-            f"threshold={threshold:.2f}/stateful-target: transition_f1={target_transition['f1']:.3f}, "
+            f"threshold={threshold:.2f}/stateful-target: "
+            f"transition_f1={target_transition['f1']:.3f}, "
             f"matched={target_transition['matched']}/{target_transition['ground_truth']}, "
-            f"predicted={target_transition['predicted']}, short_recall={target_short['recall']:.3f}, "
-            f"chatter_lt100={chatter['lt_100ms']}, chatter_lt200={chatter['lt_200ms']}",
+            f"predicted={target_transition['predicted']}, "
+            f"short_recall={target_short['recall']:.3f}, "
+            f"chatter_lt100={chatter['lt_100ms']}, "
+            f"chatter_lt200={chatter['lt_200ms']}",
             flush=True,
         )
         print(
-            f"threshold={threshold:.2f}/stateful-observation: transition_f1={observation_transition['f1']:.3f}, "
-            f"matched={observation_transition['matched']}/{observation_transition['ground_truth']}, "
+            f"threshold={threshold:.2f}/stateful-observation: "
+            f"transition_f1={observation_transition['f1']:.3f}, "
+            f"matched={observation_transition['matched']}/"
+            f"{observation_transition['ground_truth']}, "
             f"predicted={observation_transition['predicted']}",
             flush=True,
         )

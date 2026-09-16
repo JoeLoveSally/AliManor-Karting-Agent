@@ -305,9 +305,9 @@ class TemporalKartRoadTracker:
             return self._result(raw_best.relation, "switch_confirmed", candidate_angles)
 
         # Keep emitting the old corridor while it is still observable. If it is
-        # temporarily absent, expose the challenger relation for diagnostics but
-        # do not promote it to stable state until confirmation is complete.
-        relation = current.relation if current is not None else raw_best.relation
+        # temporarily absent, fail closed: retain pending evidence for possible
+        # switch confirmation but do not emit an unconfirmed challenger label.
+        relation = current.relation if current is not None else None
         mode = "hold_pending" if current is not None else "pending_no_current"
         return self._result(relation, mode, candidate_angles)
 

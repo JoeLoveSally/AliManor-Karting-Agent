@@ -1,26 +1,10 @@
-# Kart-Relative Geometry Teacher POC
+# Kart-Relative Geometry Teacher and v4-C2
 
 ## 1. Why this exists
 
 The latest closed-loop experiments show that road orientation alone is not the missing state for the second-bend failure.
 
-The road-axis auxiliary task was learnable, but it did not improve control:
-
-```text
-v4-C1 λ_axis=0.10
-axis error ≈ 26.2°
-stateful target F1 @0.60 = 0.906
-
-v4-C1 λ_axis=0.03
-axis error ≈ 27.5°
-stateful target F1 @0.60 = 0.849
-
-v4-C1 λ_axis=0
-axis head untrained
-validation selected threshold = 0.70
-```
-
-The `λ_axis=0` checkpoint was then tested in the real ADB closed loop at threshold `0.70`.
+The road-axis auxiliary task was learnable, but did not improve control. The `λ_axis=0` control ablation was then tested in the real ADB closed loop at validation-selected threshold `0.70`.
 
 Runtime performance was healthy:
 
@@ -40,29 +24,23 @@ RELEASE source frame 516
 PRESS   source frame 595
 ```
 
-After the RELEASE at frame 516, the policy remained strongly in KEEP-RELEASE while the kart drifted out of the road. The useful pre-failure diagnostic window is approximately:
+After frame 516, the policy remained strongly in KEEP-RELEASE while the kart drifted out. The useful pre-failure diagnostic window is approximately frame `532–548`; later fully off-road/failure frames must not be treated as synthetic recovery demonstrations.
 
-```text
-frame 532 → frame 548
-```
-
-By roughly frame 560 the kart is already outside the useful correction regime. Do not create synthetic "recovery" supervision from the later failure state.
-
-This motivates a different structured state:
+The missing state is better described as:
 
 ```text
 kart center
 kart heading
-road orientation
+local road orientation
 → lateral offset
 → heading error
 ```
 
-The first step is an **offline teacher/audit only**. No new model head is approved until these labels are visually audited.
+Analytic CV remains an offline teacher/debugger only. Runtime deployment stays neural.
 
-## 2. Scope
+## 2. Teacher implementation
 
-The POC is implemented in:
+Implemented in:
 
 ```text
 src/karting_agent/train/kart_pose_pseudo_labels.py
@@ -70,176 +48,179 @@ scripts/inspect_kart_relative_geometry.py
 configs/geometry_pseudo_labels.yaml
 ```
 
-It is deliberately not used by runtime control.
+The kart detector uses red/orange chassis evidence inside a gameplay ROI. Nearby chassis pieces are merged, the centroid becomes the kart center, and PCA provides an axial heading. The mostly-white chicken body is intentionally not the primary pose cue because drift smoke/effects are also white.
 
-## 3. Kart center teacher
+The road relation does not blindly reuse the globally dominant Hough axis. Around intersections, a long remote road segment can dominate global support. The teacher therefore clusters nearby Hough edge evidence, evaluates candidate local axes around the kart, probes cross-sections normal to each candidate, and selects a plausible local corridor using lateral proximity, kart-heading compatibility, local support, and valid-probe count.
 
-The player kart has a stable red/orange chassis in the current recordings. The teacher therefore:
-
-```text
-BGR frame
-→ HSV warm-color mask
-→ gameplay-region ROI
-→ connected components
-→ reject components without enough red support
-→ choose the plausible component near the gameplay anchor
-→ merge nearby chassis pieces
-→ centroid = kart center
-```
-
-The white chicken body is not used as the primary detector because white smoke/effects are common during drifting.
-
-The minimum red-support rule is also important for rejecting failure-dialog coins/buttons, which are warm-colored but not red chassis objects.
-
-This is a dataset-specific weak teacher and must be audited if kart skins change.
-
-## 4. Kart heading teacher
-
-Heading is estimated from PCA of the merged red/orange chassis pixels.
-
-The POC predicts an **axial heading**:
-
-```text
-θ == θ + 180°
-```
-
-It does not yet decide which end of the kart is the front. That is sufficient for an initial alignment-error diagnostic against the axial road orientation.
-
-`heading_quality` is derived from PCA anisotropy. Approximately circular/noisy components are marked as heading-unusable rather than forced into a direction.
-
-## 5. Local road relation
-
-Global road center-axis pairing had low coverage, so lateral offset does not depend on the old global center-axis teacher.
-
-Instead, once a kart center and dominant road angle exist, the POC probes local cross-sections normal to the road direction:
-
-```text
-                 road tangent
-                      →
-
-road edge  =============================
-
-          cross section      |
-                             |
-                    kart  ●  |
-                             |
-
-road edge  =============================
-```
-
-The probes are shifted slightly forward/backward along the road tangent so the kart sprite itself does not split the road mask.
-
-For each valid cross-section:
-
-```text
-road run midpoint → local road center
-road run width    → local road width
-```
-
-The reported lateral offset is:
+For a selected corridor:
 
 ```text
 lateral_offset_norm = lateral_offset_px / (road_width / 2)
 ```
 
-Interpretation:
+so `0` is local center, `|1|` is approximately an edge, and `>1` is outside the inferred corridor.
+
+Heading error is the signed axial difference between kart and road axes, wrapped to `[-90°, 90°)`.
+
+## 3. Critical-run audit result
+
+The known failed closed-loop run was audited densely over frames `500–570`, sampling every 4 frames:
 
 ```text
-0      = local center
-|1|    = road edge
-> 1    = outside the inferred road corridor
+previews          = 18
+kart detected     = 1.000
+heading usable    = 1.000
+relation usable   = 0.833
+offroad           = 0.133
+mean |heading err|= 39.2°
+mean |lateral|    = 0.49 road-half-widths
 ```
 
-The sign is an image-axis convention from the canonical road normal; it is diagnostic for now and not yet a control semantic such as "left/right of travel".
+The overlay audit shows that kart center and axial heading remain trackable through the pre-failure region, while kart-relative geometry degrades before the visible failure. This is enough to proceed to a full expert-video label gate, but it is not enough to assume the teacher generalizes across all 15 visual themes.
 
-## 6. Heading error
+## 4. v4-C2 pseudo-labels
 
-The POC reports the signed minimum axial difference:
+Implemented in:
 
 ```text
-heading_error = kart_heading - road_axis
-wrapped to [-90°, 90°)
+scripts/build_kart_relative_pseudo_labels.py
+src/karting_agent/train/kart_relative_labels.py
 ```
 
-Again, this is image-axis geometry. A future travel-relative left/right semantic would require directed travel orientation.
+Every v3 observation frame receives one JSONL row. Invalid or low-confidence teacher outputs are retained with `weight=0`, so dataset alignment stays explicit.
 
-## 7. Confidence
+The supervised targets are:
 
-`KartRoadRelation.confidence` combines:
+### 4.1 Lateral offset
 
 ```text
-kart heading quality
-× road straight confidence
-× (1 - road corner score)
-× valid local cross-section fraction
+lateral_target = clip(lateral_offset_norm, -1.25, +1.25)
 ```
 
-This value is for audit/ranking only. No threshold has been approved for training labels.
+Training uses confidence-weighted Smooth-L1 loss.
 
-## 8. Critical-run audit
+### 4.2 Axial heading error
 
-After syncing the code to the PC, inspect the known failed closed-loop run densely around the failure:
-
-```bash
-python scripts/inspect_kart_relative_geometry.py \
-  artifacts/adb_runs/adb_20260916T003536Z.mp4 \
-  --run-json artifacts/adb_runs/adb_20260916T003536Z.json \
-  --frame-start 500 \
-  --frame-end 570 \
-  --sample-every-frames 4 \
-  --max-previews-per-video 40
-```
-
-Output:
+A heading error is axial. `+90°` and `-90°` describe the same perpendicular axis, so direct scalar regression or ordinary `(cos e, sin e)` would introduce the wrong periodicity. v4-C2 encodes:
 
 ```text
-artifacts/kart_relative_geometry/
-└── adb_20260916T003536Z/
-    ├── contact_sheet.jpg
-    ├── summary.json
-    └── frame_*.jpg
+(cos 2e, sin 2e)
 ```
 
-Each overlay shows:
+and trains with confidence-weighted cosine loss.
+
+### 4.3 Edge-risk auxiliary
+
+A pure `offroad` head would be nearly degenerate on expert demonstrations because true off-road positives should be rare. v4-C2 instead uses a pre-failure edge-risk target:
 
 ```text
-yellow circle   = detected kart center
-magenta axis    = kart axial heading
-cyan cross/axis = local inferred road center/orientation
-green/red link  = kart-to-road-center offset (inside/outside)
-policy text     = nearest p_switch/action/state from the run JSON
+edge_risk = |lateral_offset_norm| >= 0.70
 ```
 
-## 9. Audit gate
+This is a diagnostic/representation auxiliary, not a hand-written runtime safety rule.
 
-Do not train a kart-relative auxiliary head yet.
+The current label gate is:
 
-First inspect the critical window and then a sparse sample across all 15 expert recordings. Required qualitative checks:
+```yaml
+kart_relative_label:
+  min_confidence: 0.05
+  lateral_clip_abs: 1.25
+  edge_risk_threshold: 0.70
+```
+
+These thresholds are provisional until the 15-video label distribution and sparse visual audit are reviewed.
+
+## 5. v4-C2 model
+
+Implemented in:
 
 ```text
-1. kart center stays on the chassis through straight and drift frames;
-2. heading axis follows the chassis rather than smoke/skid marks;
-3. failure UI is rejected rather than detected as a kart;
-4. local road center lies between the relevant road boundaries;
-5. lateral offset grows before visible off-road failure;
-6. heading error changes coherently through the drift;
-7. low-confidence/corner frames fail closed rather than producing arbitrary labels.
+src/karting_agent/model/kart_relative_supervised.py
+scripts/train_model_v4c2.py
+scripts/evaluate_model_v4c2.py
+configs/train_v4c2.yaml
 ```
 
-If these checks pass, the next model experiment should supervise **kart-relative state**, not add another road-only objective.
-
-## 10. Training status
-
-Current status:
+The v3 control path is unchanged:
 
 ```text
-road orientation teacher          audited / trainable but not control-helpful
-kart center teacher               POC / audit required
-kart axial heading teacher        POC / audit required
-local lateral offset              POC / audit required
-road-relative heading error       POC / audit required
-corner / next-corner semantics    not ready
-runtime geometry controller       explicitly out of scope
+5 RGB frames → 15 channels → MobileNetV3-Small → visual feature
+                                             ├→ future-action head
+                                             ├→ lateral head
+                                             ├→ axial heading-error head
+                                             └→ edge-risk head
+visual feature + current PRESS/RELEASE → KEEP/SWITCH head
 ```
 
-Deployment remains a learned neural policy. The analytic teacher exists only to create/audit structured supervision and diagnose failures.
+All kart-relative heads are training auxiliaries from the shared visual feature. They are not fed as analytic runtime inputs.
+
+Initial loss:
+
+```text
+L = L_switch
+  + 0.50 * L_future_action
+  + 0.03 * L_lateral
+  + 0.03 * L_heading
+  + 0.01 * L_edge_risk
+```
+
+The weights are deliberately conservative because v4-C1 demonstrated that a learnable auxiliary objective can still damage control when it competes too strongly with the primary representation.
+
+Checkpoint selection and early stopping continue to monitor **validation switch loss**, not geometry loss.
+
+## 6. Evaluation
+
+`evaluate_model_v4c2.py` preserves the existing static and stateful control evaluation and additionally reports:
+
+```text
+weighted lateral MAE
+weighted axial heading-error degrees
+edge-risk F1
+```
+
+The first requirement is that the auxiliary quantities are actually learnable on held-out videos. The control requirement remains that stateful behavior must not regress relative to the v3-family baseline.
+
+Do not select a control threshold from test. Select it on validation, then report test once using that threshold.
+
+## 7. Required gate before training
+
+The next step is not Spark training. First build labels on all 19,844 v3 observation frames and inspect per-video coverage:
+
+```text
+pose rate
+heading rate
+relation rate
+accepted rate
+edge-risk positive rate
+true off-road rate
+mean teacher weight
+mean |lateral offset|
+mean |heading error|
+```
+
+Pay special attention to held-out videos:
+
+```text
+validation: 173545, 174012
+test:       173426, 173835
+```
+
+Reject or revise the teacher if a visual theme collapses, if local road selection is systematically wrong, or if edge-risk has essentially no positive examples.
+
+Then run a sparse visual overlay audit across all 15 expert videos. Only after both quantitative and visual gates pass should v4-C2 be trained.
+
+## 8. Covariate shift remains independent
+
+Kart-relative supervision may improve causal representation, but it does not solve expert-only behavior-cloning distribution shift. If closed-loop deviations remain after v4-C2, valid pre-failure correction data must be collected iteratively. Do not manufacture recovery labels from states in which the kart is already irreversibly off track.
+
+## 9. Current status
+
+```text
+road orientation teacher       audited; learnable; not control-helpful
+kart center/heading teacher     critical-run audit passed; 15-video gate pending
+local kart-road relation        critical-run audit passed; 15-video gate pending
+v4-C2 code path                 implemented; local tests pending
+v4-C2 full training             blocked on label + visual gate
+corner / next-corner semantics postponed
+runtime geometry controller     explicitly out of scope
+```

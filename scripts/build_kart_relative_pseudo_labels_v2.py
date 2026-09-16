@@ -6,7 +6,6 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import argparse
 import json
-import math
 from pathlib import Path
 import sys
 

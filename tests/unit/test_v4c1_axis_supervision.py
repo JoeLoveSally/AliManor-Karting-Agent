@@ -105,3 +105,31 @@ def test_early_stopping_patience_can_be_disabled() -> None:
     assert should_stop_early(4, 4)
     with pytest.raises(ValueError):
         should_stop_early(-1, 4)
+
+
+def test_v4c1_runtime_drops_axis_only_parameters() -> None:
+    from karting_agent.model.state_conditioned_runner import _control_state_dict
+
+    state_dict = {
+        "visual_encoder.weight": object(),
+        "switch_head.0.weight": object(),
+        "future_action_head.weight": object(),
+        "axis_head.weight": object(),
+        "axis_head.bias": object(),
+    }
+
+    runtime = _control_state_dict(state_dict, "state_conditioned_axis_v4c1")
+
+    assert set(runtime) == {
+        "visual_encoder.weight",
+        "switch_head.0.weight",
+        "future_action_head.weight",
+    }
+
+
+def test_v3_runtime_keeps_full_state_dict() -> None:
+    from karting_agent.model.state_conditioned_runner import _control_state_dict
+
+    state_dict = {"switch_head.0.weight": object()}
+
+    assert _control_state_dict(state_dict, "state_conditioned_transition_v3") is state_dict

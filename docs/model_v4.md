@@ -174,20 +174,14 @@ Accepted labels receive a continuous confidence weight:
 weight = straight_confidence × (1 - corner_score)
 ```
 
-Current feasibility defaults are stored in `configs/geometry_pseudo_labels.yaml` and remain tunable teacher parameters, not model hyperparameters.
-
-### 6.3 Full-label audit result
-
-The full v3 manifest contains `19,844` observation frames. Running the axis-label builder produced:
+The full v3 manifest contains `19,844` observation frames. The full-label audit produced:
 
 ```text
 overall detected rate = 0.967
 overall accepted rate = 0.343
 ```
 
-So roughly one third of all observations receive high-confidence straight-road orientation supervision, while ambiguous frames remain unlabeled.
-
-Per-video accepted rates are stable across visual themes, approximately `0.274–0.461`. The held-out videos are not under-covered:
+Per-video accepted rates are approximately `0.274–0.461`, with no held-out visual-theme collapse:
 
 ```text
 validation:
@@ -199,25 +193,19 @@ video_20260130_173426  accepted = 0.333
 video_20260130_173835  accepted = 0.304
 ```
 
-Accepted-label confidence is also consistently high; per-video mean accepted weight is approximately `0.864–0.941`.
+Per-video mean accepted weight is approximately `0.864–0.941`. This label gate passes.
 
-This gate passes. The teacher has enough coverage for v4-C1 without obvious train/held-out theme imbalance, so the next step is model smoke + Spark training rather than loosening teacher thresholds.
+### 6.3 Axial target representation
 
-### 6.4 Axial target representation
-
-A road orientation is axial: `θ` and `θ + 180°` are equivalent. v4-C1 therefore uses:
+A road orientation is axial: `θ` and `θ + 180°` are equivalent. v4-C1 therefore predicts:
 
 ```text
 (cos 2θ, sin 2θ)
 ```
 
-rather than direct angle regression.
-
-This removes the `0° / 180°` discontinuity.
+rather than direct degrees.
 
 ## 7. v4-C1 loss
-
-The first experiment changes only one training objective relative to v3:
 
 ```text
 L = L_switch
@@ -227,79 +215,162 @@ L = L_switch
 
 `L_axis` is confidence-weighted cosine loss on `(cos 2θ, sin 2θ)`.
 
-Initial `λ_axis = 0.1` is a starting experiment, not a final constant. Checkpoint selection remains **lowest validation switch loss**, matching v3 semantics, so the geometry objective cannot silently replace the control objective.
+Checkpoint selection remains **lowest validation switch loss**. Geometry quality is diagnostic; it does not replace the control objective.
 
-The held-out evaluator reports both:
+## 8. First v4-C1 result: λ_axis = 0.10
 
-```text
-control metrics
-+ weighted road-axis angular error
-```
-
-A lower axis error is not sufficient for model acceptance; control must remain competitive with v3.
-
-## 8. v4-C1 implementation
-
-Implemented files:
+The first full Spark run completed all 30 epochs. Best validation switch loss occurred at epoch 1:
 
 ```text
-configs/train_v4c1.yaml
-scripts/build_axis_pseudo_labels.py
-scripts/train_model_v4c1.py
-scripts/evaluate_model_v4c1.py
-src/karting_agent/model/axis_supervised.py
-src/karting_agent/train/axis_labels.py
-tests/unit/test_v4c1_axis_supervision.py
+best epoch                  = 1
+best validation switch loss = 0.19249
 ```
 
-The v3 sample manifest and `frame_cache_v2` are reused. No new temporal dataset is created.
-
-Pseudo-label generation reads raw current frames because the HSV teacher should operate on the original visual theme rather than normalized model tensors.
-
-## 9. Required gate before Spark training
-
-The label-distribution gate has passed. Generated files:
+Best-checkpoint test metrics:
 
 ```text
-data/processed/v4c1/axis_labels.jsonl
-data/processed/v4c1/axis_manifest.json
+switch@100 F1      = 0.811
+transition subset F1 = 0.818
+short subset F1      = 0.818
+future-action F1:
+  h100 = 0.968
+  h200 = 0.964
+  h300 = 0.949
+axis mean error      = 26.21°
 ```
 
-The next required gate is a local smoke test before copying code + the two small v4-C1 label files to Spark.
-
-## 10. Training/evaluation gate
+Stateful test result at threshold `0.60`:
 
 ```text
-PC smoke
-→ Spark smoke
-→ full v4-C1 training
-→ stateful held-out evaluation
+v3 baseline                    v4-C1 λ=0.10
+transition F1  0.918           0.906
+matched        78 / 88         77 / 88
+predicted      82              82
+short recall   0.778           0.778
+chatter <100   1               0
+chatter <200   9               10
+observation F1 0.753           0.612
 ```
 
-The main control reference remains:
+Threshold `0.70` also produced target transition F1 `0.906` and short recall `0.778`. Raising the threshold to `0.80/0.90` reduced short recall to `0.667`, so threshold tuning does not recover the v3 control gate.
+
+Conclusion:
 
 ```text
-v3 @ 0.60
-transition F1 = 0.918
-short recall  = 0.778
-observation F1= 0.753
+road-axis task is learnable
++ static switch classification does not collapse
+- stateful control does not beat v3
 ```
 
-Interpretation:
+Do not implement an ADB runtime for this checkpoint.
+
+### 8.1 Why λ=0.10 may be too strong
+
+At the selected test checkpoint:
 
 ```text
-axis error improves + control improves/holds
-→ structured orientation supervision is promising
-
-axis error improves + control degrades
-→ auxiliary objective is learned but conflicts with control;
-  tune/remove λ_axis rather than adding more geometry heads
-
-axis error remains poor
-→ teacher/representation is not useful enough
+switch loss = 0.1341
+future loss = 0.1353
+axis loss   = 0.6330
 ```
 
-Do not add corner/kart heads in the same experiment.
+Weighted auxiliary contributions are therefore approximately:
+
+```text
+0.5 × future loss ≈ 0.0676
+0.1 × axis loss   ≈ 0.0633
+```
+
+Although `0.1` looks numerically small, the axis objective contributes nearly as much as the entire future-action auxiliary objective. The next controlled experiment therefore reduces only `λ_axis`.
+
+## 9. v4-C1 sweep and training-efficiency changes
+
+The next primary point is:
+
+```text
+λ_axis = 0.03
+```
+
+If it still degrades control, test `0.01`. A `0.0` run is available as an objective-level ablation, but it is not bit-for-bit identical to v3 because the v4-C1 model still instantiates the unused axis head.
+
+The training script now supports:
+
+```text
+--axis-weight
+--artifact-name
+--epochs
+--early-stopping-patience
+--early-stopping-min-delta
+```
+
+When `--axis-weight` is supplied without an explicit artifact name, the run is automatically separated from the original artifact. Example:
+
+```text
+--axis-weight 0.03
+→ artifacts/models/mobilenet_v3_small_v4c1_aw0p03/
+```
+
+The default config now uses validation-switch-loss early stopping:
+
+```text
+patience = 4 epochs
+min_delta = 0
+maximum epochs = 30
+```
+
+With the previous best epoch at 1, this prevents repeatedly running the remaining 20+ overfit epochs unless validation improves again.
+
+Training resilience is also improved. After every completed epoch the script atomically updates:
+
+```text
+history.json
+training_state.json
+```
+
+The best `model.pt` is still saved immediately on validation improvement. Therefore an SSH/session interruption no longer hides all completed epoch history.
+
+## 10. Next λ=0.03 experiment
+
+After syncing the updated code to Spark, run:
+
+```bash
+python scripts/train_model_v4c1.py \
+  --config configs/train_v4c1.yaml \
+  --samples data/processed/v3/samples.jsonl \
+  --axis-labels data/processed/v4c1/axis_labels.jsonl \
+  --axis-weight 0.03 \
+  --require-cache \
+  --num-workers 4
+```
+
+The automatic artifact directory is:
+
+```text
+artifacts/models/mobilenet_v3_small_v4c1_aw0p03/
+```
+
+Evaluate it with:
+
+```bash
+python scripts/evaluate_model_v4c1.py \
+  --config configs/train_v4c1.yaml \
+  --samples data/processed/v3/samples.jsonl \
+  --labels-dir data/processed/v3/labels \
+  --axis-labels data/processed/v4c1/axis_labels.jsonl \
+  --artifact-name mobilenet_v3_small_v4c1_aw0p03 \
+  --split test \
+  --require-cache \
+  --num-workers 4
+```
+
+The control gate remains:
+
+```text
+transition F1 >= 0.918
+short recall  >= 0.778
+```
+
+Axis error should remain meaningfully below a random axial predictor, but a lower axis error alone does not justify keeping the auxiliary objective.
 
 ## 11. Later geometry stages
 
@@ -326,7 +397,7 @@ lateral offset
 heading error
 ```
 
-These become later targets only when their teacher labels are demonstrably reliable.
+If `λ_axis = 0.01/0.03/0.10` all fail to improve v3 control, stop tuning road-only supervision and move to kart-relative state rather than adding more road-only heads.
 
 ## 12. Covariate shift remains independent
 
@@ -350,15 +421,13 @@ This separates representation errors from control errors and off-distribution fa
 ## 14. Current implementation order
 
 ```text
-1. pytest + Ruff
-2. v4-C1 PC smoke
-3. rsync code to Spark using the normal no-.git/no-data command
-4. separately copy data/processed/v4c1/axis_labels.jsonl + axis_manifest.json to Spark
-5. Spark smoke
-6. full v4-C1 training
-7. stateful evaluator vs v3
-8. only if offline control gate passes, implement/run ADB closed-loop A/B
-9. keep center-axis/corner and kart-pose work as later independent experiments
+1. pytest + Ruff after sweep/early-stopping changes
+2. rsync updated code to Spark
+3. run λ_axis=0.03 with early stopping
+4. stateful evaluator vs v3
+5. if control gate passes, consider ADB closed-loop A/B
+6. if 0.03 still misses, test λ_axis=0.01
+7. if road-axis sweep has no net control gain, move to kart-relative supervision
 ```
 
 ## 15. What v4 is not

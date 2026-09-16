@@ -11,7 +11,7 @@ Analytic CV is offline teacher/debug tooling only. It never sends runtime action
 
 ## 2. v3 reference
 
-v3 remains the best control baseline:
+v3 remains the reference control formulation:
 
 ```text
 5 RGB frames
@@ -29,7 +29,7 @@ repeat_latest flip rate = 0.351
 reverse       flip rate = 0.622
 ```
 
-Relevant v3 stateful reference at threshold `0.60`:
+Relevant original-v3 stateful reference at threshold `0.60`:
 
 ```text
 target transition F1 = 0.918
@@ -79,9 +79,9 @@ Geometry priorities are therefore:
 
 ```text
 1. local straight-road orientation
-2. later: visible corner state
-3. later: kart center / heading
-4. later: lateral offset and heading error
+2. kart center / heading
+3. lateral offset and heading error
+4. later: visible corner state
 5. later: travel-relative next-corner distance/direction
 ```
 
@@ -124,10 +124,10 @@ The low center-axis coverage is intentional precision-first behavior, but it is 
 
 Therefore:
 
-- do **not** train center-axis position;
+- do **not** train global center-axis position;
 - do **not** train corner location yet;
 - do **not** loosen pairing thresholds just to inflate label coverage;
-- retain center-axis inference only as diagnostic work for later stages.
+- retain center-axis inference only as diagnostic work.
 
 ## 6. v4-C1: straight-road axial orientation supervision
 
@@ -217,225 +217,238 @@ L = L_switch
 
 Checkpoint selection remains **lowest validation switch loss**. Geometry quality is diagnostic; it does not replace the control objective.
 
-## 8. First v4-C1 result: λ_axis = 0.10
+## 8. λ_axis = 0.10 result
 
 The first full Spark run completed all 30 epochs. Best validation switch loss occurred at epoch 1:
 
 ```text
-best epoch                  = 1
+best epoch                   = 1
 best validation switch loss = 0.19249
 ```
 
 Best-checkpoint test metrics:
 
 ```text
-switch@100 F1      = 0.811
-transition subset F1 = 0.818
-short subset F1      = 0.818
-future-action F1:
-  h100 = 0.968
-  h200 = 0.964
-  h300 = 0.949
-axis mean error      = 26.21°
+switch@100 F1         = 0.811
+transition subset F1  = 0.818
+short subset F1       = 0.818
+future-action F1 h100 = 0.968
+future-action F1 h200 = 0.964
+future-action F1 h300 = 0.949
+axis mean error       = 26.21°
 ```
 
 Stateful test result at threshold `0.60`:
 
 ```text
-v3 baseline                    v4-C1 λ=0.10
-transition F1  0.918           0.906
-matched        78 / 88         77 / 88
-predicted      82              82
-short recall   0.778           0.778
-chatter <100   1               0
-chatter <200   9               10
-observation F1 0.753           0.612
+original v3                 v4-C1 λ=0.10
+transition F1  0.918        0.906
+matched        78 / 88      77 / 88
+predicted      82           82
+short recall   0.778        0.778
+chatter <100   1            0
+chatter <200   9            10
+observation F1 0.753        0.612
 ```
 
-Threshold `0.70` also produced target transition F1 `0.906` and short recall `0.778`. Raising the threshold to `0.80/0.90` reduced short recall to `0.667`, so threshold tuning does not recover the v3 control gate.
+The axis task is learned, but control does not improve.
 
-Conclusion:
+## 9. λ_axis = 0.03 result
+
+Early stopping reduced the run to five epochs because validation switch loss stopped improving after epoch 1:
 
 ```text
-road-axis task is learnable
-+ static switch classification does not collapse
-- stateful control does not beat v3
+best epoch                   = 1
+best validation switch loss = 0.201525
 ```
 
-Do not implement an ADB runtime for this checkpoint.
-
-### 8.1 Why λ=0.10 may be too strong
-
-At the selected test checkpoint:
+Selected-checkpoint test metrics:
 
 ```text
-switch loss = 0.1341
-future loss = 0.1353
-axis loss   = 0.6330
+axis error = 27.49°
 ```
 
-Weighted auxiliary contributions are therefore approximately:
+At threshold `0.60`:
 
 ```text
-0.5 × future loss ≈ 0.0676
-0.1 × axis loss   ≈ 0.0633
+stateful target F1 = 0.849
+matched            = 79 / 88
+predicted          = 98
+short recall       = 0.833
+chatter <100ms     = 8
+chatter <200ms     = 21
+observation F1     = 0.667
 ```
 
-Although `0.1` looks numerically small, the axis objective contributes nearly as much as the entire future-action auxiliary objective. The next controlled experiment therefore reduces only `λ_axis`.
+Reducing the road-axis weight did not recover control. The checkpoint became substantially more trigger-happy and chatters more often.
 
-## 9. v4-C1 sweep and training-efficiency changes
+## 10. λ_axis = 0 control ablation
 
-The next primary point is:
+The v4-C1 harness was also trained with the axis objective disabled. The axis head still exists structurally but receives no loss.
 
 ```text
-λ_axis = 0.03
+best epoch                   = 3
+best validation switch loss = 0.227882
+axis error                   = 37.36°  # untrained head; diagnostic only
 ```
 
-If it still degrades control, test `0.01`. A `0.0` run is available as an objective-level ablation, but it is not bit-for-bit identical to v3 because the v4-C1 model still instantiates the unused axis head.
-
-The training script now supports:
+Threshold selection was performed on validation, not test. Validation `0.60` and `0.70` tied on target metrics:
 
 ```text
---axis-weight
---artifact-name
---epochs
---early-stopping-patience
---early-stopping-min-delta
+threshold 0.60 / 0.70
+stateful target F1 = 0.933
+matched            = 70 / 72
+predicted          = 78
+short recall       = 0.917
+chatter <100ms     = 0
+chatter <200ms     = 3
 ```
 
-When `--axis-weight` is supplied without an explicit artifact name, the run is automatically separated from the original artifact. Example:
+`0.70` was selected because it preserved the same target/short/chatter result with slightly better observation alignment.
+
+On test at the validation-selected `0.70`:
 
 ```text
---axis-weight 0.03
-→ artifacts/models/mobilenet_v3_small_v4c1_aw0p03/
+stateful target F1 = 0.913
+matched            = 84 / 88
+predicted          = 96
+short recall       = 0.944
+chatter <100ms     = 8
+chatter <200ms     = 12
+observation F1     = 0.696
 ```
 
-The default config now uses validation-switch-loss early stopping:
+This is not a clean improvement over the original v3 checkpoint. It is a more aggressive controller: it catches more short corrections but also emits more extra transitions.
+
+## 11. Closed-loop result of λ_axis = 0
+
+The `λ_axis=0` checkpoint was loaded through the ordinary v3 runtime after dropping the unused `axis_head.*` parameters. It was run on the real device at threshold `0.70`.
+
+Runtime health was good:
 
 ```text
-patience = 4 epochs
-min_delta = 0
-maximum epochs = 30
+input fps       ≈ 55.6
+control fps     ≈ 29.2
+inference mean  ≈ 6.7 ms
+inference p95   ≈ 9.2 ms
+dropped frames  = 1
 ```
 
-With the previous best epoch at 1, this prevents repeatedly running the remaining 20+ overfit epochs unless validation improves again.
-
-Training resilience is also improved. After every completed epoch the script atomically updates:
+Observed state changes:
 
 ```text
-history.json
-training_state.json
+PRESS    source frame 399
+RELEASE  source frame 516
+PRESS    source frame 595
 ```
 
-The best `model.pt` is still saved immediately on validation improvement. Therefore an SSH/session interruption no longer hides all completed epoch history.
-
-## 10. Next λ=0.03 experiment
-
-After syncing the updated code to Spark, run:
-
-```bash
-python scripts/train_model_v4c1.py \
-  --config configs/train_v4c1.yaml \
-  --samples data/processed/v3/samples.jsonl \
-  --axis-labels data/processed/v4c1/axis_labels.jsonl \
-  --axis-weight 0.03 \
-  --require-cache \
-  --num-workers 4
-```
-
-The automatic artifact directory is:
+The critical failure is the long KEEP-RELEASE interval after frame 516. Dense video/JSON inspection shows the useful pre-failure region is approximately:
 
 ```text
-artifacts/models/mobilenet_v3_small_v4c1_aw0p03/
+frame 532 → frame 548
 ```
 
-Evaluate it with:
+During this window the kart is still in a state where an earlier correction could matter, but `p_switch` remains very low. By roughly frame 560 the kart is already outside the useful correction regime. The later PRESS near frame 595 happens after the failure state is visually established.
 
-```bash
-python scripts/evaluate_model_v4c1.py \
-  --config configs/train_v4c1.yaml \
-  --samples data/processed/v3/samples.jsonl \
-  --labels-dir data/processed/v3/labels \
-  --axis-labels data/processed/v4c1/axis_labels.jsonl \
-  --artifact-name mobilenet_v3_small_v4c1_aw0p03 \
-  --split test \
-  --require-cache \
-  --num-workers 4
-```
+Therefore this failure is not mainly a runtime-throughput problem and is not plausibly fixed by another threshold sweep.
 
-The control gate remains:
+## 12. Road-only supervision conclusion
+
+The road-axis experiments now answer the main question:
 
 ```text
-transition F1 >= 0.918
-short recall  >= 0.778
+road orientation is learnable
+but
+road orientation alone does not solve the second-bend control failure
 ```
 
-Axis error should remain meaningfully below a random axial predictor, but a lower axis error alone does not justify keeping the auxiliary objective.
+Do not continue `λ_axis` sweeping. Do not add more road-only heads before testing kart-relative state.
 
-## 11. Later geometry stages
-
-### v4-C2: corner state
-
-Only after a reliable center-axis or travel-aware teacher exists:
-
-```text
-corner visible
-corner proximity/location
-```
-
-Do not call a visible intersection `next_corner` without travel direction.
-
-### v4-C3: kart-relative geometry
-
-The second-bend failure is more directly described by:
+The missing state is better described as:
 
 ```text
 kart center
 kart heading
 road orientation
-lateral offset
-heading error
+→ lateral offset
+→ heading error
 ```
 
-If `λ_axis = 0.01/0.03/0.10` all fail to improve v3 control, stop tuning road-only supervision and move to kart-relative state rather than adding more road-only heads.
+## 13. Kart-relative teacher POC
 
-## 12. Covariate shift remains independent
+The next offline teacher is implemented separately and documented in:
 
-Structured perception does not solve expert-only behavior-cloning distribution shift. Closed-loop deviations still require valid pre-failure correction/recovery data through iterative behavior cloning or a DAgger-like process.
+```text
+docs/kart_relative_teacher.md
+src/karting_agent/train/kart_pose_pseudo_labels.py
+scripts/inspect_kart_relative_geometry.py
+```
 
-Do not fabricate recovery supervision after the kart is already irreversibly off track.
+The first POC uses:
 
-## 13. Shadow teacher
+```text
+red/orange chassis evidence
+→ kart center
+→ PCA axial kart heading
 
-Analytic geometry remains useful after model training for failure diagnosis:
+road mask + dominant road orientation
+→ local cross-sections around kart
+→ local road center/width
+→ lateral offset
+→ road-relative heading error
+```
+
+The local road relation intentionally does **not** depend on the low-coverage global center-axis pairing teacher.
+
+No kart-relative model head is approved yet. The teacher must first pass a visual audit on the known closed-loop failure and then on sparse samples across all expert videos.
+
+## 14. Covariate shift remains independent
+
+Structured perception does not solve expert-only behavior-cloning distribution shift. Closed-loop deviations still require valid pre-failure correction data through iterative behavior cloning or a DAgger-like process.
+
+The frame `532–548` region in the latest run is useful because the kart is deviating but not yet irreversibly lost. Do not fabricate recovery supervision from later fully off-road/failure frames.
+
+## 15. Shadow teacher
+
+Analytic geometry is now intended to be a shadow debugger:
 
 ```text
 recorded MP4
-   ├── learned road-axis prediction
-   ├── analytic teacher orientation
-   └── policy KEEP/SWITCH
+   ├── road orientation
+   ├── kart center / axial heading
+   ├── local lateral offset / heading error
+   └── policy p_switch / KEEP/SWITCH
 ```
 
-This separates representation errors from control errors and off-distribution failures.
-
-## 14. Current implementation order
+This can distinguish:
 
 ```text
-1. pytest + Ruff after sweep/early-stopping changes
-2. rsync updated code to Spark
-3. run λ_axis=0.03 with early stopping
-4. stateful evaluator vs v3
-5. if control gate passes, consider ADB closed-loop A/B
-6. if 0.03 still misses, test λ_axis=0.01
-7. if road-axis sweep has no net control gain, move to kart-relative supervision
+perception/state error
+vs
+control mapping error
+vs
+closed-loop distribution shift
 ```
 
-## 15. What v4 is not
+## 16. Current implementation order
+
+```text
+1. pytest + Ruff for kart-relative teacher POC
+2. dense audit of adb_20260916T003536Z frames 500–570
+3. inspect whether center/heading/offset become abnormal before frame 548
+4. sparse kart-relative audit across all 15 expert videos
+5. only if teacher precision is acceptable, design a kart-relative auxiliary target
+6. keep deployment fully neural; analytic geometry remains offline only
+```
+
+## 17. What v4 is not
 
 v4 is not a hand-written geometry controller.
 
 v4 is not based on the claim that v3 lacked temporal information.
 
-v4-C1 is not training the model to reproduce road-edge pixel locations. It uses road-edge evidence only to derive a high-confidence weak label for straight-road **orientation**.
+v4-C1 does not train the model to reproduce road-edge pixel locations. It uses road-edge evidence only to derive a weak straight-road orientation target.
+
+The kart-relative teacher is not part of runtime deployment.
 
 Deployment remains neural perception plus learned control.

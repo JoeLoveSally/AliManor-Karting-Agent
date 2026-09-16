@@ -67,8 +67,11 @@ def _load(path: Path) -> dict[tuple[str, int], dict[str, object]]:
     return rows
 
 
-def _video_id(video: str) -> int | None:
-    match = re.search(r"(\d+)(?=\.[^.]+$)", Path(video).name)
+def _video_id(video: object) -> int | None:
+    stem = Path(str(video)).stem
+    if stem.isdigit():
+        return int(stem)
+    match = re.search(r"(\d+)$", stem)
     return None if match is None else int(match.group(1))
 
 
@@ -77,8 +80,11 @@ def _split_map(path: Path) -> dict[int, str]:
     split = raw.get("split", {})
     mapping: dict[int, str] = {}
     for name in ("train", "validation", "test"):
-        for video_id in split.get(name, []):
-            mapping[int(video_id)] = name
+        for entry in split.get(name, []):
+            video_id = _video_id(entry)
+            if video_id is None:
+                raise ValueError(f"could not parse video id from split entry: {entry!r}")
+            mapping[video_id] = name
     return mapping
 
 

@@ -101,5 +101,14 @@ kart_relation:
   local_axis_tolerance_deg: 10.0
   local_axis_radius_fraction: 0.30
 
+# v4-C2 label gate. Keep low-confidence detections in the JSONL with weight=0
+# so every v3 observation frame has an explicit record. The edge-risk target is
+# deliberately "near edge" rather than off-road: expert demonstrations contain
+# very few true off-road positives, so a pure off-road head would be degenerate.
+kart_relative_label:
+  min_confidence: 0.05
+  lateral_clip_abs: 1.25
+  edge_risk_threshold: 0.70
+
 preview:
   sample_every_frames: 120

@@ -15,6 +15,8 @@ train:
   weight_decay: 0.0001
   num_workers: 0
   seed: 42
+  early_stopping_patience: 4
+  early_stopping_min_delta: 0.0
 
 loss:
   auxiliary_action_weight: 0.5

@@ -90,6 +90,10 @@ def _relation(row: dict[str, object]) -> bool:
     return row.get("raw_lateral_offset_norm") is not None
 
 
+def _key(row: dict[str, object]) -> tuple[str, int]:
+    return str(row["video"]), int(row["frame_index"])
+
+
 def _axial_distance_deg(left: float, right: float) -> float:
     return abs(float((left - right + 90.0) % 180.0 - 90.0))
 
@@ -102,6 +106,8 @@ def _version_summary(rows: list[dict[str, object]]) -> dict[str, object]:
 
     adjacent_pairs = []
     for previous, current in zip(rows, rows[1:]):
+        if str(previous["video"]) != str(current["video"]):
+            continue
         prev_frame = int(previous["frame_index"])
         curr_frame = int(current["frame_index"])
         if curr_frame - prev_frame > 4:
@@ -161,8 +167,8 @@ def _pair_summary(
     v1_rows: list[dict[str, object]],
     v2_rows: list[dict[str, object]],
 ) -> dict[str, object]:
-    v1 = {int(row["frame_index"]): row for row in v1_rows}
-    v2 = {int(row["frame_index"]): row for row in v2_rows}
+    v1 = {_key(row): row for row in v1_rows}
+    v2 = {_key(row): row for row in v2_rows}
     if set(v1) != set(v2):
         missing_v1 = sorted(set(v2) - set(v1))[:5]
         missing_v2 = sorted(set(v1) - set(v2))[:5]
@@ -176,9 +182,9 @@ def _pair_summary(
     risk_disagreements = 0
     lateral_deltas = []
     heading_deltas = []
-    for frame in sorted(v1):
-        left = v1[frame]
-        right = v2[frame]
+    for key in sorted(v1):
+        left = v1[key]
+        right = v2[key]
         left_ok = _accepted(left)
         right_ok = _accepted(right)
         if right_ok and not left_ok:
@@ -187,7 +193,7 @@ def _pair_summary(
             lost += 1
         if not (left_ok and right_ok):
             continue
-        both.append(frame)
+        both.append(key)
         if bool(float(left.get("edge_risk_target", 0.0)) > 0.5) != bool(
             float(right.get("edge_risk_target", 0.0)) > 0.5
         ):

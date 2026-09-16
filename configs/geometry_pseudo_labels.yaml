@@ -55,5 +55,47 @@ axis_label:
   min_road_area_fraction: 0.15
   max_road_area_fraction: 0.65
 
+# Kart-relative POC. The kart sprite uses a stable red/orange chassis across the
+# current recordings. Restrict the detector to the gameplay region so progress
+# UI and top-bar icons do not become pose candidates. A minimum red fraction is
+# important because failure-dialog coins/buttons are warm-colored but mostly
+# contain no red chassis pixels.
+kart_pose:
+  warm_hsv_ranges:
+    - lower: [0, 120, 90]
+      upper: [12, 255, 255]
+    - lower: [13, 110, 100]
+      upper: [35, 255, 255]
+    - lower: [170, 120, 90]
+      upper: [179, 255, 255]
+  red_hsv_ranges:
+    - lower: [0, 120, 90]
+      upper: [12, 255, 255]
+    - lower: [170, 120, 90]
+      upper: [179, 255, 255]
+  search_x_min_norm: 0.18
+  search_x_max_norm: 0.92
+  search_y_min_norm: 0.28
+  search_y_max_norm: 0.82
+  close_kernel: 5
+  min_component_area_fraction: 0.00015
+  max_component_area_fraction: 0.01
+  min_red_fraction: 0.15
+  anchor_x_norm: 0.55
+  anchor_y_norm: 0.50
+  anchor_distance_weight: 6.0
+  join_distance_fraction: 0.075
+  min_heading_quality: 0.35
+
+# Estimate a local road center at the kart by probing cross-sections normal to
+# the dominant road axis. The probes are shifted along the road tangent so the
+# kart sprite itself does not split the road mask. The resulting offset is
+# normalized by half road width: 0=center, |1|=edge, >1=outside.
+kart_relation:
+  tangent_offsets_fraction: [-0.05, 0.05]
+  max_normal_distance_fraction: 0.30
+  min_road_width_fraction: 0.025
+  max_road_width_fraction: 0.35
+
 preview:
   sample_every_frames: 120

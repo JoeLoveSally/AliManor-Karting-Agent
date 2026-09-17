@@ -28,6 +28,10 @@ class MultiHorizonSchedulerConfig:
     interpolating where the switch probability crosses ``threshold`` between the
     control and anticipation horizons, then subtracting the control horizon.
 
+    ``pending_advance_ms`` shifts only anticipation-scheduled transitions earlier
+    than that interpolated delay. The effective pending delay is clamped to zero,
+    so this never schedules a transition before the warning was observed.
+
     ``min_state_hold_ms`` rejects immediate reversals after an executed switch.
     The default 100 ms matches the lower bound of the dataset's explicitly
     retained short-correction segments, so it removes scheduler-created
@@ -41,6 +45,7 @@ class MultiHorizonSchedulerConfig:
     threshold: float = 0.6
     monotonic_tolerance: float = 1e-6
     min_state_hold_ms: float = 100.0
+    pending_advance_ms: float = 0.0
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 2:
@@ -63,6 +68,15 @@ class MultiHorizonSchedulerConfig:
             raise ValueError("monotonic_tolerance must be finite and >= 0")
         if not math.isfinite(self.min_state_hold_ms) or self.min_state_hold_ms < 0:
             raise ValueError("min_state_hold_ms must be finite and >= 0")
+        if not math.isfinite(self.pending_advance_ms) or self.pending_advance_ms < 0:
+            raise ValueError("pending_advance_ms must be finite and >= 0")
+        anticipation_span_ms = (
+            self.anticipation_horizon_ms - self.control_horizon_ms
+        )
+        if self.pending_advance_ms > anticipation_span_ms + 1e-6:
+            raise ValueError(
+                "pending_advance_ms must not exceed the anticipation/control horizon span"
+            )
 
 
 @dataclass(frozen=True)
@@ -154,7 +168,8 @@ class MultiHorizonSwitchScheduler:
         fraction = (threshold - control) / denominator
         fraction = min(1.0, max(0.0, fraction))
         crossing_horizon_ms = self.config.control_horizon_ms + fraction * span_ms
-        delay_ms = crossing_horizon_ms - self.config.control_horizon_ms
+        raw_delay_ms = crossing_horizon_ms - self.config.control_horizon_ms
+        delay_ms = max(0.0, raw_delay_ms - self.config.pending_advance_ms)
         return crossing_horizon_ms, delay_ms
 
     def _decision(

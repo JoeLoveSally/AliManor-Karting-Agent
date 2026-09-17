@@ -283,6 +283,8 @@ def main() -> int:
             "mode": "video",
             "frames_read": input_frames,
             "decoded_frames": max(0, decoded_end - decoded_start),
+            "decoded_frame_count_total": len(video_input.decoded_frame_timestamps_ms),
+            "decoded_frame_timestamps_ms": list(video_input.decoded_frame_timestamps_ms),
             "dropped_frames": max(0, dropped_end - dropped_start),
             "fps": input_fps,
             "startup_ms": video_input.startup_ms,
@@ -327,10 +329,28 @@ def main() -> int:
         {
             "path": str(recording_path),
             "format": "mp4",
-            "codec": "h264",
+            "codec": "mp4v",
             "resolution": [video_input.decode_width, video_input.decode_height]
             if video_input is not None
             else None,
+            "timing": "cfr_visual_only",
+            "fps": video_input.recording_fps if video_input is not None else None,
+            "frame_count": video_input.recorded_frames if video_input is not None else None,
+            "source_frame_mapping": "mp4_frame_index_equals_decoded_frame_index",
+            "frame_mapping_valid": (
+                video_input.recording_frame_mapping_valid
+                if video_input is not None
+                else False
+            ),
+            "dropped_frames": (
+                video_input.recording_dropped_frames if video_input is not None else None
+            ),
+            "dropped_frame_indices": (
+                list(video_input.recording_dropped_frame_indices)
+                if video_input is not None
+                else None
+            ),
+            "error": video_input.recording_error if video_input is not None else None,
             "includes_pre_control": True,
             "control_start_source_frame": control_start_source_frame,
             "control_start_timestamp_ms": control_start_timestamp_ms,
@@ -338,6 +358,15 @@ def main() -> int:
         if recording_path is not None
         else None
     )
+    if recording_payload is not None and not recording_payload["frame_mapping_valid"]:
+        print(
+            "WARNING: debug MP4/source-frame correspondence is invalid: "
+            f"dropped={recording_payload['dropped_frames']} "
+            f"error={recording_payload['error']}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     payload = {
         "mode": mode,
         "policy": "state_conditioned_transition_v3",

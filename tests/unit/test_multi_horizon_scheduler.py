@@ -218,6 +218,54 @@ def test_non_monotonic_horizons_do_not_arm_pending_switch() -> None:
     assert scheduler.pending_due_ms is None
 
 
+def test_short_horizon_overdue_is_opt_in() -> None:
+    scheduler = make_scheduler()
+
+    decision = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.9, 0.2, 0.1),
+        current_pressed=False,
+    )
+
+    assert decision.switch is False
+    assert decision.reason == "hold"
+
+
+def test_short_horizon_overdue_switches_after_hold_gate() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            execute_short_horizon_overdue=True,
+        )
+    )
+    first = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    assert first.reason == "primary"
+
+    blocked = scheduler.update(
+        timestamp_ms=1099.0,
+        probabilities=(0.9, 0.2, 0.1),
+        current_pressed=True,
+    )
+    eligible = scheduler.update(
+        timestamp_ms=1100.0,
+        probabilities=(0.9, 0.2, 0.1),
+        current_pressed=True,
+    )
+
+    assert blocked.switch is False
+    assert blocked.reason == "min_hold"
+    assert eligible.switch is True
+    assert eligible.reason == "short_overdue"
+
+
 def test_primary_signal_overrides_pending_delay() -> None:
     scheduler = make_scheduler()
     scheduler.update(
@@ -321,6 +369,47 @@ def test_minimum_hold_can_arm_pending_without_early_execution() -> None:
     assert executed is not None
     assert executed.due_at_ms == pytest.approx(1100.0)
     assert scheduler.last_switch_ms == pytest.approx(1100.0)
+
+
+def test_hold_armed_pending_survives_primary_signal_inside_hold() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            arm_pending_during_min_hold=True,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    armed = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.1, 0.59, 0.9),
+        current_pressed=True,
+    )
+    strengthened = scheduler.update(
+        timestamp_ms=1080.0,
+        probabilities=(0.1, 0.8, 0.95),
+        current_pressed=True,
+    )
+
+    assert armed.reason == "pending_armed"
+    assert armed.pending_due_ms == pytest.approx(1100.0)
+    assert strengthened.switch is False
+    assert strengthened.reason == "pending_wait"
+    assert strengthened.pending_due_ms == pytest.approx(1100.0)
+
+    executed = scheduler.execute_pending_if_due(
+        timestamp_ms=1100.0,
+        current_pressed=True,
+    )
+    assert executed is not None
+    assert executed.due_at_ms == pytest.approx(1100.0)
 
 
 def test_minimum_hold_preserves_later_natural_pending_deadline() -> None:

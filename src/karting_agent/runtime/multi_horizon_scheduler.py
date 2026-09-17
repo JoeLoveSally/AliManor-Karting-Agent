@@ -37,6 +37,11 @@ class MultiHorizonSchedulerConfig:
     retained short-correction segments, so it removes scheduler-created
     sub-100 ms chatter without intentionally suppressing the 100--300 ms
     corrections that are part of the training/evaluation target.
+
+    When ``arm_pending_during_min_hold`` is enabled, the hold remains an execution
+    gate rather than an observation blind spot: monotonic anticipation warnings
+    may arm and remain pending during the hold, but their deadline is clamped to
+    the hold expiry so no reversal can execute before ``min_state_hold_ms``.
     """
 
     horizons_ms: tuple[float, ...]
@@ -46,6 +51,7 @@ class MultiHorizonSchedulerConfig:
     monotonic_tolerance: float = 1e-6
     min_state_hold_ms: float = 100.0
     pending_advance_ms: float = 0.0
+    arm_pending_during_min_hold: bool = False
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 2:
@@ -163,6 +169,8 @@ class MultiHorizonSwitchScheduler:
         if pending.state_before != current_pressed:
             self._pending = None
             return None
+        if self._inside_min_hold(timestamp_ms):
+            return None
         if timestamp_ms + 1e-6 < pending.due_at_ms:
             return None
 
@@ -276,6 +284,11 @@ class MultiHorizonSwitchScheduler:
             < self.config.min_state_hold_ms
         )
 
+    def _hold_expiry_ms(self) -> float | None:
+        if self._last_switch_ms is None:
+            return None
+        return self._last_switch_ms + self.config.min_state_hold_ms
+
     def update(
         self,
         *,
@@ -299,10 +312,8 @@ class MultiHorizonSwitchScheduler:
         if self._pending is not None and self._pending.state_before != current_pressed:
             self._pending = None
 
-        # A switch changes the conditioning state abruptly. Ignore the immediate
-        # counter-signal until the shortest intentionally retained correction
-        # duration has elapsed, then evaluate the horizons afresh.
-        if self._inside_min_hold(timestamp_ms):
+        inside_min_hold = self._inside_min_hold(timestamp_ms)
+        if inside_min_hold and not self.config.arm_pending_during_min_hold:
             self._pending = None
             return self._decision(
                 timestamp_ms=timestamp_ms,
@@ -313,7 +324,7 @@ class MultiHorizonSwitchScheduler:
             )
 
         control = probabilities[self._control_index]
-        if control >= self.config.threshold:
+        if not inside_min_hold and control >= self.config.threshold:
             return self._switch_decision(
                 timestamp_ms=timestamp_ms,
                 reason="primary",
@@ -336,7 +347,7 @@ class MultiHorizonSwitchScheduler:
                     pending_due_ms=pending.due_at_ms,
                     pending_delay_ms=pending.delay_ms,
                 )
-            if timestamp_ms + 1e-6 >= pending.due_at_ms:
+            if not inside_min_hold and timestamp_ms + 1e-6 >= pending.due_at_ms:
                 return self._switch_decision(
                     timestamp_ms=timestamp_ms,
                     reason="pending_execute",
@@ -361,13 +372,18 @@ class MultiHorizonSwitchScheduler:
             return self._decision(
                 timestamp_ms=timestamp_ms,
                 switch=False,
-                reason="hold",
+                reason="min_hold" if inside_min_hold else "hold",
                 current_pressed=current_pressed,
                 probabilities=probabilities,
             )
 
         crossing_horizon_ms, delay_ms = candidate
         due_at_ms = timestamp_ms + delay_ms
+        if inside_min_hold:
+            hold_expiry_ms = self._hold_expiry_ms()
+            assert hold_expiry_ms is not None
+            due_at_ms = max(due_at_ms, hold_expiry_ms)
+            delay_ms = due_at_ms - timestamp_ms
         self._pending = _PendingSwitch(
             state_before=current_pressed,
             armed_at_ms=timestamp_ms,

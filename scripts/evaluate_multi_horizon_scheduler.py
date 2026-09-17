@@ -93,6 +93,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-horizon-ms", type=float, default=200.0)
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
     parser.add_argument("--pending-advance-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--arm-pending-during-min-hold",
+        action="store_true",
+        help=(
+            "Allow monotonic anticipation warnings to arm during the minimum state "
+            "hold while clamping execution to the hold expiry."
+        ),
+    )
     parser.add_argument("--tolerance-ms", type=float, default=None)
     return parser.parse_args()
 
@@ -424,11 +432,12 @@ def main() -> int:
     if args.output:
         output_path = args.output.resolve()
     else:
-        suffix = (
-            ""
-            if abs(float(args.pending_advance_ms)) < 1e-9
-            else f"_advance_{float(args.pending_advance_ms):g}ms"
-        )
+        suffix_parts: list[str] = []
+        if abs(float(args.pending_advance_ms)) >= 1e-9:
+            suffix_parts.append(f"advance_{float(args.pending_advance_ms):g}ms")
+        if args.arm_pending_during_min_hold:
+            suffix_parts.append("hold_arm")
+        suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
         output_path = (
             artifact
             / "evaluation"
@@ -448,6 +457,7 @@ def main() -> int:
         anticipation_horizon_ms=float(args.anticipation_horizon_ms),
         threshold=float(args.threshold),
         pending_advance_ms=float(args.pending_advance_ms),
+        arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
     )
     scheduler_config.validate()
     control_index = horizons.index(scheduler_config.control_horizon_ms)
@@ -568,7 +578,8 @@ def main() -> int:
         f"threshold={args.threshold:.2f} "
         f"control_h={scheduler_config.control_horizon_ms:g}ms "
         f"anticipation_h={scheduler_config.anticipation_horizon_ms:g}ms "
-        f"pending_advance={scheduler_config.pending_advance_ms:g}ms",
+        f"pending_advance={scheduler_config.pending_advance_ms:g}ms "
+        f"hold_arm={scheduler_config.arm_pending_during_min_hold}",
         flush=True,
     )
     print_replay_summary("baseline_h200", baseline_summary)

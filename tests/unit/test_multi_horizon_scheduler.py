@@ -31,6 +31,7 @@ def test_primary_control_horizon_switches_immediately() -> None:
     assert decision.switch is True
     assert decision.reason == "primary"
     assert scheduler.pending_due_ms is None
+    assert scheduler.last_switch_ms == pytest.approx(1000.0)
 
 
 def test_far_horizon_arms_interpolated_pending_switch() -> None:
@@ -73,6 +74,7 @@ def test_pending_requires_warning_to_persist_until_due() -> None:
     assert executed.switch is True
     assert executed.reason == "pending_execute"
     assert scheduler.pending_due_ms is None
+    assert scheduler.last_switch_ms == pytest.approx(1080.0)
 
 
 def test_pending_is_cancelled_when_far_warning_disappears() -> None:
@@ -125,6 +127,77 @@ def test_primary_signal_overrides_pending_delay() -> None:
     assert decision.switch is True
     assert decision.reason == "primary"
     assert scheduler.pending_due_ms is None
+
+
+def test_minimum_state_hold_suppresses_immediate_primary_reversal() -> None:
+    scheduler = make_scheduler()
+    first = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    assert first.switch is True
+
+    blocked = scheduler.update(
+        timestamp_ms=1099.0,
+        probabilities=(0.95, 0.90, 0.80),
+        current_pressed=True,
+    )
+    eligible = scheduler.update(
+        timestamp_ms=1100.0,
+        probabilities=(0.95, 0.90, 0.80),
+        current_pressed=True,
+    )
+
+    assert blocked.switch is False
+    assert blocked.reason == "min_hold"
+    assert eligible.switch is True
+    assert eligible.reason == "primary"
+
+
+def test_minimum_state_hold_does_not_arm_pending_transition() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+
+    blocked = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.1, 0.2, 0.8),
+        current_pressed=True,
+    )
+
+    assert blocked.switch is False
+    assert blocked.reason == "min_hold"
+    assert scheduler.pending_due_ms is None
+
+
+def test_zero_minimum_state_hold_preserves_immediate_reversal() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=0.0,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+
+    reversal = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.95, 0.90, 0.80),
+        current_pressed=True,
+    )
+
+    assert reversal.switch is True
+    assert reversal.reason == "primary"
 
 
 def test_state_change_invalidates_old_pending_switch() -> None:

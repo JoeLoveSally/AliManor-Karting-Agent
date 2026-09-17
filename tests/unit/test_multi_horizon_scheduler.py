@@ -142,6 +142,49 @@ def test_pending_requires_warning_to_persist_until_due() -> None:
     assert scheduler.last_switch_ms == pytest.approx(1080.0)
 
 
+def test_pending_deadline_can_be_consumed_without_new_model_observation() -> None:
+    scheduler = make_scheduler()
+    armed = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.55, 0.80),
+        current_pressed=False,
+    )
+    assert armed.pending_due_ms == pytest.approx(1020.0)
+
+    early = scheduler.execute_pending_if_due(
+        timestamp_ms=1019.9,
+        current_pressed=False,
+    )
+    executed = scheduler.execute_pending_if_due(
+        timestamp_ms=1020.0,
+        current_pressed=False,
+    )
+
+    assert early is None
+    assert scheduler.pending_due_ms is None
+    assert executed is not None
+    assert executed.state_before is False
+    assert executed.due_at_ms == pytest.approx(1020.0)
+    assert scheduler.last_switch_ms == pytest.approx(1020.0)
+
+
+def test_pending_deadline_rejects_stale_state() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.55, 0.80),
+        current_pressed=False,
+    )
+
+    executed = scheduler.execute_pending_if_due(
+        timestamp_ms=1020.0,
+        current_pressed=True,
+    )
+
+    assert executed is None
+    assert scheduler.pending_due_ms is None
+
+
 def test_pending_is_cancelled_when_far_warning_disappears() -> None:
     scheduler = make_scheduler()
     scheduler.update(

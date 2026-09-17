@@ -10,7 +10,6 @@ current model predicts them reliably on held-out expert-conditioned samples.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import json
 from pathlib import Path
 import sys
@@ -346,7 +345,7 @@ def main() -> int:
             transitions = sum(left != right for left, right in zip(truth, truth[1:]))
             if transitions == 0:
                 continue
-            top = Counter(row).most_common(5)
+            top = sorted(row.items(), key=lambda item: (-item[1], item[0]))[:5]
             print(
                 f"  {truth}: " + ", ".join(f"{pred}={count}" for pred, count in top),
                 flush=True,

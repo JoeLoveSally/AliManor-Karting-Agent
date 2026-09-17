@@ -1,5 +1,6 @@
 import io
 from pathlib import Path
+from queue import Queue
 import subprocess
 
 import cv2
@@ -146,7 +147,7 @@ def test_adb_video_input_builds_scaled_screenrecord_command() -> None:
     )
 
 
-def test_adb_video_input_records_same_stream_to_fragmented_mp4(tmp_path: Path) -> None:
+def test_adb_video_input_decodes_only_one_ffmpeg_output_when_recording(tmp_path: Path) -> None:
     record_path = tmp_path / "run.mp4"
     video = AdbVideoInput(
         AdbClient(),
@@ -154,32 +155,16 @@ def test_adb_video_input_records_same_stream_to_fragmented_mp4(tmp_path: Path) -
         record_path=record_path,
     )
 
-    command = video._ffmpeg_command()
-    assert command[:11] == (
+    assert video._ffmpeg_command() == (
         "ffmpeg",
         "-loglevel",
         "error",
-        "-use_wallclock_as_timestamps",
-        "1",
         "-f",
         "h264",
         "-flags",
         "low_delay",
         "-i",
         "pipe:0",
-    )
-    assert command[11:20] == (
-        "-map",
-        "0:v:0",
-        "-an",
-        "-c:v",
-        "copy",
-        "-movflags",
-        "+frag_keyframe+empty_moov+default_base_moof",
-        "-y",
-        str(record_path.resolve()),
-    )
-    assert command[-8:] == (
         "-map",
         "0:v:0",
         "-an",
@@ -189,6 +174,30 @@ def test_adb_video_input_records_same_stream_to_fragmented_mp4(tmp_path: Path) -
         "rawvideo",
         "pipe:1",
     )
+    assert "-use_wallclock_as_timestamps" not in video._ffmpeg_command()
+    assert "copy" not in video._ffmpeg_command()
+
+
+def test_adb_video_input_marks_recording_mapping_invalid_on_queue_overflow(
+    tmp_path: Path,
+) -> None:
+    video = AdbVideoInput(
+        AdbClient(),
+        screen_size=(20, 40),
+        record_path=tmp_path / "run.mp4",
+    )
+    video._record_queue = Queue(maxsize=1)
+    image = np.zeros((40, 20, 3), dtype=np.uint8)
+    first = Frame(image=image, frame_index=0, timestamp_ms=0.0)
+    second = Frame(image=image, frame_index=1, timestamp_ms=10.0)
+
+    video._offer_recording(first)
+    video._offer_recording(second)
+
+    assert video.recording_dropped_frames == 1
+    assert video.recording_dropped_frame_indices == [1]
+    assert video.recording_error is not None
+    assert video.recording_frame_mapping_valid is False
 
 
 def test_adb_video_input_rejects_non_mp4_recording_path(tmp_path: Path) -> None:

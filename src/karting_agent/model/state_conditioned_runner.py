@@ -10,12 +10,18 @@ import numpy as np
 
 from karting_agent.model.runner import _runtime_spec, _select_device
 from karting_agent.model.state_conditioned import build_state_conditioned_model
+from karting_agent.runtime.future_action_projection import project_switch_probabilities
 
 
 _SUPPORTED_MODEL_FAMILIES = {
     "state_conditioned_transition_v3",
     "state_conditioned_axis_v4c1",
     "state_conditioned_kart_relative_v4c2",
+}
+
+_SUPPORTED_SWITCH_PROBABILITY_SOURCES = {
+    "native_switch",
+    "future_action_projection",
 }
 
 _AUXILIARY_HEAD_PREFIXES = {
@@ -39,6 +45,18 @@ def _control_state_dict(state_dict: dict[str, object], model_family: str) -> dic
         for key, value in state_dict.items()
         if not key.startswith(prefixes)
     }
+
+
+def _switch_probability_source(metadata: dict[str, object]) -> str:
+    """Resolve the runtime switch-probability source from artifact metadata."""
+
+    source = str(metadata.get("switch_probability_source", "native_switch"))
+    if source not in _SUPPORTED_SWITCH_PROBABILITY_SOURCES:
+        expected = ", ".join(sorted(_SUPPORTED_SWITCH_PROBABILITY_SOURCES))
+        raise ValueError(
+            f"unsupported switch_probability_source {source!r}; expected one of: {expected}"
+        )
+    return source
 
 
 class StateConditionedModelRunner:
@@ -81,6 +99,7 @@ class StateConditionedModelRunner:
 
         self.metadata = metadata
         self.model_family = model_family
+        self.switch_probability_source = _switch_probability_source(metadata)
         self.spec = _runtime_spec(metadata)
         self._torch = torch
         self.device = _select_device(torch, device)
@@ -136,9 +155,21 @@ class StateConditionedModelRunner:
             dtype=self._torch.long,
         )
         with self._torch.inference_mode():
-            switch_logits, _ = self.model(tensor, state)
-            probabilities = self._torch.sigmoid(switch_logits)[0]
-        return tuple(float(value) for value in probabilities.detach().cpu().tolist())
+            switch_logits, future_logits = self.model(tensor, state)
+            if self.switch_probability_source == "native_switch":
+                probabilities = self._torch.sigmoid(switch_logits)[0]
+                return tuple(
+                    float(value) for value in probabilities.detach().cpu().tolist()
+                )
+            future_probabilities = self._torch.sigmoid(future_logits)[0]
+            future_values = tuple(
+                float(value)
+                for value in future_probabilities.detach().cpu().tolist()
+            )
+        return project_switch_probabilities(
+            future_values,
+            current_pressed=current_pressed,
+        )
 
     def predict_switch(self, inputs: np.ndarray, current_pressed: bool) -> float:
         probabilities = self.predict_switch_all(inputs, current_pressed)

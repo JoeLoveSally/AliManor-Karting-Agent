@@ -94,6 +94,17 @@ class SchedulerDecision:
 
 
 @dataclass(frozen=True)
+class PendingExecution:
+    """Metadata returned when a previously armed pending switch reaches its deadline."""
+
+    state_before: bool
+    armed_at_ms: float
+    due_at_ms: float
+    crossing_horizon_ms: float
+    delay_ms: float
+
+
+@dataclass(frozen=True)
 class _PendingSwitch:
     state_before: bool
     armed_at_ms: float
@@ -128,6 +139,42 @@ class MultiHorizonSwitchScheduler:
         self._pending = None
         self._last_timestamp_ms = None
         self._last_switch_ms = None
+
+    def execute_pending_if_due(
+        self,
+        *,
+        timestamp_ms: float,
+        current_pressed: bool,
+    ) -> PendingExecution | None:
+        """Consume an armed pending transition once its fixed deadline is reached.
+
+        This path performs no model inference. It is intended for a runtime timer
+        that has already kept the warning alive through normal scheduler updates.
+        A state mismatch invalidates the pending transition instead of executing it.
+        """
+
+        timestamp_ms = float(timestamp_ms)
+        if not math.isfinite(timestamp_ms):
+            raise ValueError("timestamp_ms must be finite")
+        current_pressed = bool(current_pressed)
+        pending = self._pending
+        if pending is None:
+            return None
+        if pending.state_before != current_pressed:
+            self._pending = None
+            return None
+        if timestamp_ms + 1e-6 < pending.due_at_ms:
+            return None
+
+        self._pending = None
+        self._last_switch_ms = timestamp_ms
+        return PendingExecution(
+            state_before=pending.state_before,
+            armed_at_ms=pending.armed_at_ms,
+            due_at_ms=pending.due_at_ms,
+            crossing_horizon_ms=pending.crossing_horizon_ms,
+            delay_ms=pending.delay_ms,
+        )
 
     def _validated_probabilities(self, values: Sequence[float]) -> tuple[float, ...]:
         probabilities = tuple(float(value) for value in values)

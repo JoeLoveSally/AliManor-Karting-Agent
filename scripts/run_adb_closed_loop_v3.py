@@ -329,14 +329,14 @@ def main() -> int:
         {
             "path": str(recording_path),
             "format": "mp4",
-            "codec": "mp4v",
+            "codec": "h264",
             "resolution": [video_input.decode_width, video_input.decode_height]
             if video_input is not None
             else None,
-            "timing": "cfr_visual_only",
+            "timing": "synthetic_cfr_stream_copy",
             "fps": video_input.recording_fps if video_input is not None else None,
             "frame_count": video_input.recorded_frames if video_input is not None else None,
-            "source_frame_mapping": "mp4_frame_index_equals_decoded_frame_index",
+            "source_frame_mapping": "shared_h264_frame_order_matches_decoded_frame_index",
             "frame_mapping_valid": (
                 video_input.recording_frame_mapping_valid
                 if video_input is not None

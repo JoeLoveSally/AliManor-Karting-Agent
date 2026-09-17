@@ -1,6 +1,5 @@
 import io
 from pathlib import Path
-from queue import Queue
 import subprocess
 
 import cv2
@@ -147,7 +146,9 @@ def test_adb_video_input_builds_scaled_screenrecord_command() -> None:
     )
 
 
-def test_adb_video_input_decodes_only_one_ffmpeg_output_when_recording(tmp_path: Path) -> None:
+def test_adb_video_input_stream_copies_debug_mp4_with_synthetic_cfr(
+    tmp_path: Path,
+) -> None:
     record_path = tmp_path / "run.mp4"
     video = AdbVideoInput(
         AdbClient(),
@@ -155,16 +156,36 @@ def test_adb_video_input_decodes_only_one_ffmpeg_output_when_recording(tmp_path:
         record_path=record_path,
     )
 
-    assert video._ffmpeg_command() == (
+    command = video._ffmpeg_command()
+    assert command[:15] == (
         "ffmpeg",
         "-loglevel",
         "error",
+        "-fflags",
+        "+genpts",
+        "-r",
+        "60",
         "-f",
         "h264",
         "-flags",
         "low_delay",
         "-i",
         "pipe:0",
+        "-map",
+        "0:v:0",
+    )
+    assert command[15:24] == (
+        "-an",
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-y",
+        str(record_path.resolve()),
+        "-map",
+        "0:v:0",
+    )
+    assert command[-8:] == (
         "-map",
         "0:v:0",
         "-an",
@@ -174,11 +195,10 @@ def test_adb_video_input_decodes_only_one_ffmpeg_output_when_recording(tmp_path:
         "rawvideo",
         "pipe:1",
     )
-    assert "-use_wallclock_as_timestamps" not in video._ffmpeg_command()
-    assert "copy" not in video._ffmpeg_command()
+    assert "-use_wallclock_as_timestamps" not in command
 
 
-def test_adb_video_input_marks_recording_mapping_invalid_on_queue_overflow(
+def test_adb_video_input_recording_mapping_requires_healthy_shared_stream(
     tmp_path: Path,
 ) -> None:
     video = AdbVideoInput(
@@ -186,17 +206,12 @@ def test_adb_video_input_marks_recording_mapping_invalid_on_queue_overflow(
         screen_size=(20, 40),
         record_path=tmp_path / "run.mp4",
     )
-    video._record_queue = Queue(maxsize=1)
-    image = np.zeros((40, 20, 3), dtype=np.uint8)
-    first = Frame(image=image, frame_index=0, timestamp_ms=0.0)
-    second = Frame(image=image, frame_index=1, timestamp_ms=10.0)
+    video.decoded_frame_timestamps_ms.extend([0.0, 16.7])
+    video.recorded_frames = 2
 
-    video._offer_recording(first)
-    video._offer_recording(second)
+    assert video.recording_frame_mapping_valid is True
 
-    assert video.recording_dropped_frames == 1
-    assert video.recording_dropped_frame_indices == [1]
-    assert video.recording_error is not None
+    video.recording_error = "ffmpeg failed"
     assert video.recording_frame_mapping_valid is False
 
 

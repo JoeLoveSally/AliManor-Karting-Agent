@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.60)
     parser.add_argument("--control-horizon-ms", type=float, default=200.0)
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
+    parser.add_argument("--pending-advance-ms", type=float, default=0.0)
     parser.add_argument("--tolerance-ms", type=float, default=None)
     return parser.parse_args()
 
@@ -420,11 +421,19 @@ def main() -> int:
     artifact = artifact_dir(raw)
     model_path = args.model.resolve() if args.model else artifact / "model.pt"
     metadata_path = args.metadata.resolve() if args.metadata else artifact / "metadata.json"
-    output_path = (
-        args.output.resolve()
-        if args.output
-        else artifact / "evaluation" / f"{args.split}_multi_horizon_scheduler.json"
-    )
+    if args.output:
+        output_path = args.output.resolve()
+    else:
+        suffix = (
+            ""
+            if abs(float(args.pending_advance_ms)) < 1e-9
+            else f"_advance_{float(args.pending_advance_ms):g}ms"
+        )
+        output_path = (
+            artifact
+            / "evaluation"
+            / f"{args.split}_multi_horizon_scheduler{suffix}.json"
+        )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     model_family = str(metadata.get("model_family", ""))
@@ -438,6 +447,7 @@ def main() -> int:
         control_horizon_ms=float(args.control_horizon_ms),
         anticipation_horizon_ms=float(args.anticipation_horizon_ms),
         threshold=float(args.threshold),
+        pending_advance_ms=float(args.pending_advance_ms),
     )
     scheduler_config.validate()
     control_index = horizons.index(scheduler_config.control_horizon_ms)
@@ -557,7 +567,8 @@ def main() -> int:
         f"split={args.split} samples={len(samples)} device={device} "
         f"threshold={args.threshold:.2f} "
         f"control_h={scheduler_config.control_horizon_ms:g}ms "
-        f"anticipation_h={scheduler_config.anticipation_horizon_ms:g}ms",
+        f"anticipation_h={scheduler_config.anticipation_horizon_ms:g}ms "
+        f"pending_advance={scheduler_config.pending_advance_ms:g}ms",
         flush=True,
     )
     print_replay_summary("baseline_h200", baseline_summary)

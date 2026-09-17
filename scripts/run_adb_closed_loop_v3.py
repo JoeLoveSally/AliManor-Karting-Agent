@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
     parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
+    parser.add_argument("--pending-advance-ms", type=float, default=0.0)
     parser.add_argument("--arm", action="store_true")
     parser.add_argument("--wait-for-start", action="store_true")
     parser.add_argument(
@@ -89,6 +90,8 @@ def main() -> int:
         raise ValueError("--switch-threshold must be in (0, 1)")
     if args.min_state_hold_ms < 0:
         raise ValueError("--min-state-hold-ms must be >= 0")
+    if args.pending_advance_ms < 0:
+        raise ValueError("--pending-advance-ms must be >= 0")
     if args.wait_for_start and not args.arm:
         raise ValueError("--wait-for-start requires --arm")
 
@@ -143,6 +146,7 @@ def main() -> int:
                 anticipation_horizon_ms=float(args.anticipation_horizon_ms),
                 threshold=args.switch_threshold,
                 min_state_hold_ms=float(args.min_state_hold_ms),
+                pending_advance_ms=float(args.pending_advance_ms),
             )
         )
 
@@ -202,6 +206,7 @@ def main() -> int:
         runtime_detail += (
             f", anticipation_horizon={scheduler.config.anticipation_horizon_ms:g}ms"
             f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
+            f", pending_advance={scheduler.config.pending_advance_ms:g}ms"
         )
     print(runtime_detail, flush=True)
     if recording_path is not None:

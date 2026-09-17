@@ -282,6 +282,108 @@ def test_minimum_state_hold_does_not_arm_pending_transition() -> None:
     assert scheduler.pending_due_ms is None
 
 
+def test_minimum_hold_can_arm_pending_without_early_execution() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            arm_pending_during_min_hold=True,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+
+    armed = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.1, 0.59, 0.9),
+        current_pressed=True,
+    )
+
+    assert armed.switch is False
+    assert armed.reason == "pending_armed"
+    assert armed.pending_due_ms == pytest.approx(1100.0)
+    assert armed.pending_delay_ms == pytest.approx(50.0)
+    assert scheduler.execute_pending_if_due(
+        timestamp_ms=1099.0,
+        current_pressed=True,
+    ) is None
+
+    executed = scheduler.execute_pending_if_due(
+        timestamp_ms=1100.0,
+        current_pressed=True,
+    )
+    assert executed is not None
+    assert executed.due_at_ms == pytest.approx(1100.0)
+    assert scheduler.last_switch_ms == pytest.approx(1100.0)
+
+
+def test_minimum_hold_preserves_later_natural_pending_deadline() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            arm_pending_during_min_hold=True,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+
+    armed = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.1, 0.2, 0.8),
+        current_pressed=True,
+    )
+
+    assert armed.reason == "pending_armed"
+    assert armed.pending_due_ms == pytest.approx(1116.6666667)
+    assert armed.pending_delay_ms == pytest.approx(66.6666667)
+
+
+def test_minimum_hold_pending_is_cancelled_when_warning_disappears() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            arm_pending_during_min_hold=True,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.1, 0.2, 0.8),
+        current_pressed=True,
+    )
+
+    cancelled = scheduler.update(
+        timestamp_ms=1070.0,
+        probabilities=(0.1, 0.1, 0.4),
+        current_pressed=True,
+    )
+
+    assert cancelled.switch is False
+    assert cancelled.reason == "pending_cancelled"
+    assert scheduler.pending_due_ms is None
+
+
 def test_zero_minimum_state_hold_preserves_immediate_reversal() -> None:
     scheduler = MultiHorizonSwitchScheduler(
         MultiHorizonSchedulerConfig(

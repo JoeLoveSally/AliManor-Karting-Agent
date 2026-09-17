@@ -9,6 +9,7 @@ from karting_agent.model.runner import _runtime_spec
 from karting_agent.model.state_conditioned_runner import (
     _SUPPORTED_MODEL_FAMILIES,
     _control_state_dict,
+    _switch_probability_source,
 )
 
 
@@ -43,6 +44,24 @@ def test_v4c2_runtime_strips_only_auxiliary_heads() -> None:
         "heading_error_head.weight",
         "edge_risk_head.weight",
     }
+
+
+def test_switch_probability_source_defaults_to_native_head() -> None:
+    assert _switch_probability_source({}) == "native_switch"
+
+
+def test_switch_probability_source_accepts_future_action_projection() -> None:
+    assert (
+        _switch_probability_source(
+            {"switch_probability_source": "future_action_projection"}
+        )
+        == "future_action_projection"
+    )
+
+
+def test_switch_probability_source_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="unsupported switch_probability_source"):
+        _switch_probability_source({"switch_probability_source": "bad"})
 
 
 def test_runtime_spec_accepts_legacy_config_path(tmp_path: Path) -> None:

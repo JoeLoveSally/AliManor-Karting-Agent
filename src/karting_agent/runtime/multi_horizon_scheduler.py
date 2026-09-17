@@ -11,6 +11,7 @@ SchedulerReason = Literal[
     "hold",
     "min_hold",
     "primary",
+    "short_overdue",
     "pending_armed",
     "pending_wait",
     "pending_execute",
@@ -42,6 +43,14 @@ class MultiHorizonSchedulerConfig:
     gate rather than an observation blind spot: monotonic anticipation warnings
     may arm and remain pending during the hold, but their deadline is clamped to
     the hold expiry so no reversal can execute before ``min_state_hold_ms``.
+
+    ``execute_short_horizon_overdue`` handles the complementary non-monotonic
+    pattern where a horizon shorter than the deployed control horizon already
+    predicts a switch while the control horizon does not. Under the deployed
+    control-horizon semantics that means a short correction lies before the
+    controller's nominal target time, so once the minimum hold has expired the
+    next switch is treated as overdue and executed immediately. This remains
+    model-only runtime logic; no analytic visual teacher is used online.
     """
 
     horizons_ms: tuple[float, ...]
@@ -52,6 +61,7 @@ class MultiHorizonSchedulerConfig:
     min_state_hold_ms: float = 100.0
     pending_advance_ms: float = 0.0
     arm_pending_during_min_hold: bool = False
+    execute_short_horizon_overdue: bool = False
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 2:
@@ -120,7 +130,7 @@ class _PendingSwitch:
 
 
 class MultiHorizonSwitchScheduler:
-    """Use a far-horizon warning to schedule, not immediately execute, a switch."""
+    """Use learned multi-horizon state forecasts to time the next switch."""
 
     def __init__(self, config: MultiHorizonSchedulerConfig) -> None:
         config.validate()
@@ -202,6 +212,15 @@ class MultiHorizonSwitchScheduler:
             left <= right + tolerance for left, right in zip(values, values[1:])
         )
 
+    def _short_horizon_overdue(self, probabilities: tuple[float, ...]) -> bool:
+        if not self.config.execute_short_horizon_overdue:
+            return False
+        threshold = self.config.threshold
+        return any(
+            probability >= threshold
+            for probability in probabilities[: self._control_index]
+        )
+
     def _candidate(
         self,
         probabilities: tuple[float, ...],
@@ -256,7 +275,7 @@ class MultiHorizonSwitchScheduler:
         self,
         *,
         timestamp_ms: float,
-        reason: Literal["primary", "pending_execute"],
+        reason: Literal["primary", "short_overdue", "pending_execute"],
         current_pressed: bool,
         probabilities: tuple[float, ...],
         crossing_horizon_ms: float | None = None,
@@ -324,6 +343,7 @@ class MultiHorizonSwitchScheduler:
             )
 
         control = probabilities[self._control_index]
+        short_overdue = self._short_horizon_overdue(probabilities)
         if not inside_min_hold and control >= self.config.threshold:
             return self._switch_decision(
                 timestamp_ms=timestamp_ms,
@@ -331,11 +351,23 @@ class MultiHorizonSwitchScheduler:
                 current_pressed=current_pressed,
                 probabilities=probabilities,
             )
+        if not inside_min_hold and control < self.config.threshold and short_overdue:
+            return self._switch_decision(
+                timestamp_ms=timestamp_ms,
+                reason="short_overdue",
+                current_pressed=current_pressed,
+                probabilities=probabilities,
+            )
 
         candidate = self._candidate(probabilities)
         if self._pending is not None:
             pending = self._pending
-            if candidate is None:
+            warning_valid = (
+                candidate is not None
+                or control >= self.config.threshold
+                or short_overdue
+            )
+            if not warning_valid:
                 self._pending = None
                 return self._decision(
                     timestamp_ms=timestamp_ms,

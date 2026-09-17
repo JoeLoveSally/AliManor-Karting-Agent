@@ -101,6 +101,14 @@ def parse_args() -> argparse.Namespace:
             "hold while clamping execution to the hold expiry."
         ),
     )
+    parser.add_argument(
+        "--execute-short-horizon-overdue",
+        action="store_true",
+        help=(
+            "Treat a shorter-than-control horizon crossing with a low control "
+            "probability as an overdue short correction once the state hold expires."
+        ),
+    )
     parser.add_argument("--tolerance-ms", type=float, default=None)
     return parser.parse_args()
 
@@ -437,6 +445,8 @@ def main() -> int:
             suffix_parts.append(f"advance_{float(args.pending_advance_ms):g}ms")
         if args.arm_pending_during_min_hold:
             suffix_parts.append("hold_arm")
+        if args.execute_short_horizon_overdue:
+            suffix_parts.append("short_overdue")
         suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
         output_path = (
             artifact
@@ -458,6 +468,7 @@ def main() -> int:
         threshold=float(args.threshold),
         pending_advance_ms=float(args.pending_advance_ms),
         arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
+        execute_short_horizon_overdue=bool(args.execute_short_horizon_overdue),
     )
     scheduler_config.validate()
     control_index = horizons.index(scheduler_config.control_horizon_ms)
@@ -579,7 +590,8 @@ def main() -> int:
         f"control_h={scheduler_config.control_horizon_ms:g}ms "
         f"anticipation_h={scheduler_config.anticipation_horizon_ms:g}ms "
         f"pending_advance={scheduler_config.pending_advance_ms:g}ms "
-        f"hold_arm={scheduler_config.arm_pending_during_min_hold}",
+        f"hold_arm={scheduler_config.arm_pending_during_min_hold} "
+        f"short_overdue={scheduler_config.execute_short_horizon_overdue}",
         flush=True,
     )
     print_replay_summary("baseline_h200", baseline_summary)

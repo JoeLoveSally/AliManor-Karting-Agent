@@ -32,6 +32,7 @@ from karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402
     MultiHorizonSwitchScheduler,
 )
 from karting_agent.runtime.state_conditioned_engine import (  # noqa: E402
+    DeadlineControlEvent,
     StateConditionedRuntimeConfig,
     StateConditionedRuntimeEngine,
 )
@@ -71,6 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
     parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
     parser.add_argument("--pending-advance-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--execute-pending-at-due",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Execute a still-valid pending transition on its exact timer deadline; "
+            "while pending, recheck the warning on every arriving video frame."
+        ),
+    )
     parser.add_argument("--arm", action="store_true")
     parser.add_argument("--wait-for-start", action="store_true")
     parser.add_argument(
@@ -92,6 +102,8 @@ def main() -> int:
         raise ValueError("--min-state-hold-ms must be >= 0")
     if args.pending_advance_ms < 0:
         raise ValueError("--pending-advance-ms must be >= 0")
+    if args.execute_pending_at_due and not args.multi_horizon_scheduler:
+        raise ValueError("--execute-pending-at-due requires --multi-horizon-scheduler")
     if args.wait_for_start and not args.arm:
         raise ValueError("--wait-for-start requires --arm")
 
@@ -160,6 +172,7 @@ def main() -> int:
             frame_offsets_ms=model.spec.frame_offsets_ms,
             prediction_horizon_ms=model.spec.prediction_horizon_ms,
             switch_threshold=args.switch_threshold,
+            execute_pending_at_due=bool(args.execute_pending_at_due),
         ),
         initial_pressed=False,
         scheduler=scheduler,
@@ -207,12 +220,14 @@ def main() -> int:
             f", anticipation_horizon={scheduler.config.anticipation_horizon_ms:g}ms"
             f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
             f", pending_advance={scheduler.config.pending_advance_ms:g}ms"
+            f", execute_pending_at_due={args.execute_pending_at_due}"
         )
     print(runtime_detail, flush=True)
     if recording_path is not None:
         print(f"Debug recording: {recording_path}", flush=True)
 
     steps = []
+    deadline_events: list[DeadlineControlEvent] = []
     input_frames = 0
     read_frame_timestamps_ms: list[float] = []
     stop_reason = "duration"
@@ -224,6 +239,17 @@ def main() -> int:
     decoded_end = dropped_end = interval_end = 0
     control_start_source_frame: int | None = None
     control_start_timestamp_ms: float | None = None
+
+    def collect_deadline_events() -> None:
+        for event in engine.drain_deadline_events():
+            deadline_events.append(event)
+            print(
+                f"t={event.timestamp_ms:8.1f}ms action={event.action.value:<7} "
+                f"state={'PRESS' if event.pressed else 'RELEASE':<7} "
+                f"reason={event.scheduler_reason} "
+                f"timer_late={event.timer_lateness_ms:.2f}ms",
+                flush=True,
+            )
 
     try:
         pending_frame = None
@@ -269,6 +295,7 @@ def main() -> int:
             else:
                 frame = pending_frame
                 pending_frame = None
+            collect_deadline_events()
             input_frames += 1
             read_frame_timestamps_ms.append(frame.timestamp_ms)
             step = engine.ingest(frame)
@@ -297,7 +324,10 @@ def main() -> int:
                             scheduler.config.horizons_ms, step.probabilities
                         )
                     )
-                    suffix += f" reason={step.scheduler_reason} [{probabilities}]"
+                    suffix += (
+                        f" reason={step.scheduler_reason} [{probabilities}]"
+                        f" trigger={step.inference_trigger}"
+                    )
                     if step.pending_due_ms is not None:
                         suffix += f" pending_due={step.pending_due_ms:.1f}ms"
                 print(
@@ -307,6 +337,7 @@ def main() -> int:
                     f"{input_detail}infer={step.inference_ms:.2f}ms{suffix}",
                     flush=True,
                 )
+            collect_deadline_events()
     except KeyboardInterrupt:
         stop_reason = "keyboard_interrupt"
         print("Interrupted; requesting safety RELEASE...", flush=True)
@@ -317,7 +348,9 @@ def main() -> int:
             dropped_end = video_input.dropped_frames
             interval_end = len(video_input.decode_intervals_ms)
         try:
+            collect_deadline_events()
             safety_release = engine.shutdown()
+            collect_deadline_events()
         except Exception as exc:
             shutdown_error = str(exc)
             print(f"WARNING: safety RELEASE failed: {exc}", file=sys.stderr, flush=True)
@@ -328,13 +361,17 @@ def main() -> int:
     elapsed = ended - started if started is not None and ended is not None else 0.0
     inference_stats = legacy.stats([step.inference_ms for step in steps])
     execute_stats = legacy.stats(executor.execute_latencies_ms) if args.arm else legacy.stats([])
-    state_changes = sum(step.action is not ControlAction.HOLD for step in steps)
-    control_fps = len(steps) / elapsed if elapsed > 0 else 0.0
-    scheduler_events = (
-        dict(sorted(Counter(step.scheduler_reason for step in steps).items()))
-        if scheduler is not None
-        else None
+    state_changes = (
+        sum(step.action is not ControlAction.HOLD for step in steps)
+        + len(deadline_events)
     )
+    control_fps = len(steps) / elapsed if elapsed > 0 else 0.0
+    scheduler_counter = Counter(
+        step.scheduler_reason for step in steps if step.scheduler_reason is not None
+    )
+    scheduler_counter.update(event.scheduler_reason for event in deadline_events)
+    scheduler_events = dict(sorted(scheduler_counter.items())) if scheduler is not None else None
+    inference_triggers = dict(sorted(Counter(step.inference_trigger for step in steps).items()))
 
     if video_input is not None:
         decode_intervals = video_input.decode_intervals_ms[interval_start:interval_end]
@@ -383,6 +420,22 @@ def main() -> int:
         print(
             "Scheduler events: "
             + ", ".join(f"{key}={value}" for key, value in scheduler_events.items()),
+            flush=True,
+        )
+    if args.execute_pending_at_due:
+        print(
+            "Inference triggers: "
+            + ", ".join(f"{key}={value}" for key, value in inference_triggers.items()),
+            flush=True,
+        )
+        deadline_lateness = legacy.stats(
+            [event.timer_lateness_ms for event in deadline_events]
+        )
+        print(
+            f"Deadline timer: events={len(deadline_events)} "
+            f"late_mean={deadline_lateness['mean_ms']:.2f}ms "
+            f"late_p95={deadline_lateness['p95_ms']:.2f}ms "
+            f"late_max={deadline_lateness['max_ms']:.2f}ms",
             flush=True,
         )
 
@@ -457,6 +510,7 @@ def main() -> int:
             "prediction_horizons_ms": model.spec.prediction_horizons_ms,
             "frame_offsets_ms": model.spec.frame_offsets_ms,
             "initial_pressed": False,
+            "execute_pending_at_due": bool(args.execute_pending_at_due),
             "multi_horizon_scheduler": (
                 asdict(scheduler.config) if scheduler is not None else None
             ),
@@ -464,10 +518,14 @@ def main() -> int:
         "capture": capture_payload,
         "recording": recording_payload,
         "inference": {"steps": len(steps), "fps": control_fps, **inference_stats},
+        "inference_triggers": inference_triggers,
         "execute": {"semantics": "persistent_shell_enqueue", **execute_stats}
         if args.arm
         else None,
         "scheduler_events": scheduler_events,
+        "deadline_events": [
+            {**asdict(event), "action": event.action.value} for event in deadline_events
+        ],
         "state_changes": state_changes,
         "safety_release": safety_release,
         "shutdown_error": shutdown_error,

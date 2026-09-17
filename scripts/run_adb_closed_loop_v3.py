@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -25,6 +26,10 @@ from karting_agent.data_flow.input.adb import AdbInput  # noqa: E402
 from karting_agent.data_flow.input.adb_video import AdbVideoInput  # noqa: E402
 from karting_agent.model.state_conditioned_runner import (  # noqa: E402
     StateConditionedModelRunner,
+)
+from karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402
+    MultiHorizonSchedulerConfig,
+    MultiHorizonSwitchScheduler,
 )
 from karting_agent.runtime.state_conditioned_engine import (  # noqa: E402
     StateConditionedRuntimeConfig,
@@ -58,6 +63,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seconds", type=float, default=5.0)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--switch-threshold", type=float, default=0.6)
+    parser.add_argument(
+        "--multi-horizon-scheduler",
+        action="store_true",
+        help="Use the selected metadata control horizon with a farther anticipation horizon.",
+    )
+    parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
+    parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
     parser.add_argument("--arm", action="store_true")
     parser.add_argument("--wait-for-start", action="store_true")
     parser.add_argument(
@@ -75,6 +87,8 @@ def main() -> int:
         raise ValueError("--max-seconds must be > 0")
     if not 0.0 < args.switch_threshold < 1.0:
         raise ValueError("--switch-threshold must be in (0, 1)")
+    if args.min_state_hold_ms < 0:
+        raise ValueError("--min-state-hold-ms must be >= 0")
     if args.wait_for_start and not args.arm:
         raise ValueError("--wait-for-start requires --arm")
 
@@ -120,6 +134,18 @@ def main() -> int:
     else:
         executor = MockExecutor()
 
+    scheduler = None
+    if args.multi_horizon_scheduler:
+        scheduler = MultiHorizonSwitchScheduler(
+            MultiHorizonSchedulerConfig(
+                horizons_ms=model.spec.prediction_horizons_ms,
+                control_horizon_ms=model.spec.control_horizon_ms,
+                anticipation_horizon_ms=float(args.anticipation_horizon_ms),
+                threshold=args.switch_threshold,
+                min_state_hold_ms=float(args.min_state_hold_ms),
+            )
+        )
+
     target_fps = float(runtime_raw.get("target_fps", 30.0))
     engine = StateConditionedRuntimeEngine(
         model=model,
@@ -132,6 +158,7 @@ def main() -> int:
             switch_threshold=args.switch_threshold,
         ),
         initial_pressed=False,
+        scheduler=scheduler,
     )
 
     video_input: AdbVideoInput | None = None
@@ -148,7 +175,12 @@ def main() -> int:
         adb_input = AdbInput(client)
 
     mode = "ARMED" if args.arm else "DRY-RUN"
-    print(f"Mode: {mode}; policy=v3-state-conditioned; input={args.input}", flush=True)
+    policy = (
+        "v3-state-conditioned-multi-horizon"
+        if scheduler is not None
+        else "v3-state-conditioned"
+    )
+    print(f"Mode: {mode}; policy={policy}; input={args.input}", flush=True)
     print(
         f"ADB: serial={client.config.serial or '<default>'}; "
         f"screen={screen_width}x{screen_height}",
@@ -161,12 +193,17 @@ def main() -> int:
         f"warmup first={warmup[0]:.2f}ms last={warmup[-1]:.2f}ms",
         flush=True,
     )
-    print(
+    runtime_detail = (
         f"Runtime: target_fps={target_fps:g}, offsets={model.spec.frame_offsets_ms}, "
         f"switch_horizon={model.spec.prediction_horizon_ms:g}ms, "
-        f"switch_threshold={args.switch_threshold:.2f}",
-        flush=True,
+        f"switch_threshold={args.switch_threshold:.2f}"
     )
+    if scheduler is not None:
+        runtime_detail += (
+            f", anticipation_horizon={scheduler.config.anticipation_horizon_ms:g}ms"
+            f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
+        )
+    print(runtime_detail, flush=True)
     if recording_path is not None:
         print(f"Debug recording: {recording_path}", flush=True)
 
@@ -233,7 +270,11 @@ def main() -> int:
             if step is None:
                 continue
             steps.append(step)
-            if args.verbose or step.action is not ControlAction.HOLD:
+            scheduler_event = step.scheduler_reason in {
+                "pending_armed",
+                "pending_cancelled",
+            }
+            if args.verbose or step.action is not ControlAction.HOLD or scheduler_event:
                 if video_input is None:
                     input_detail = f"capture={adb_input.last_capture_ms:.1f}ms "
                 else:
@@ -243,7 +284,17 @@ def main() -> int:
                     )
                 suffix = ""
                 if args.arm and step.action is not ControlAction.HOLD:
-                    suffix = f" enqueue={executor.last_execute_ms:.2f}ms"
+                    suffix += f" enqueue={executor.last_execute_ms:.2f}ms"
+                if scheduler is not None:
+                    probabilities = ",".join(
+                        f"h{horizon:g}={probability:.3f}"
+                        for horizon, probability in zip(
+                            scheduler.config.horizons_ms, step.probabilities
+                        )
+                    )
+                    suffix += f" reason={step.scheduler_reason} [{probabilities}]"
+                    if step.pending_due_ms is not None:
+                        suffix += f" pending_due={step.pending_due_ms:.1f}ms"
                 print(
                     f"t={step.observation_timestamp_ms:8.1f}ms "
                     f"p_switch={step.probability:.3f} action={step.action.value:<7} "
@@ -274,6 +325,11 @@ def main() -> int:
     execute_stats = legacy.stats(executor.execute_latencies_ms) if args.arm else legacy.stats([])
     state_changes = sum(step.action is not ControlAction.HOLD for step in steps)
     control_fps = len(steps) / elapsed if elapsed > 0 else 0.0
+    scheduler_events = (
+        dict(sorted(Counter(step.scheduler_reason for step in steps).items()))
+        if scheduler is not None
+        else None
+    )
 
     if video_input is not None:
         decode_intervals = video_input.decode_intervals_ms[interval_start:interval_end]
@@ -315,6 +371,13 @@ def main() -> int:
             f"state_changes={state_changes} control_fps={control_fps:.1f} "
             f"infer_mean={inference_stats['mean_ms']:.2f}ms "
             f"infer_p95={inference_stats['p95_ms']:.2f}ms safety_release={safety_release}",
+            flush=True,
+        )
+
+    if scheduler_events is not None:
+        print(
+            "Scheduler events: "
+            + ", ".join(f"{key}={value}" for key, value in scheduler_events.items()),
             flush=True,
         )
 
@@ -369,7 +432,11 @@ def main() -> int:
 
     payload = {
         "mode": mode,
-        "policy": "state_conditioned_transition_v3",
+        "policy": (
+            "state_conditioned_transition_v3_multi_horizon"
+            if scheduler is not None
+            else "state_conditioned_transition_v3"
+        ),
         "input_mode": args.input,
         "wait_for_start": args.wait_for_start,
         "stop_reason": stop_reason,
@@ -382,8 +449,12 @@ def main() -> int:
             "target_fps": target_fps,
             "switch_threshold": args.switch_threshold,
             "prediction_horizon_ms": model.spec.prediction_horizon_ms,
+            "prediction_horizons_ms": model.spec.prediction_horizons_ms,
             "frame_offsets_ms": model.spec.frame_offsets_ms,
             "initial_pressed": False,
+            "multi_horizon_scheduler": (
+                asdict(scheduler.config) if scheduler is not None else None
+            ),
         },
         "capture": capture_payload,
         "recording": recording_payload,
@@ -391,6 +462,7 @@ def main() -> int:
         "execute": {"semantics": "persistent_shell_enqueue", **execute_stats}
         if args.arm
         else None,
+        "scheduler_events": scheduler_events,
         "state_changes": state_changes,
         "safety_release": safety_release,
         "shutdown_error": shutdown_error,

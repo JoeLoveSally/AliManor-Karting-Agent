@@ -50,6 +50,71 @@ def test_far_horizon_arms_interpolated_pending_switch() -> None:
     assert decision.pending_due_ms == pytest.approx(1076.6574586)
 
 
+def test_pending_advance_shifts_only_scheduled_delay() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            pending_advance_ms=40.0,
+        )
+    )
+
+    decision = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.006, 0.045, 0.769),
+        current_pressed=False,
+    )
+
+    assert decision.switch is False
+    assert decision.reason == "pending_armed"
+    assert decision.crossing_horizon_ms == pytest.approx(276.6574586)
+    assert decision.pending_delay_ms == pytest.approx(36.6574586)
+    assert decision.pending_due_ms == pytest.approx(1036.6574586)
+
+
+def test_pending_advance_clamps_effective_delay_to_zero() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            pending_advance_ms=100.0,
+        )
+    )
+
+    armed = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.59, 0.9),
+        current_pressed=False,
+    )
+    executed = scheduler.update(
+        timestamp_ms=1001.0,
+        probabilities=(0.1, 0.59, 0.9),
+        current_pressed=False,
+    )
+
+    assert armed.reason == "pending_armed"
+    assert armed.pending_delay_ms == pytest.approx(0.0)
+    assert armed.pending_due_ms == pytest.approx(1000.0)
+    assert executed.switch is True
+    assert executed.reason == "pending_execute"
+
+
+def test_pending_advance_must_fit_horizon_span() -> None:
+    config = MultiHorizonSchedulerConfig(
+        horizons_ms=(100.0, 200.0, 300.0),
+        control_horizon_ms=200.0,
+        anticipation_horizon_ms=300.0,
+        pending_advance_ms=100.1,
+    )
+
+    with pytest.raises(ValueError, match="pending_advance_ms"):
+        config.validate()
+
+
 def test_pending_requires_warning_to_persist_until_due() -> None:
     scheduler = make_scheduler()
     scheduler.update(

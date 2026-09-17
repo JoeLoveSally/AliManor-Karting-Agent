@@ -13,6 +13,7 @@ from karting_agent.control.controller import ControlAction
 from karting_agent.data_flow.execute.common import Executor
 from karting_agent.data_flow.input.common import Frame
 from karting_agent.runtime.engine import RuntimeStep
+from karting_agent.runtime.multi_horizon_scheduler import MultiHorizonSwitchScheduler
 from karting_agent.vision.preprocess import PreprocessConfig
 from karting_agent.vision.temporal import TemporalFrameBuffer
 
@@ -20,6 +21,11 @@ from karting_agent.vision.temporal import TemporalFrameBuffer
 class SwitchModel(Protocol):
     def predict_switch(self, inputs: np.ndarray, current_pressed: bool) -> float:
         """Return probability that the current physical state should be flipped."""
+
+    def predict_switch_all(
+        self, inputs: np.ndarray, current_pressed: bool
+    ) -> tuple[float, ...]:
+        """Return switch probabilities for all prediction horizons."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,16 @@ class StateConditionedRuntimeConfig:
         return max(0.0, -min(self.frame_offsets_ms))
 
 
+@dataclass(frozen=True)
+class StateConditionedRuntimeStep(RuntimeStep):
+    """Runtime step with optional multi-horizon scheduler diagnostics."""
+
+    probabilities: tuple[float, ...] = ()
+    scheduler_reason: str | None = None
+    pending_due_ms: float | None = None
+    pending_delay_ms: float | None = None
+
+
 class StateConditionedRuntimeEngine:
     """Run v3 by feeding the model the physical state active at each step."""
 
@@ -62,18 +78,36 @@ class StateConditionedRuntimeEngine:
         executor: Executor,
         config: StateConditionedRuntimeConfig,
         initial_pressed: bool = False,
+        scheduler: MultiHorizonSwitchScheduler | None = None,
     ) -> None:
         config.validate()
+        if scheduler is not None:
+            scheduler_config = scheduler.config
+            if not math.isclose(
+                scheduler_config.control_horizon_ms,
+                config.prediction_horizon_ms,
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    "scheduler control horizon must match runtime prediction horizon"
+                )
+            if not math.isclose(
+                scheduler_config.threshold,
+                config.switch_threshold,
+                abs_tol=1e-9,
+            ):
+                raise ValueError("scheduler threshold must match runtime switch threshold")
         self.model = model
         self.preprocess_config = preprocess_config
         self.executor = executor
         self.config = config
+        self.scheduler = scheduler
         self.pressed = bool(initial_pressed)
         self._buffer = TemporalFrameBuffer(config.history_ms)
         self._interval_ms = 1000.0 / config.target_fps
         self._next_due_ms: float | None = None
 
-    def ingest(self, frame: Frame) -> RuntimeStep | None:
+    def ingest(self, frame: Frame) -> StateConditionedRuntimeStep | None:
         self._buffer.add(frame)
         if self._next_due_ms is None:
             self._next_due_ms = frame.timestamp_ms + self.config.history_ms
@@ -93,19 +127,47 @@ class StateConditionedRuntimeEngine:
 
         before = self.pressed
         started = time.perf_counter()
-        probability = float(self.model.predict_switch(temporal.input, before))
+        if self.scheduler is None:
+            probability = float(self.model.predict_switch(temporal.input, before))
+            probabilities = (probability,)
+        else:
+            probabilities = tuple(
+                float(value)
+                for value in self.model.predict_switch_all(temporal.input, before)
+            )
+            probability = probabilities[
+                self.scheduler.config.horizons_ms.index(
+                    self.scheduler.config.control_horizon_ms
+                )
+            ]
         inference_ms = (time.perf_counter() - started) * 1000.0
-        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
-            raise ValueError("model probability must be finite and in [0, 1]")
 
-        if probability >= self.config.switch_threshold:
+        if self.scheduler is None:
+            if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                raise ValueError("model probability must be finite and in [0, 1]")
+            should_switch = probability >= self.config.switch_threshold
+            scheduler_reason = None
+            pending_due_ms = None
+            pending_delay_ms = None
+        else:
+            decision = self.scheduler.update(
+                timestamp_ms=frame.timestamp_ms,
+                probabilities=probabilities,
+                current_pressed=before,
+            )
+            should_switch = decision.switch
+            scheduler_reason = decision.reason
+            pending_due_ms = decision.pending_due_ms
+            pending_delay_ms = decision.pending_delay_ms
+
+        if should_switch:
             self.pressed = not before
             action = ControlAction.PRESS if self.pressed else ControlAction.RELEASE
             self.executor.set_pressed(self.pressed)
         else:
             action = ControlAction.HOLD
 
-        return RuntimeStep(
+        return StateConditionedRuntimeStep(
             observation_timestamp_ms=frame.timestamp_ms,
             prediction_target_timestamp_ms=(
                 frame.timestamp_ms + self.config.prediction_horizon_ms
@@ -116,9 +178,15 @@ class StateConditionedRuntimeEngine:
             action=action,
             pressed=self.pressed,
             inference_ms=inference_ms,
+            probabilities=probabilities,
+            scheduler_reason=scheduler_reason,
+            pending_due_ms=pending_due_ms,
+            pending_delay_ms=pending_delay_ms,
         )
 
     def shutdown(self) -> bool:
+        if self.scheduler is not None:
+            self.scheduler.reset()
         if not self.pressed:
             return False
         self.executor.set_pressed(False)

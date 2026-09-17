@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import pytest
+
+from karting_agent.runtime.multi_horizon_scheduler import (
+    MultiHorizonSchedulerConfig,
+    MultiHorizonSwitchScheduler,
+)
+
+
+def make_scheduler() -> MultiHorizonSwitchScheduler:
+    return MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+        )
+    )
+
+
+def test_primary_control_horizon_switches_immediately() -> None:
+    scheduler = make_scheduler()
+
+    decision = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+
+    assert decision.switch is True
+    assert decision.reason == "primary"
+    assert scheduler.pending_due_ms is None
+
+
+def test_far_horizon_arms_interpolated_pending_switch() -> None:
+    scheduler = make_scheduler()
+
+    decision = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.006, 0.045, 0.769),
+        current_pressed=False,
+    )
+
+    assert decision.switch is False
+    assert decision.reason == "pending_armed"
+    assert decision.crossing_horizon_ms == pytest.approx(276.6574586)
+    assert decision.pending_delay_ms == pytest.approx(76.6574586)
+    assert decision.pending_due_ms == pytest.approx(1076.6574586)
+
+
+def test_pending_requires_warning_to_persist_until_due() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.006, 0.045, 0.769),
+        current_pressed=False,
+    )
+
+    waiting = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.02, 0.20, 0.80),
+        current_pressed=False,
+    )
+    executed = scheduler.update(
+        timestamp_ms=1080.0,
+        probabilities=(0.03, 0.30, 0.90),
+        current_pressed=False,
+    )
+
+    assert waiting.switch is False
+    assert waiting.reason == "pending_wait"
+    assert executed.switch is True
+    assert executed.reason == "pending_execute"
+    assert scheduler.pending_due_ms is None
+
+
+def test_pending_is_cancelled_when_far_warning_disappears() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.006, 0.045, 0.769),
+        current_pressed=False,
+    )
+
+    decision = scheduler.update(
+        timestamp_ms=1040.0,
+        probabilities=(0.01, 0.05, 0.40),
+        current_pressed=False,
+    )
+
+    assert decision.switch is False
+    assert decision.reason == "pending_cancelled"
+    assert scheduler.pending_due_ms is None
+
+
+def test_non_monotonic_horizons_do_not_arm_pending_switch() -> None:
+    scheduler = make_scheduler()
+
+    decision = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.8, 0.2, 0.9),
+        current_pressed=False,
+    )
+
+    assert decision.switch is False
+    assert decision.reason == "hold"
+    assert scheduler.pending_due_ms is None
+
+
+def test_primary_signal_overrides_pending_delay() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.006, 0.045, 0.769),
+        current_pressed=False,
+    )
+
+    decision = scheduler.update(
+        timestamp_ms=1030.0,
+        probabilities=(0.2, 0.65, 0.95),
+        current_pressed=False,
+    )
+
+    assert decision.switch is True
+    assert decision.reason == "primary"
+    assert scheduler.pending_due_ms is None
+
+
+def test_state_change_invalidates_old_pending_switch() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.006, 0.045, 0.769),
+        current_pressed=False,
+    )
+
+    decision = scheduler.update(
+        timestamp_ms=1030.0,
+        probabilities=(0.9, 0.3, 0.2),
+        current_pressed=True,
+    )
+
+    assert decision.switch is False
+    assert decision.reason == "hold"
+    assert scheduler.pending_due_ms is None
+
+
+def test_scheduler_rejects_non_increasing_timestamps() -> None:
+    scheduler = make_scheduler()
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.0, 0.0, 0.0),
+        current_pressed=False,
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        scheduler.update(
+            timestamp_ms=1000.0,
+            probabilities=(0.0, 0.0, 0.0),
+            current_pressed=False,
+        )

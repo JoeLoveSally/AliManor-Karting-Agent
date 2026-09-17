@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 
 from karting_agent.control.controller import ControlAction
@@ -50,6 +52,35 @@ class FixedModel:
         raise AssertionError("fixed runtime must use predict_switch")
 
 
+class ManualTimer:
+    def __init__(self, interval: float, callback: Callable[[], None]) -> None:
+        self.interval = float(interval)
+        self.callback = callback
+        self.started = False
+        self.cancelled = False
+        self.daemon = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if self.started and not self.cancelled:
+            self.callback()
+
+
+class ManualTimerFactory:
+    def __init__(self) -> None:
+        self.timers: list[ManualTimer] = []
+
+    def __call__(self, interval: float, callback: Callable[[], None]) -> ManualTimer:
+        timer = ManualTimer(interval, callback)
+        self.timers.append(timer)
+        return timer
+
+
 def make_frame(index: int, timestamp_ms: float) -> Frame:
     return Frame(
         image=np.zeros((16, 16, 3), dtype=np.uint8),
@@ -58,12 +89,16 @@ def make_frame(index: int, timestamp_ms: float) -> Frame:
     )
 
 
-def make_runtime_config() -> StateConditionedRuntimeConfig:
+def make_runtime_config(
+    *,
+    execute_pending_at_due: bool = False,
+) -> StateConditionedRuntimeConfig:
     return StateConditionedRuntimeConfig(
         target_fps=30.0,
         frame_offsets_ms=(0.0,),
         prediction_horizon_ms=200.0,
         switch_threshold=0.6,
+        execute_pending_at_due=execute_pending_at_due,
     )
 
 
@@ -75,9 +110,8 @@ def make_preprocess_config() -> PreprocessConfig:
     )
 
 
-def test_scheduler_runtime_arms_executes_and_respects_min_hold() -> None:
-    executor = RecordingExecutor()
-    scheduler = MultiHorizonSwitchScheduler(
+def make_scheduler() -> MultiHorizonSwitchScheduler:
+    return MultiHorizonSwitchScheduler(
         MultiHorizonSchedulerConfig(
             horizons_ms=(100.0, 200.0, 300.0),
             control_horizon_ms=200.0,
@@ -86,6 +120,11 @@ def test_scheduler_runtime_arms_executes_and_respects_min_hold() -> None:
             min_state_hold_ms=100.0,
         )
     )
+
+
+def test_scheduler_runtime_arms_executes_and_respects_min_hold() -> None:
+    executor = RecordingExecutor()
+    scheduler = make_scheduler()
     model = SequenceModel(
         [
             (0.01, 0.05, 0.80),
@@ -127,6 +166,106 @@ def test_scheduler_runtime_arms_executes_and_respects_min_hold() -> None:
     assert reversed_step.scheduler_reason == "primary"
     assert reversed_step.pressed is False
     assert executor.states == [True, False]
+
+
+def test_deadline_runtime_rechecks_pending_on_intermediate_frames_and_fires_timer() -> None:
+    executor = RecordingExecutor()
+    timers = ManualTimerFactory()
+    model = SequenceModel(
+        [
+            (0.10, 0.55, 0.80),
+            (0.10, 0.56, 0.85),
+            (0.99, 0.90, 0.01),
+        ]
+    )
+    engine = StateConditionedRuntimeEngine(
+        model=model,
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=make_runtime_config(execute_pending_at_due=True),
+        scheduler=make_scheduler(),
+        timer_factory=timers,
+        clock=lambda: 10.0,
+    )
+
+    armed = engine.ingest(make_frame(0, 0.0))
+    monitored = engine.ingest(make_frame(1, 10.0))
+
+    assert armed is not None
+    assert armed.scheduler_reason == "pending_armed"
+    assert armed.pending_due_ms == 20.0
+    assert monitored is not None
+    assert monitored.scheduler_reason == "pending_wait"
+    assert monitored.inference_trigger == "pending_monitor"
+    assert len(timers.timers) == 2
+    assert timers.timers[0].cancelled is True
+    assert timers.timers[1].cancelled is False
+
+    timers.timers[1].fire()
+    events = engine.drain_deadline_events()
+
+    assert executor.states == [True]
+    assert len(events) == 1
+    assert events[0].action is ControlAction.PRESS
+    assert events[0].pressed is True
+    assert events[0].timestamp_ms == 20.0
+    assert events[0].scheduler_reason == "pending_execute_deadline"
+
+    held = engine.ingest(make_frame(2, 35.0))
+    assert held is not None
+    assert held.scheduler_reason == "min_hold"
+    assert held.action is ControlAction.HOLD
+    assert held.pressed is True
+
+
+def test_deadline_runtime_cancels_timer_when_warning_disappears() -> None:
+    executor = RecordingExecutor()
+    timers = ManualTimerFactory()
+    model = SequenceModel(
+        [
+            (0.10, 0.55, 0.80),
+            (0.10, 0.10, 0.40),
+        ]
+    )
+    engine = StateConditionedRuntimeEngine(
+        model=model,
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=make_runtime_config(execute_pending_at_due=True),
+        scheduler=make_scheduler(),
+        timer_factory=timers,
+        clock=lambda: 10.0,
+    )
+
+    armed = engine.ingest(make_frame(0, 0.0))
+    cancelled = engine.ingest(make_frame(1, 10.0))
+
+    assert armed is not None
+    assert cancelled is not None
+    assert cancelled.scheduler_reason == "pending_cancelled"
+    assert timers.timers[0].cancelled is True
+    timers.timers[0].fire()
+    assert executor.states == []
+    assert engine.drain_deadline_events() == []
+
+
+def test_deadline_monitor_is_opt_in() -> None:
+    executor = RecordingExecutor()
+    engine = StateConditionedRuntimeEngine(
+        model=SequenceModel([(0.10, 0.55, 0.80)]),
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=make_runtime_config(execute_pending_at_due=False),
+        scheduler=make_scheduler(),
+    )
+
+    armed = engine.ingest(make_frame(0, 0.0))
+    intermediate = engine.ingest(make_frame(1, 10.0))
+
+    assert armed is not None
+    assert armed.scheduler_reason == "pending_armed"
+    assert intermediate is None
+    assert executor.states == []
 
 
 def test_fixed_runtime_path_remains_unchanged() -> None:

@@ -9,6 +9,7 @@ from typing import Literal, Sequence
 
 SchedulerReason = Literal[
     "hold",
+    "min_hold",
     "primary",
     "pending_armed",
     "pending_wait",
@@ -26,6 +27,12 @@ class MultiHorizonSchedulerConfig:
     rise monotonically with horizon. The pending delay is estimated by linearly
     interpolating where the switch probability crosses ``threshold`` between the
     control and anticipation horizons, then subtracting the control horizon.
+
+    ``min_state_hold_ms`` rejects immediate reversals after an executed switch.
+    The default 100 ms matches the lower bound of the dataset's explicitly
+    retained short-correction segments, so it removes scheduler-created
+    sub-100 ms chatter without intentionally suppressing the 100--300 ms
+    corrections that are part of the training/evaluation target.
     """
 
     horizons_ms: tuple[float, ...]
@@ -33,6 +40,7 @@ class MultiHorizonSchedulerConfig:
     anticipation_horizon_ms: float = 300.0
     threshold: float = 0.6
     monotonic_tolerance: float = 1e-6
+    min_state_hold_ms: float = 100.0
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 2:
@@ -53,6 +61,8 @@ class MultiHorizonSchedulerConfig:
             raise ValueError("threshold must be in (0, 1)")
         if not math.isfinite(self.monotonic_tolerance) or self.monotonic_tolerance < 0:
             raise ValueError("monotonic_tolerance must be finite and >= 0")
+        if not math.isfinite(self.min_state_hold_ms) or self.min_state_hold_ms < 0:
+            raise ValueError("min_state_hold_ms must be finite and >= 0")
 
 
 @dataclass(frozen=True)
@@ -90,14 +100,20 @@ class MultiHorizonSwitchScheduler:
         )
         self._pending: _PendingSwitch | None = None
         self._last_timestamp_ms: float | None = None
+        self._last_switch_ms: float | None = None
 
     @property
     def pending_due_ms(self) -> float | None:
         return None if self._pending is None else self._pending.due_at_ms
 
+    @property
+    def last_switch_ms(self) -> float | None:
+        return self._last_switch_ms
+
     def reset(self) -> None:
         self._pending = None
         self._last_timestamp_ms = None
+        self._last_switch_ms = None
 
     def _validated_probabilities(self, values: Sequence[float]) -> tuple[float, ...]:
         probabilities = tuple(float(value) for value in values)
@@ -166,6 +182,38 @@ class MultiHorizonSwitchScheduler:
             pending_delay_ms=pending_delay_ms,
         )
 
+    def _switch_decision(
+        self,
+        *,
+        timestamp_ms: float,
+        reason: Literal["primary", "pending_execute"],
+        current_pressed: bool,
+        probabilities: tuple[float, ...],
+        crossing_horizon_ms: float | None = None,
+        pending_due_ms: float | None = None,
+        pending_delay_ms: float | None = None,
+    ) -> SchedulerDecision:
+        self._pending = None
+        self._last_switch_ms = timestamp_ms
+        return self._decision(
+            timestamp_ms=timestamp_ms,
+            switch=True,
+            reason=reason,
+            current_pressed=current_pressed,
+            probabilities=probabilities,
+            crossing_horizon_ms=crossing_horizon_ms,
+            pending_due_ms=pending_due_ms,
+            pending_delay_ms=pending_delay_ms,
+        )
+
+    def _inside_min_hold(self, timestamp_ms: float) -> bool:
+        if self._last_switch_ms is None:
+            return False
+        return (
+            timestamp_ms - self._last_switch_ms + 1e-6
+            < self.config.min_state_hold_ms
+        )
+
     def update(
         self,
         *,
@@ -189,12 +237,23 @@ class MultiHorizonSwitchScheduler:
         if self._pending is not None and self._pending.state_before != current_pressed:
             self._pending = None
 
-        control = probabilities[self._control_index]
-        if control >= self.config.threshold:
+        # A switch changes the conditioning state abruptly. Ignore the immediate
+        # counter-signal until the shortest intentionally retained correction
+        # duration has elapsed, then evaluate the horizons afresh.
+        if self._inside_min_hold(timestamp_ms):
             self._pending = None
             return self._decision(
                 timestamp_ms=timestamp_ms,
-                switch=True,
+                switch=False,
+                reason="min_hold",
+                current_pressed=current_pressed,
+                probabilities=probabilities,
+            )
+
+        control = probabilities[self._control_index]
+        if control >= self.config.threshold:
+            return self._switch_decision(
+                timestamp_ms=timestamp_ms,
                 reason="primary",
                 current_pressed=current_pressed,
                 probabilities=probabilities,
@@ -216,10 +275,8 @@ class MultiHorizonSwitchScheduler:
                     pending_delay_ms=pending.delay_ms,
                 )
             if timestamp_ms + 1e-6 >= pending.due_at_ms:
-                self._pending = None
-                return self._decision(
+                return self._switch_decision(
                     timestamp_ms=timestamp_ms,
-                    switch=True,
                     reason="pending_execute",
                     current_pressed=current_pressed,
                     probabilities=probabilities,

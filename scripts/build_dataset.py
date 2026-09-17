@@ -31,6 +31,8 @@ def load_config(path: Path) -> DatasetConfig:
     dataset = raw.get("dataset", {})
     raw_horizons = dataset.get("prediction_horizons_ms", ())
     horizons = tuple(float(value) for value in raw_horizons)
+    raw_sampling_horizons = dataset.get("sampling_horizons_ms", ())
+    sampling_horizons = tuple(float(value) for value in raw_sampling_horizons)
     return DatasetConfig(
         sample_fps=float(dataset.get("sample_fps", 30)),
         frame_stack=int(model.get("frame_stack", 3)),
@@ -38,6 +40,7 @@ def load_config(path: Path) -> DatasetConfig:
         frame_interval_ms=float(dataset.get("frame_interval_ms", 50)),
         prediction_horizon_ms=float(dataset.get("prediction_horizon_ms", 100)),
         prediction_horizons_ms=horizons,
+        sampling_horizons_ms=sampling_horizons,
         transition_window_ms=float(dataset.get("transition_window_ms", 200)),
         short_correction_min_ms=float(dataset.get("short_correction_min_ms", 100)),
         short_correction_max_ms=float(dataset.get("short_correction_max_ms", 300)),

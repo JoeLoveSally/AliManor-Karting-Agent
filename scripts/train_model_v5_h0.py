@@ -321,8 +321,7 @@ def main() -> int:
         print(
             "smoke/checkpoint: "
             f"switch_loss={validation_cf_summary['switch_loss']:.4f} "
-            f"h0_target_positive={primary_cf['target_positive']}/"
-            f"{primary_cf['samples']}",
+            f"h0_target_positive_rate={primary_cf['target_positive_rate']:.3f}",
             flush=True,
         )
         for dataset in datasets.values():

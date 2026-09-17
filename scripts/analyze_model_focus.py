@@ -294,20 +294,22 @@ def top_cells(
     current_pressed: bool,
     count: int = 5,
 ) -> dict[str, list[dict[str, object]]]:
-    grid = sensitivity.shape[0]
+    if sensitivity.shape != unmasked_fraction.shape:
+        raise ValueError("sensitivity and unmasked_fraction must have matching shapes")
+    rows, cols = sensitivity.shape
     cells: list[dict[str, object]] = []
-    for row in range(grid):
-        for col in range(grid):
+    for row in range(rows):
+        for col in range(cols):
             if unmasked_fraction[row, col] <= 0.0:
                 continue
             cells.append(
                 {
                     "row": row,
                     "col": col,
-                    "x0": col / grid,
-                    "y0": row / grid,
-                    "x1": (col + 1) / grid,
-                    "y1": (row + 1) / grid,
+                    "x0": col / cols,
+                    "y0": row / rows,
+                    "x1": (col + 1) / cols,
+                    "y1": (row + 1) / rows,
                     "unmasked_fraction": float(unmasked_fraction[row, col]),
                     "delta_switch_probability": float(sensitivity[row, col]),
                 }

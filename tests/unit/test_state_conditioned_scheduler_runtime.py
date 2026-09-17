@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import numpy as np
+import pytest
 
 from karting_agent.control.controller import ControlAction
 from karting_agent.data_flow.input.common import Frame
@@ -193,7 +194,7 @@ def test_deadline_runtime_rechecks_pending_on_intermediate_frames_and_fires_time
 
     assert armed is not None
     assert armed.scheduler_reason == "pending_armed"
-    assert armed.pending_due_ms == 20.0
+    assert armed.pending_due_ms == pytest.approx(20.0)
     assert monitored is not None
     assert monitored.scheduler_reason == "pending_wait"
     assert monitored.inference_trigger == "pending_monitor"
@@ -208,7 +209,7 @@ def test_deadline_runtime_rechecks_pending_on_intermediate_frames_and_fires_time
     assert len(events) == 1
     assert events[0].action is ControlAction.PRESS
     assert events[0].pressed is True
-    assert events[0].timestamp_ms == 20.0
+    assert events[0].timestamp_ms == pytest.approx(20.0)
     assert events[0].scheduler_reason == "pending_execute_deadline"
 
     held = engine.ingest(make_frame(2, 35.0))

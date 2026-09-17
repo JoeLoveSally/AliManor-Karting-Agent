@@ -73,6 +73,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
     parser.add_argument("--pending-advance-ms", type=float, default=0.0)
     parser.add_argument(
+        "--arm-pending-during-min-hold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow a monotonic anticipation warning to arm during the minimum "
+            "state-hold window while still forbidding execution before hold expiry."
+        ),
+    )
+    parser.add_argument(
         "--execute-pending-at-due",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -102,6 +111,10 @@ def main() -> int:
         raise ValueError("--min-state-hold-ms must be >= 0")
     if args.pending_advance_ms < 0:
         raise ValueError("--pending-advance-ms must be >= 0")
+    if args.arm_pending_during_min_hold and not args.multi_horizon_scheduler:
+        raise ValueError(
+            "--arm-pending-during-min-hold requires --multi-horizon-scheduler"
+        )
     if args.execute_pending_at_due and not args.multi_horizon_scheduler:
         raise ValueError("--execute-pending-at-due requires --multi-horizon-scheduler")
     if args.wait_for_start and not args.arm:
@@ -159,6 +172,7 @@ def main() -> int:
                 threshold=args.switch_threshold,
                 min_state_hold_ms=float(args.min_state_hold_ms),
                 pending_advance_ms=float(args.pending_advance_ms),
+                arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
             )
         )
 
@@ -220,6 +234,7 @@ def main() -> int:
             f", anticipation_horizon={scheduler.config.anticipation_horizon_ms:g}ms"
             f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
             f", pending_advance={scheduler.config.pending_advance_ms:g}ms"
+            f", arm_pending_during_min_hold={scheduler.config.arm_pending_during_min_hold}"
             f", execute_pending_at_due={args.execute_pending_at_due}"
         )
     print(runtime_detail, flush=True)

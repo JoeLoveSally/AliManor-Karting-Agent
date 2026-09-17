@@ -11,7 +11,6 @@ from threading import Event, Thread
 import time
 from typing import BinaryIO, Callable
 
-import cv2
 import numpy as np
 
 from karting_agent.data_flow.adb import AdbClient, AdbError
@@ -20,7 +19,6 @@ from karting_agent.data_flow.input.common import Frame
 
 PopenFactory = Callable[..., subprocess.Popen[bytes]]
 DEBUG_RECORDING_FPS = 60.0
-DEBUG_RECORDING_QUEUE_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -51,9 +49,10 @@ class AdbVideoInput:
     """Decode Android ``screenrecord`` H.264 into a latest-frame BGR stream.
 
     Runtime timestamps are assigned when decoded BGR frames arrive. When
-    ``record_path`` is provided, those exact decoded frames are also written to
-    a constant-frame-rate debug MP4 on a separate thread. The MP4 is therefore
-    a visual frame-index copy; authoritative timing remains in
+    ``record_path`` is provided, FFmpeg also stream-copies the same encoded H.264
+    frames into a debug MP4. The raw H.264 input is assigned a synthetic CFR time
+    base so the MP4 remains visually playable without wall-clock timestamp
+    collapse. Authoritative runtime timing remains in
     ``decoded_frame_timestamps_ms``.
     """
 
@@ -92,14 +91,10 @@ class AdbVideoInput:
         self._last_frame_at: float | None = None
         self._error: str | None = None
 
+        # The MP4 time base is deliberately synthetic. It is only for visual
+        # inspection and frame-index lookup; decoded timestamps below remain the
+        # source of truth for runtime timing.
         self.recording_fps = DEBUG_RECORDING_FPS
-        self._record_queue: Queue[Frame | None] | None = (
-            Queue(maxsize=DEBUG_RECORDING_QUEUE_SIZE)
-            if self.record_path is not None
-            else None
-        )
-        self._record_writer: cv2.VideoWriter | None = None
-        self._record_thread: Thread | None = None
         self.recorded_frames = 0
         self.recording_dropped_frames = 0
         self.recording_dropped_frame_indices: list[int] = []
@@ -137,50 +132,52 @@ class AdbVideoInput:
         )
 
     def _ffmpeg_command(self) -> tuple[str, ...]:
-        return (
+        command: list[str] = [
             self.config.ffmpeg_executable,
             "-loglevel",
             "error",
+            # Raw screenrecord H.264 has no trustworthy container timestamps.
+            # Generate a stable CFR input time base instead of stamping packets
+            # with their arrival wall-clock time, which previously collapsed
+            # hundreds of MP4 frames into nearly identical PTS values.
+            "-fflags",
+            "+genpts",
+            "-r",
+            f"{self.recording_fps:g}",
             "-f",
             "h264",
             "-flags",
             "low_delay",
             "-i",
             "pipe:0",
-            "-map",
-            "0:v:0",
-            "-an",
-            "-pix_fmt",
-            "bgr24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
+        ]
+        if self.record_path is not None:
+            command.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-an",
+                    "-c:v",
+                    "copy",
+                    "-movflags",
+                    "+frag_keyframe+empty_moov+default_base_moof",
+                    "-y",
+                    str(self.record_path),
+                ]
+            )
+        command.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-an",
+                "-pix_fmt",
+                "bgr24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
         )
-
-    def _start_debug_recorder(self) -> None:
-        if self.record_path is None:
-            return
-        if self._record_writer is not None or self._record_thread is not None:
-            return
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(self.record_path),
-            fourcc,
-            self.recording_fps,
-            (self.decode_width, self.decode_height),
-        )
-        if not writer.isOpened():
-            writer.release()
-            raise RuntimeError(f"failed to open debug MP4 writer: {self.record_path}")
-
-        self._record_writer = writer
-        self._record_thread = Thread(
-            target=self._record_frames,
-            name="adb-video-debug-recorder",
-            daemon=True,
-        )
-        self._record_thread.start()
+        return tuple(command)
 
     def _start(self) -> None:
         if self.started:
@@ -189,7 +186,6 @@ class AdbVideoInput:
             raise RuntimeError(f"FFmpeg executable not found: {self.config.ffmpeg_executable}")
         if self.record_path is not None:
             self.record_path.parent.mkdir(parents=True, exist_ok=True)
-            self._start_debug_recorder()
 
         self._origin = time.perf_counter()
         try:
@@ -200,7 +196,6 @@ class AdbVideoInput:
                 bufsize=0,
             )
         except FileNotFoundError as exc:
-            self._close_debug_recorder()
             raise AdbError(f"ADB executable not found: {self.client.config.executable}") from exc
 
         assert self._recorder.stdout is not None
@@ -214,7 +209,6 @@ class AdbVideoInput:
             )
         except FileNotFoundError as exc:
             self._recorder.terminate()
-            self._close_debug_recorder()
             raise RuntimeError(
                 f"FFmpeg executable not found: {self.config.ffmpeg_executable}"
             ) from exc
@@ -263,7 +257,10 @@ class AdbVideoInput:
                 content = _read_exact(self._ffmpeg.stdout, frame_size)
                 if len(content) != frame_size:
                     if not self._closing.is_set() and not self._stop.is_set():
-                        self._error = self._process_error() or "Android video stream ended"
+                        detail = self._process_error() or "Android video stream ended"
+                        self._error = detail
+                        if self.record_path is not None and detail.startswith("ffmpeg"):
+                            self.recording_error = detail
                     return
 
                 now = time.perf_counter()
@@ -287,7 +284,11 @@ class AdbVideoInput:
                     timestamp_ms=(now - self._origin) * 1000.0,
                 )
                 self.decoded_frame_timestamps_ms.append(frame.timestamp_ms)
-                self._offer_recording(frame)
+                if self.record_path is not None:
+                    # Both FFmpeg outputs are fed by the same input stream. Count
+                    # decoded pictures as the expected MP4 frame mapping; ffprobe
+                    # remains the external verification of the finalized file.
+                    self.recorded_frames += 1
                 self.decoded_frames += 1
                 self._offer_latest(frame)
         except Exception as exc:
@@ -308,56 +309,6 @@ class AdbVideoInput:
         self.dropped_frames += 1
         self._frames.put_nowait(frame)
 
-    def _offer_recording(self, frame: Frame) -> None:
-        queue = self._record_queue
-        if queue is None:
-            return
-        try:
-            queue.put_nowait(frame)
-        except Full:
-            self.recording_dropped_frames += 1
-            self.recording_dropped_frame_indices.append(frame.frame_index)
-            if self.recording_error is None:
-                self.recording_error = (
-                    "debug recording queue overflow; MP4/source-frame mapping is invalid"
-                )
-
-    def _record_frames(self) -> None:
-        queue = self._record_queue
-        writer = self._record_writer
-        assert queue is not None and writer is not None
-        try:
-            while True:
-                frame = queue.get()
-                if frame is None:
-                    return
-                writer.write(frame.image)
-                self.recorded_frames += 1
-        except Exception as exc:
-            if self.recording_error is None:
-                self.recording_error = f"debug MP4 recorder failed: {exc}"
-
-    def _close_debug_recorder(self) -> None:
-        queue = self._record_queue
-        thread = self._record_thread
-        writer = self._record_writer
-        if queue is None or writer is None:
-            return
-
-        if thread is not None and thread.is_alive():
-            try:
-                queue.put(None, timeout=5.0)
-            except Full:
-                if self.recording_error is None:
-                    self.recording_error = "timed out draining debug recording queue"
-            thread.join(timeout=10.0)
-            if thread.is_alive() and self.recording_error is None:
-                self.recording_error = "debug recording thread did not stop"
-
-        writer.release()
-        self._record_writer = None
-        self._record_thread = None
-
     def _process_error(self) -> str | None:
         for label, process in (("screenrecord", self._recorder), ("ffmpeg", self._ffmpeg)):
             if process is None or process.poll() is None or process.stderr is None:
@@ -374,16 +325,28 @@ class AdbVideoInput:
             process.kill()
             process.wait(timeout=2)
 
+    def _record_ffmpeg_error(self) -> None:
+        ffmpeg = self._ffmpeg
+        if self.record_path is None or ffmpeg is None or ffmpeg.returncode in (None, 0):
+            return
+        detail = ""
+        if ffmpeg.stderr is not None:
+            detail = ffmpeg.stderr.read().decode("utf-8", errors="replace").strip()
+        self.recording_error = (
+            f"debug MP4 ffmpeg exited with code {ffmpeg.returncode}: {detail}"
+        ).rstrip()
+
     def close(self) -> None:
-        """Stop screen capture, drain decoded frames, and finalize debug recording."""
+        """Stop screen capture, drain decoded frames, and finalize debug MP4."""
         self._closing.set()
 
         recorder = self._recorder
         ffmpeg = self._ffmpeg
 
         # Stop the producer first. Once the ADB stdout pipe closes, FFmpeg sees
-        # EOF and drains decoded raw frames. The reader must stay alive during
-        # this phase or FFmpeg can block on its rawvideo stdout pipe.
+        # EOF, drains its rawvideo decoder output, and finalizes the stream-copy
+        # MP4. The reader must stay alive during this phase or FFmpeg can block
+        # on its rawvideo stdout pipe.
         if recorder is not None and recorder.poll() is None:
             recorder.terminate()
             self._wait_or_kill(recorder, timeout=2)
@@ -395,11 +358,10 @@ class AdbVideoInput:
                 ffmpeg.terminate()
                 self._wait_or_kill(ffmpeg, timeout=2)
 
+        self._record_ffmpeg_error()
         self._stop.set()
         if self._reader is not None:
             self._reader.join(timeout=2)
-
-        self._close_debug_recorder()
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:

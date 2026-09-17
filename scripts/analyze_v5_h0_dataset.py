@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -61,7 +60,9 @@ def infer_horizons(sample: DatasetSample) -> tuple[float, ...]:
     return tuple(round(float(value) - observation_ms, 6) for value in timestamps)
 
 
-def index_samples(samples: list[DatasetSample]) -> dict[tuple[str, tuple[int, ...]], DatasetSample]:
+def index_samples(
+    samples: list[DatasetSample],
+) -> dict[tuple[str, tuple[int, ...]], DatasetSample]:
     result: dict[tuple[str, tuple[int, ...]], DatasetSample] = {}
     for sample in samples:
         key = sample_key(sample)
@@ -177,19 +178,16 @@ def main() -> int:
         ):
             h0_frame_overlap += 1
 
-        # Under counterfactual training each visual sample appears once with
-        # RELEASE and once with PRESS. Exactly one of those two states must differ
-        # from the expert H0 action, so H0 switch supervision is balanced by design.
+        # Counterfactual training emits each visual sample once with RELEASE and
+        # once with PRESS. Exactly one supplied state differs from the expert H0
+        # action, so H0 switch supervision is balanced by construction.
         for conditioned_pressed in (False, True):
             h0_counterfactual_positive += int(h0_state != conditioned_pressed)
             h0_counterfactual_total += 1
 
         transition_count = 0
-        for left_index, right_index in zip(
-            range(len(candidate_horizons) - 1),
-            range(1, len(candidate_horizons)),
-            strict=True,
-        ):
+        for left_index in range(len(candidate_horizons) - 1):
+            right_index = left_index + 1
             changed = bool(new_states[left_index]) != bool(new_states[right_index])
             if changed:
                 transition_count += 1

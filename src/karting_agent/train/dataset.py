@@ -25,6 +25,7 @@ class DatasetConfig:
     frame_interval_ms: float = 50.0
     prediction_horizon_ms: float = 100.0
     prediction_horizons_ms: tuple[float, ...] = ()
+    sampling_horizons_ms: tuple[float, ...] = ()
     transition_window_ms: float = 200.0
     short_correction_min_ms: float = 100.0
     short_correction_max_ms: float = 300.0
@@ -51,12 +52,32 @@ class DatasetConfig:
             raise ValueError("prediction horizons must be sorted")
         if len(set(horizons)) != len(horizons):
             raise ValueError("prediction horizons must be unique")
+        if self.sampling_horizons_ms:
+            if tuple(sorted(self.sampling_horizons_ms)) != self.sampling_horizons_ms:
+                raise ValueError("sampling horizons must be sorted")
+            if len(set(self.sampling_horizons_ms)) != len(self.sampling_horizons_ms):
+                raise ValueError("sampling horizons must be unique")
+            missing = [
+                value for value in self.sampling_horizons_ms if value not in horizons
+            ]
+            if missing:
+                raise ValueError(
+                    "sampling horizons must be prediction horizons; "
+                    f"missing={missing}"
+                )
         if not (0 <= self.short_correction_min_ms <= self.short_correction_max_ms):
             raise ValueError("invalid short-correction duration range")
 
     @property
     def target_horizons_ms(self) -> tuple[float, ...]:
         return self.prediction_horizons_ms or (self.prediction_horizon_ms,)
+
+    @property
+    def sampling_horizon_indices(self) -> tuple[int, ...]:
+        horizons = self.target_horizons_ms
+        if not self.sampling_horizons_ms:
+            return tuple(range(len(horizons)))
+        return tuple(horizons.index(value) for value in self.sampling_horizons_ms)
 
     @property
     def frame_offsets_ms(self) -> tuple[float, ...]:
@@ -139,6 +160,7 @@ def build_samples(
 ) -> list[DatasetSample]:
     config.validate()
     horizons = config.target_horizons_ms
+    sampling_indices = config.sampling_horizon_indices
     start_ms = config.history_ms
     end_ms = timeline.duration_ms - max(horizons)
     if end_ms < start_ms:
@@ -198,8 +220,10 @@ def build_samples(
                 target_timestamp_ms=target_timestamps[0],
                 target_pressed=target_states[0],
                 transition_distance_ms=distances[0],
-                near_transition=any(near_transitions),
-                near_short_correction=any(near_short),
+                near_transition=any(near_transitions[index] for index in sampling_indices),
+                near_short_correction=any(
+                    near_short[index] for index in sampling_indices
+                ),
                 target_frame_indices=target_indices,
                 target_timestamps_ms=target_timestamps,
                 target_pressed_by_horizon=target_states,

@@ -267,11 +267,12 @@ class StateConditionedRuntimeEngine:
             action = ControlAction.PRESS if self.pressed else ControlAction.RELEASE
             self.executor.set_pressed(self.pressed)
             lateness_ms = max(0.0, (self._clock() - wall_due) * 1000.0)
-            deadline_reason = (
-                "consensus_execute_deadline"
-                if self.transition_lifecycle is not None
-                else "pending_execute_deadline"
-            )
+            if self.transition_lifecycle is not None:
+                deadline_reason = "consensus_execute_deadline"
+            elif getattr(execution, "kind", None) == "hold_reversal":
+                deadline_reason = "hold_reversal_execute_deadline"
+            else:
+                deadline_reason = "pending_execute_deadline"
             self._deadline_events.append(
                 DeadlineControlEvent(
                     timestamp_ms=pending_due_ms,

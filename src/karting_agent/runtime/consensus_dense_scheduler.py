@@ -71,6 +71,7 @@ class ConsensusDecision:
     pending_delay_ms: float | None = None
     consensus_heads_ms: tuple[float, ...] = ()
     consensus_due_spread_ms: float | None = None
+    evidence_lead_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,7 @@ class ConsensusDenseHorizonScheduler:
         pending_due_ms: float | None = None,
         heads: tuple[float, ...] = (),
         spread_ms: float | None = None,
+        evidence_lead_ms: float | None = None,
     ) -> ConsensusDecision:
         return ConsensusDecision(
             timestamp_ms=timestamp_ms,
@@ -282,6 +284,7 @@ class ConsensusDenseHorizonScheduler:
             ),
             consensus_heads_ms=heads,
             consensus_due_spread_ms=spread_ms,
+            evidence_lead_ms=evidence_lead_ms,
         )
 
     def _switch_now(
@@ -293,6 +296,7 @@ class ConsensusDenseHorizonScheduler:
         probabilities: tuple[float, ...],
         heads: tuple[float, ...] = (),
         spread_ms: float | None = None,
+        evidence_lead_ms: float | None = None,
     ) -> ConsensusDecision:
         self._pending = None
         self._last_switch_ms = timestamp_ms
@@ -309,6 +313,7 @@ class ConsensusDenseHorizonScheduler:
             probabilities=probabilities,
             heads=heads,
             spread_ms=spread_ms,
+            evidence_lead_ms=evidence_lead_ms,
         )
 
     def execute_pending_if_due(
@@ -453,6 +458,10 @@ class ConsensusDenseHorizonScheduler:
                 probabilities=values,
                 heads=pending.support_heads_ms,
                 spread_ms=pending.due_spread_ms,
+                evidence_lead_ms=max(
+                    0.0,
+                    pending.due_at_ms - pending.armed_at_ms,
+                ),
             )
 
         self._remember(

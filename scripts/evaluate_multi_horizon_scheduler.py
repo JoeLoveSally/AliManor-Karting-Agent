@@ -109,6 +109,14 @@ def parse_args() -> argparse.Namespace:
             "probability as an overdue short correction once the state hold expires."
         ),
     )
+    parser.add_argument(
+        "--reserve-bounded-reversal-during-min-hold",
+        action="store_true",
+        help=(
+            "Remember a near-horizon reversal pattern observed during minimum "
+            "state hold and execute it when the hold expires."
+        ),
+    )
     parser.add_argument("--tolerance-ms", type=float, default=None)
     return parser.parse_args()
 
@@ -447,6 +455,8 @@ def main() -> int:
             suffix_parts.append("hold_arm")
         if args.execute_short_horizon_overdue:
             suffix_parts.append("short_overdue")
+        if args.reserve_bounded_reversal_during_min_hold:
+            suffix_parts.append("hold_reversal")
         suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
         output_path = (
             artifact
@@ -469,6 +479,9 @@ def main() -> int:
         pending_advance_ms=float(args.pending_advance_ms),
         arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
         execute_short_horizon_overdue=bool(args.execute_short_horizon_overdue),
+        reserve_bounded_reversal_during_min_hold=bool(
+            args.reserve_bounded_reversal_during_min_hold
+        ),
     )
     scheduler_config.validate()
     control_index = horizons.index(scheduler_config.control_horizon_ms)
@@ -591,7 +604,9 @@ def main() -> int:
         f"anticipation_h={scheduler_config.anticipation_horizon_ms:g}ms "
         f"pending_advance={scheduler_config.pending_advance_ms:g}ms "
         f"hold_arm={scheduler_config.arm_pending_during_min_hold} "
-        f"short_overdue={scheduler_config.execute_short_horizon_overdue}",
+        f"short_overdue={scheduler_config.execute_short_horizon_overdue} "
+        f"hold_reversal="
+        f"{scheduler_config.reserve_bounded_reversal_during_min_hold}",
         flush=True,
     )
     print_replay_summary("baseline_h200", baseline_summary)

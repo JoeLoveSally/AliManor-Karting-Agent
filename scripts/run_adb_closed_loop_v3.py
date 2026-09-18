@@ -163,6 +163,10 @@ def main() -> int:
         executor = MockExecutor()
 
     scheduler = None
+    direct_h0 = (
+        not args.multi_horizon_scheduler
+        and abs(float(model.spec.control_horizon_ms)) <= 1e-6
+    )
     if args.multi_horizon_scheduler:
         scheduler = MultiHorizonSwitchScheduler(
             MultiHorizonSchedulerConfig(
@@ -186,6 +190,7 @@ def main() -> int:
             frame_offsets_ms=model.spec.frame_offsets_ms,
             prediction_horizon_ms=model.spec.prediction_horizon_ms,
             switch_threshold=args.switch_threshold,
+            min_state_hold_ms=(float(args.min_state_hold_ms) if direct_h0 else 0.0),
             execute_pending_at_due=bool(args.execute_pending_at_due),
         ),
         initial_pressed=False,
@@ -206,11 +211,12 @@ def main() -> int:
         adb_input = AdbInput(client)
 
     mode = "ARMED" if args.arm else "DRY-RUN"
-    policy = (
-        "v3-state-conditioned-multi-horizon"
-        if scheduler is not None
-        else "v3-state-conditioned"
-    )
+    if scheduler is not None:
+        policy = "v3-state-conditioned-multi-horizon"
+    elif direct_h0:
+        policy = "v5-h0-immediate"
+    else:
+        policy = "v3-state-conditioned"
     print(f"Mode: {mode}; policy={policy}; input={args.input}", flush=True)
     print(
         f"ADB: serial={client.config.serial or '<default>'}; "
@@ -229,6 +235,8 @@ def main() -> int:
         f"switch_horizon={model.spec.prediction_horizon_ms:g}ms, "
         f"switch_threshold={args.switch_threshold:.2f}"
     )
+    if direct_h0:
+        runtime_detail += f", min_state_hold={args.min_state_hold_ms:g}ms"
     if scheduler is not None:
         runtime_detail += (
             f", anticipation_horizon={scheduler.config.anticipation_horizon_ms:g}ms"
@@ -345,6 +353,8 @@ def main() -> int:
                     )
                     if step.pending_due_ms is not None:
                         suffix += f" pending_due={step.pending_due_ms:.1f}ms"
+                elif direct_h0 and step.scheduler_reason is not None:
+                    suffix += f" reason={step.scheduler_reason}"
                 print(
                     f"t={step.observation_timestamp_ms:8.1f}ms "
                     f"p_switch={step.probability:.3f} action={step.action.value:<7} "

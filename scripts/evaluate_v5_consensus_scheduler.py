@@ -30,6 +30,9 @@ from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402
     ConsensusDenseConfig,
     ConsensusDenseHorizonScheduler,
 )
+from karting_agent.runtime.consensus_transition_lifecycle import (  # noqa: E402
+    ConsensusTransitionLifecycle,
+)
 from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa: E402
 from karting_agent.train.h0_closed_loop import simulate_h0_closed_loop  # noqa: E402
 from karting_agent.train.sequence_evaluator import (  # noqa: E402
@@ -355,6 +358,150 @@ def main() -> int:
         tolerance_ms=tolerance_ms,
     )
 
+    lifecycle_points_by_video: dict[str, list[SequencePoint]] = {}
+    lifecycle_switch_times: dict[str, list[float]] = {}
+    lifecycle_event_counts: Counter[str] = Counter()
+    lifecycle_state_correct = 0
+    lifecycle_state_total = 0
+
+    for video, raw_indices in indices_by_video.items():
+        indices = sorted(
+            raw_indices,
+            key=lambda index: float(samples[index].input_timestamps_ms[-1]),
+        )
+        timestamps = [
+            float(samples[index].input_timestamps_ms[-1]) for index in indices
+        ]
+        initial = samples[indices[0]].current_pressed
+        if initial is None:
+            raise ValueError("validation sample missing current_pressed")
+        state = bool(initial)
+        scheduler = ConsensusDenseHorizonScheduler(scheduler_config)
+        lifecycle = ConsensusTransitionLifecycle(
+            threshold=args.threshold,
+            min_state_hold_ms=args.min_state_hold_ms,
+        )
+        points = [
+            SequencePoint(
+                video=video,
+                timestamp_ms=timestamps[0] - 1e-3,
+                probability=1.0 if state else 0.0,
+            )
+        ]
+        switch_times: list[float] = []
+        expert_states = [
+            bool(samples[index].current_pressed) for index in indices
+        ]
+
+        for local_index, sample_index in enumerate(indices):
+            timestamp_ms = timestamps[local_index]
+            due_ms = scheduler.pending_due_ms
+            if due_ms is not None and due_ms <= timestamp_ms + 1e-6:
+                previous_state = state
+                execution = scheduler.execute_pending_if_due(
+                    timestamp_ms=due_ms,
+                    current_pressed=state,
+                )
+                if execution is not None:
+                    state = not state
+                    switch_times.append(due_ms)
+                    points.append(
+                        SequencePoint(
+                            video=video,
+                            timestamp_ms=due_ms,
+                            probability=1.0 if state else 0.0,
+                        )
+                    )
+                    lifecycle.begin(
+                        executed_at_ms=due_ms,
+                        previous_pressed=previous_state,
+                        current_pressed=state,
+                        evidence_lead_ms=execution.delay_ms,
+                    )
+                    lifecycle_event_counts["consensus_execute_deadline"] += 1
+
+            probabilities = (
+                switch_if_press[sample_index]
+                if state
+                else switch_if_release[sample_index]
+            )
+            effective_probabilities = np.asarray(
+                probabilities,
+                dtype=np.float64,
+            ).copy()
+
+            if lifecycle.active:
+                pending = lifecycle.pending
+                assert pending is not None
+                previous_probabilities = (
+                    switch_if_press[sample_index]
+                    if pending.previous_pressed
+                    else switch_if_release[sample_index]
+                )
+                lifecycle_status = lifecycle.observe(
+                    timestamp_ms=timestamp_ms,
+                    previous_state_h0_probability=float(
+                        previous_probabilities[0]
+                    ),
+                )
+                lifecycle_event_counts[
+                    f"lifecycle_{lifecycle_status}"
+                ] += 1
+                if lifecycle_status in {"waiting", "confirmed"}:
+                    effective_probabilities[0] = 0.0
+
+            decision = scheduler.update(
+                timestamp_ms=timestamp_ms,
+                probabilities=effective_probabilities,
+                current_pressed=state,
+            )
+            lifecycle_event_counts[decision.reason] += 1
+            if decision.switch:
+                previous_state = state
+                state = not state
+                switch_times.append(timestamp_ms)
+                points.append(
+                    SequencePoint(
+                        video=video,
+                        timestamp_ms=timestamp_ms,
+                        probability=1.0 if state else 0.0,
+                    )
+                )
+                if decision.reason == "consensus_execute":
+                    lifecycle.begin(
+                        executed_at_ms=timestamp_ms,
+                        previous_pressed=previous_state,
+                        current_pressed=state,
+                        evidence_lead_ms=args.min_state_hold_ms,
+                    )
+                else:
+                    lifecycle.clear()
+
+            lifecycle_state_total += 1
+            lifecycle_state_correct += int(
+                state == expert_states[local_index]
+            )
+
+        final_timestamp_ms = timestamps[-1]
+        if points[-1].timestamp_ms < final_timestamp_ms - 1e-6:
+            points.append(
+                SequencePoint(
+                    video=video,
+                    timestamp_ms=final_timestamp_ms,
+                    probability=1.0 if state else 0.0,
+                )
+            )
+        lifecycle_points_by_video[video] = points
+        lifecycle_switch_times[video] = switch_times
+
+    lifecycle_summary = dense_base._event_summary(
+        lifecycle_points_by_video,
+        lifecycle_switch_times,
+        (lifecycle_state_correct, lifecycle_state_total),
+        label_data,
+        tolerance_ms=tolerance_ms,
+    )
+
     def unmatched_diagnostics(
         points_by_video: dict[str, list[SequencePoint]],
         event_metadata_by_video: dict[str, list[dict[str, object]]] | None,
@@ -503,6 +650,18 @@ def main() -> int:
     )
     dense_base._print_summary(f"h0_min_hold_{args.min_state_hold_ms:g}ms", h0_summary)
     dense_base._print_summary("consensus_dense_scheduler", consensus_summary)
+    dense_base._print_summary(
+        "consensus_lifecycle_guard",
+        lifecycle_summary,
+    )
+    print(
+        "lifecycle events: "
+        + ", ".join(
+            f"{key}={value}"
+            for key, value in sorted(lifecycle_event_counts.items())
+        ),
+        flush=True,
+    )
     print(
         "consensus events: "
         + ", ".join(f"{key}={value}" for key, value in sorted(event_counts.items())),
@@ -566,6 +725,8 @@ def main() -> int:
         "transition_tolerance_ms": tolerance_ms,
         "h0_min_hold": h0_summary,
         "consensus_dense_scheduler": consensus_summary,
+        "consensus_lifecycle_guard": lifecycle_summary,
+        "lifecycle_events": dict(sorted(lifecycle_event_counts.items())),
         "consensus_events": dict(sorted(event_counts.items())),
         "consensus_armed_delay_ms": delay_summary,
         "consensus_due_spread_ms": spread_summary,

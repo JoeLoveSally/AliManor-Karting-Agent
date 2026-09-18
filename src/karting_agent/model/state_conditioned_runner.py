@@ -177,6 +177,33 @@ class StateConditionedModelRunner:
             current_pressed=current_pressed,
         )
 
+    def predict_native_switch_and_future_all(
+        self,
+        inputs: np.ndarray,
+        current_pressed: bool,
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Return native switch and absolute future-action probabilities in one pass."""
+
+        tensor = self._tensor(inputs)
+        state = self._torch.tensor(
+            [1 if current_pressed else 0],
+            device=self.device,
+            dtype=self._torch.long,
+        )
+        with self._torch.inference_mode():
+            switch_logits, future_logits = self.model(tensor, state)
+            switch_probabilities = self._torch.sigmoid(switch_logits)[0]
+            future_probabilities = self._torch.sigmoid(future_logits)[0]
+            switch_values = tuple(
+                float(value)
+                for value in switch_probabilities.detach().cpu().tolist()
+            )
+            future_values = tuple(
+                float(value)
+                for value in future_probabilities.detach().cpu().tolist()
+            )
+        return switch_values, future_values
+
     def predict_switch(self, inputs: np.ndarray, current_pressed: bool) -> float:
         probabilities = self.predict_switch_all(inputs, current_pressed)
         return probabilities[self.spec.control_output_index]

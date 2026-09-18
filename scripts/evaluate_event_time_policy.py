@@ -136,7 +136,11 @@ def _load_label_data(
         for event in events[1:]
     ]
     releases = [
-        ReleaseSegment(video=video, start_ms=current.timestamp_ms, end_ms=nxt.timestamp_ms)
+        ReleaseSegment(
+            video=video,
+            start_ms=current.timestamp_ms,
+            end_ms=nxt.timestamp_ms,
+        )
         for current, nxt in zip(events, events[1:])
         if not current.pressed and nxt.pressed
     ]
@@ -319,7 +323,11 @@ def main() -> int:
     cache_root = frame_cache_root_from_config(raw, ROOT)
     artifact = _artifact_dir(raw)
     model_path = args.model.resolve() if args.model else artifact / "model.pt"
-    metadata_path = args.metadata.resolve() if args.metadata else artifact / "metadata.json"
+    metadata_path = (
+        args.metadata.resolve()
+        if args.metadata
+        else artifact / "metadata.json"
+    )
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("model_family") != "event_time_v4c4":
         raise ValueError("metadata is not a V4-C4 event-time artifact")

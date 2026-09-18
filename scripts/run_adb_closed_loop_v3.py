@@ -643,15 +643,15 @@ def main() -> int:
                 "state_conditioned_kart_relative_v5_h0_consensus_lifecycle"
                 if args.consensus_dense_scheduler
                 else (
-                "state_conditioned_transition_v3_multi_horizon"
-                if scheduler is not None
-                else (
-                    "state_conditioned_kart_relative_v5_h0_direct"
-                    if direct_h0
-                    else "state_conditioned_transition_v3"
+                    "state_conditioned_transition_v3_multi_horizon"
+                    if scheduler is not None
+                    else (
+                        "state_conditioned_kart_relative_v5_h0_direct"
+                        if direct_h0
+                        else "state_conditioned_transition_v3"
+                    )
                 )
             )
-        )
         ),
         "input_mode": args.input,
         "wait_for_start": args.wait_for_start,

@@ -37,6 +37,7 @@ dataset:
   frame_interval_ms: 50
   prediction_horizon_ms: 200
   prediction_horizons_ms: [100, 150, 200, 250, 300]
+  sampling_horizons_ms: [100, 200, 300]
   control_horizon_ms: 200
   transition_window_ms: 200
   short_correction_min_ms: 100

@@ -348,6 +348,15 @@ def main() -> int:
             dense_total += 1
             dense_correct += int(state == expert_states[local_index])
 
+        final_timestamp_ms = timestamps[-1]
+        if points[-1].timestamp_ms < final_timestamp_ms - 1e-6:
+            points.append(
+                SequencePoint(
+                    video=video,
+                    timestamp_ms=final_timestamp_ms,
+                    probability=1.0 if state else 0.0,
+                )
+            )
         dense_points_by_video[video] = points
         dense_switch_times[video] = switch_times
 

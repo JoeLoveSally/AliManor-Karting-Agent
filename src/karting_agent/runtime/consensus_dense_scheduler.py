@@ -375,19 +375,11 @@ class ConsensusDenseHorizonScheduler:
                     current_pressed=current_pressed,
                     probabilities=values,
                 )
-            expiry = self._hold_expiry_ms()
-            assert expiry is not None
-            if self._pending is None:
-                self._pending = _Pending(
-                    state_before=current_pressed,
-                    armed_at_ms=timestamp_ms,
-                    due_at_ms=expiry,
-                    support_heads_ms=(0.0,),
-                    due_spread_ms=0.0,
-                )
-                reason: ConsensusReason = "consensus_armed"
-            else:
-                reason = "consensus_wait"
+            # Preserve the validated H0 min-hold semantics: H0 itself does not
+            # create a timer at hold expiry. An already-armed future consensus
+            # may remain active, but otherwise the next regular inference after
+            # hold expiry decides whether to switch.
+            pending = self._pending
             self._remember(
                 timestamp_ms=timestamp_ms,
                 probabilities=values,
@@ -396,12 +388,12 @@ class ConsensusDenseHorizonScheduler:
             return self._decision(
                 timestamp_ms=timestamp_ms,
                 switch=False,
-                reason=reason,
+                reason="min_hold",
                 current_pressed=current_pressed,
                 probabilities=values,
-                pending_due_ms=self._pending.due_at_ms,
-                heads=self._pending.support_heads_ms,
-                spread_ms=self._pending.due_spread_ms,
+                pending_due_ms=None if pending is None else pending.due_at_ms,
+                heads=() if pending is None else pending.support_heads_ms,
+                spread_ms=None if pending is None else pending.due_spread_ms,
             )
 
         self._refresh_forecasts(timestamp_ms=timestamp_ms, probabilities=values)

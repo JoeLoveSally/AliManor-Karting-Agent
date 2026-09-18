@@ -32,6 +32,11 @@ from train_model_v4c1 import should_stop_early, write_json_atomic  # noqa: E402
 from karting_agent.model.kart_relative_supervised import (  # noqa: E402
     build_kart_relative_model,
 )
+from karting_agent.model.temporal_delta import (  # noqa: E402
+    initialize_current_rgb_delta_first_conv,
+    transform_temporal_input_torch,
+    validate_temporal_input_representation,
+)
 from karting_agent.train.evaluator import BinaryMetricAccumulator  # noqa: E402
 from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa: E402
 from karting_agent.train.kart_relative_labels import (  # noqa: E402
@@ -71,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--require-cache", action="store_true")
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Train and validate without loading or evaluating the frozen test split.",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +131,8 @@ def run_epoch(
     heading_weight_multiplier: float,
     edge_risk_weight_multiplier: float,
     primary_output_index: int,
+    input_representation: str = "raw_rgb_stack",
+    frame_stack: int = 5,
     optimizer=None,
     threshold: float = 0.5,
     max_batches: int | None = None,
@@ -156,6 +168,11 @@ def run_epoch(
             if max_batches is not None and batch_index >= max_batches:
                 break
             inputs = batch["input"].to(device=device, dtype=torch.float32)
+            inputs = transform_temporal_input_torch(
+                inputs,
+                frame_stack=frame_stack,
+                representation=input_representation,
+            )
             current_pressed = batch["current_pressed"].to(device=device)
             switch_targets = batch["switch_target"].to(
                 device=device, dtype=torch.float32
@@ -401,6 +418,26 @@ def main() -> int:
     ):
         raise ValueError("v4-C2 config sections must be mappings")
 
+    model_family = str(
+        model_config.get("family", "state_conditioned_kart_relative_v4c2")
+    )
+    if model_family not in {
+        "state_conditioned_kart_relative_v4c2",
+        "state_conditioned_kart_relative_v4c3_delta",
+    }:
+        raise ValueError(f"unsupported v4-C2/C3 model family: {model_family}")
+    input_representation = validate_temporal_input_representation(
+        str(model_config.get("input_representation", "raw_rgb_stack"))
+    )
+    if (
+        model_family == "state_conditioned_kart_relative_v4c3_delta"
+        and input_representation != "current_rgb_plus_adjacent_deltas"
+    ):
+        raise ValueError(
+            "state_conditioned_kart_relative_v4c3_delta requires "
+            "current_rgb_plus_adjacent_deltas"
+        )
+
     architecture = str(model_config.get("architecture", "mobilenet_v3_small"))
     frame_stack = int(model_config.get("frame_stack", 5))
     pretrained = bool(model_config.get("pretrained", True)) and not args.no_pretrained
@@ -479,11 +516,12 @@ def main() -> int:
     device = select_device(torch)
     print(f"Device: {device}", flush=True)
     print(
-        f"V4-C2: lateral_weight={lateral_weight:g} "
+        f"{model_family}: lateral_weight={lateral_weight:g} "
         f"heading_weight={heading_weight:g} "
         f"edge_risk_weight={edge_risk_weight:g} horizons={horizons} "
         f"control_horizon={control_ms:g}ms "
-        f"counterfactual_train={counterfactual_train}",
+        f"counterfactual_train={counterfactual_train} "
+        f"input_representation={input_representation}",
         flush=True,
     )
     print(
@@ -492,6 +530,11 @@ def main() -> int:
         flush=True,
     )
 
+    dataset_names = (
+        ("train", "validation")
+        if args.skip_test
+        else ("train", "validation", "test")
+    )
     datasets = {
         name: KartRelativeSupervisedVideoDataset(
             partitions[name],
@@ -504,7 +547,7 @@ def main() -> int:
                 counterfactual_train if name == "train" else False
             ),
         )
-        for name in ("train", "validation", "test")
+        for name in dataset_names
     }
     base_weights = build_sample_weights(partitions["train"], sampling_config)
     train_weights = (
@@ -535,14 +578,15 @@ def main() -> int:
             num_workers=num_workers,
             pin_memory=device.type == "cuda",
         ),
-        "test": make_loader(
+    }
+    if not args.skip_test:
+        loaders["test"] = make_loader(
             DataLoader,
             datasets["test"],
             batch_size=loop_config.batch_size,
             num_workers=num_workers,
             pin_memory=device.type == "cuda",
-        ),
-    }
+        )
 
     model = build_kart_relative_model(
         architecture,
@@ -552,7 +596,17 @@ def main() -> int:
         visual_feature_dim=visual_feature_dim,
         state_embedding_dim=state_embedding_dim,
         hidden_dim=hidden_dim,
-    ).to(device)
+    )
+    if (
+        input_representation == "current_rgb_plus_adjacent_deltas"
+        and pretrained
+    ):
+        initialize_current_rgb_delta_first_conv(
+            model,
+            architecture=architecture,
+            frame_stack=frame_stack,
+        )
+    model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=loop_config.learning_rate,
@@ -565,6 +619,8 @@ def main() -> int:
         "heading_weight_multiplier": heading_weight,
         "edge_risk_weight_multiplier": edge_risk_weight,
         "primary_output_index": primary_index,
+        "input_representation": input_representation,
+        "frame_stack": frame_stack,
     }
     if args.smoke:
         train_summary = run_epoch(
@@ -686,10 +742,12 @@ def main() -> int:
         except TypeError:
             state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
-        test_summary = run_epoch(model, loaders["test"], device, **kwargs)
-        print_summary("test", test_summary, horizons, primary_index)
+        test_summary = None
+        if not args.skip_test:
+            test_summary = run_epoch(model, loaders["test"], device, **kwargs)
+            print_summary("test", test_summary, horizons, primary_index)
         metadata = {
-            "model_family": "state_conditioned_kart_relative_v4c2",
+            "model_family": model_family,
             "architecture": architecture,
             "frame_stack": frame_stack,
             "visual_feature_dim": visual_feature_dim,
@@ -697,6 +755,7 @@ def main() -> int:
             "hidden_dim": hidden_dim,
             "prediction_horizons_ms": list(horizons),
             "control_horizon_ms": control_ms,
+            "input_representation": input_representation,
             "counterfactual_train_states": counterfactual_train,
             "relation_labels": str(relation_labels_path),
             "loss_weights": {
@@ -707,6 +766,7 @@ def main() -> int:
             },
             "best_epoch": best_epoch,
             "best_validation_switch_loss": best_loss,
+            "test_evaluated": not args.skip_test,
             "test": test_summary,
             "config": str(config_path),
         }

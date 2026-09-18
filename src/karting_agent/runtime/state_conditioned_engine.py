@@ -87,6 +87,8 @@ class StateConditionedRuntimeStep(RuntimeStep):
     pending_delay_ms: float | None = None
     inference_trigger: str = "regular"
     lifecycle_status: str | None = None
+    raw_control_probability: float | None = None
+    lifecycle_previous_state_probability: float | None = None
 
 
 @dataclass(frozen=True)
@@ -299,9 +301,12 @@ class StateConditionedRuntimeEngine:
             before = self.pressed
             started = time.perf_counter()
             lifecycle_status: str | None = None
+            raw_control_probability: float | None = None
+            lifecycle_previous_state_probability: float | None = None
             if self.scheduler is None:
                 probability = float(self.model.predict_switch(temporal.input, before))
                 probabilities = (probability,)
+                raw_control_probability = probability
             else:
                 probabilities = tuple(
                     float(value)
@@ -310,7 +315,11 @@ class StateConditionedRuntimeEngine:
                 control_index = self.scheduler.config.horizons_ms.index(
                     self.scheduler.config.control_horizon_ms
                 )
-                if self.transition_lifecycle is not None and self.transition_lifecycle.active:
+                raw_control_probability = probabilities[control_index]
+                if (
+                    self.transition_lifecycle is not None
+                    and self.transition_lifecycle.active
+                ):
                     pending = self.transition_lifecycle.pending
                     assert pending is not None
                     previous_probabilities = tuple(
@@ -320,11 +329,14 @@ class StateConditionedRuntimeEngine:
                             pending.previous_pressed,
                         )
                     )
+                    lifecycle_previous_state_probability = previous_probabilities[
+                        control_index
+                    ]
                     lifecycle_status = self.transition_lifecycle.observe(
                         timestamp_ms=frame.timestamp_ms,
-                        previous_state_h0_probability=previous_probabilities[
-                            control_index
-                        ],
+                        previous_state_h0_probability=(
+                            lifecycle_previous_state_probability
+                        ),
                     )
                     if lifecycle_status in {"waiting", "confirmed"}:
                         masked = list(probabilities)
@@ -419,6 +431,10 @@ class StateConditionedRuntimeEngine:
                 pending_delay_ms=pending_delay_ms,
                 inference_trigger=inference_trigger,
                 lifecycle_status=lifecycle_status,
+                raw_control_probability=raw_control_probability,
+                lifecycle_previous_state_probability=(
+                    lifecycle_previous_state_probability
+                ),
             )
 
     def shutdown(self) -> bool:

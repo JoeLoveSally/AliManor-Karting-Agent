@@ -371,3 +371,55 @@ def test_fixed_runtime_can_apply_direct_min_state_hold() -> None:
     assert blocked_again.action is ControlAction.HOLD
     assert blocked_again.scheduler_reason == "min_hold"
     assert executor.states == [True, False]
+
+
+def test_runtime_preserves_bounded_reversal_seen_during_min_hold() -> None:
+    executor = RecordingExecutor()
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            reserve_bounded_reversal_during_min_hold=True,
+        )
+    )
+    model = SequenceModel(
+        [
+            (0.10, 0.70, 0.90),
+            (0.98, 0.86, 0.03),
+            (0.25, 0.10, 0.05),
+            (0.10, 0.05, 0.05),
+        ]
+    )
+    engine = StateConditionedRuntimeEngine(
+        model=model,
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=make_runtime_config(),
+        scheduler=scheduler,
+    )
+
+    first = engine.ingest(make_frame(0, 0.0))
+    armed = engine.ingest(make_frame(1, 50.0))
+    waiting = engine.ingest(make_frame(2, 80.0))
+    reversed_step = engine.ingest(make_frame(3, 100.0))
+
+    assert first is not None
+    assert first.action is ControlAction.PRESS
+    assert first.scheduler_reason == "primary"
+
+    assert armed is not None
+    assert armed.action is ControlAction.HOLD
+    assert armed.scheduler_reason == "hold_reversal_armed"
+    assert armed.pending_due_ms == pytest.approx(100.0)
+
+    assert waiting is not None
+    assert waiting.action is ControlAction.HOLD
+    assert waiting.scheduler_reason == "hold_reversal_wait"
+
+    assert reversed_step is not None
+    assert reversed_step.action is ControlAction.RELEASE
+    assert reversed_step.scheduler_reason == "hold_reversal_execute"
+    assert executor.states == [True, False]

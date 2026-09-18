@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 import sys
@@ -411,6 +411,79 @@ def scheduler_diagnostics(
     }
 
 
+def hold_reversal_event_diagnostics(
+    decisions_by_video: dict[str, list[ReplayDecision]],
+    label_data: dict[str, tuple[list[Transition], list[ReleaseSegment]]],
+    *,
+    control_horizon_ms: float,
+    tolerance_ms: float,
+) -> list[dict[str, object]]:
+    """Describe each bounded hold-reversal execution against nearby ground truth."""
+
+    rows: list[dict[str, object]] = []
+    for video, decisions in decisions_by_video.items():
+        transitions, _ = label_data[video]
+        armed: ReplayDecision | None = None
+        for decision in decisions:
+            if decision.reason == "hold_reversal_armed":
+                armed = decision
+                continue
+            if decision.reason != "hold_reversal_execute":
+                continue
+
+            target_timestamp_ms = (
+                decision.observation_timestamp_ms + control_horizon_ms
+            )
+            same_state = [
+                transition
+                for transition in transitions
+                if transition.pressed == decision.state_after
+            ]
+            nearest = (
+                min(
+                    same_state,
+                    key=lambda transition: abs(
+                        transition.timestamp_ms - target_timestamp_ms
+                    ),
+                )
+                if same_state
+                else None
+            )
+            delta_ms = (
+                target_timestamp_ms - nearest.timestamp_ms
+                if nearest is not None
+                else None
+            )
+            rows.append(
+                {
+                    "video": video,
+                    "armed_at_ms": (
+                        None
+                        if armed is None
+                        else armed.observation_timestamp_ms
+                    ),
+                    "executed_at_ms": decision.observation_timestamp_ms,
+                    "target_timestamp_ms": target_timestamp_ms,
+                    "state_after": decision.state_after,
+                    "arm_probabilities": (
+                        None if armed is None else armed.probabilities
+                    ),
+                    "execute_probabilities": decision.probabilities,
+                    "nearest_gt_timestamp_ms": (
+                        None if nearest is None else nearest.timestamp_ms
+                    ),
+                    "target_delta_ms": delta_ms,
+                    "within_tolerance": (
+                        False
+                        if delta_ms is None
+                        else abs(delta_ms) <= tolerance_ms
+                    ),
+                }
+            )
+            armed = None
+    return rows
+
+
 def print_replay_summary(name: str, summary: dict[str, object]) -> None:
     target = summary["target_timeline"]
     observation = summary["observation_timeline"]
@@ -577,6 +650,7 @@ def main() -> int:
     }
 
     baseline_by_video: dict[str, list[ReplayDecision]] = {}
+    scheduler_control_by_video: dict[str, list[ReplayDecision]] = {}
     scheduler_by_video: dict[str, list[ReplayDecision]] = {}
     for video, indices in indices_by_video.items():
         baseline_by_video[video] = simulate_fixed_horizon(
@@ -588,6 +662,18 @@ def main() -> int:
             horizon_index=control_index,
             threshold=args.threshold,
         )
+        if scheduler_config.reserve_bounded_reversal_during_min_hold:
+            scheduler_control_by_video[video] = simulate_scheduler(
+                video,
+                samples,
+                indices,
+                switch_if_release,
+                switch_if_press,
+                scheduler_config=replace(
+                    scheduler_config,
+                    reserve_bounded_reversal_during_min_hold=False,
+                ),
+            )
         scheduler_by_video[video] = simulate_scheduler(
             video,
             samples,
@@ -603,6 +689,16 @@ def main() -> int:
         control_horizon_ms=scheduler_config.control_horizon_ms,
         tolerance_ms=tolerance_ms,
     )
+    scheduler_control_summary = (
+        replay_summary(
+            scheduler_control_by_video,
+            label_data,
+            control_horizon_ms=scheduler_config.control_horizon_ms,
+            tolerance_ms=tolerance_ms,
+        )
+        if scheduler_control_by_video
+        else None
+    )
     scheduler_summary = replay_summary(
         scheduler_by_video,
         label_data,
@@ -610,6 +706,12 @@ def main() -> int:
         tolerance_ms=tolerance_ms,
     )
     diagnostics = scheduler_diagnostics(scheduler_by_video)
+    hold_reversal_events = hold_reversal_event_diagnostics(
+        scheduler_by_video,
+        label_data,
+        control_horizon_ms=scheduler_config.control_horizon_ms,
+        tolerance_ms=tolerance_ms,
+    )
 
     print(
         f"split={args.split} samples={len(samples)} device={device} "
@@ -624,6 +726,8 @@ def main() -> int:
         flush=True,
     )
     print_replay_summary("baseline_h200", baseline_summary)
+    if scheduler_control_summary is not None:
+        print_replay_summary("scheduler_control", scheduler_control_summary)
     print_replay_summary("scheduler", scheduler_summary)
     print(
         "scheduler events: "
@@ -650,6 +754,25 @@ def main() -> int:
         f"{reversal_delays['max']:.1f}ms",
         flush=True,
     )
+    if hold_reversal_events:
+        print("hold reversal executions:", flush=True)
+        for row in hold_reversal_events:
+            arm_probs = row["arm_probabilities"]
+            assert isinstance(arm_probs, tuple)
+            delta_ms = row["target_delta_ms"]
+            delta_text = "n/a" if delta_ms is None else f"{float(delta_ms):+.1f}ms"
+            print(
+                f"  {row['video']} "
+                f"arm={float(row['armed_at_ms']):.1f}ms "
+                f"exec={float(row['executed_at_ms']):.1f}ms "
+                f"state={'PRESS' if row['state_after'] else 'RELEASE'} "
+                f"arm_probs=["
+                + ",".join(f"{float(value):.3f}" for value in arm_probs)
+                + "] "
+                f"nearest_gt_delta={delta_text} "
+                f"within_tol={row['within_tolerance']}",
+                flush=True,
+            )
 
     payload = {
         "split": args.split,
@@ -659,8 +782,10 @@ def main() -> int:
         "scheduler_config": asdict(scheduler_config),
         "transition_tolerance_ms": tolerance_ms,
         "baseline_h200": baseline_summary,
+        "scheduler_control": scheduler_control_summary,
         "scheduler": scheduler_summary,
         "scheduler_diagnostics": diagnostics,
+        "hold_reversal_events": hold_reversal_events,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

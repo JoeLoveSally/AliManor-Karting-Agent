@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--control-horizon-ms", type=float, default=None)
     parser.add_argument("--anchor-transition", type=int, default=5)
     parser.add_argument(
         "--offsets-ms",
@@ -373,7 +374,16 @@ def main() -> int:
         flush=True,
     )
     horizons = tuple(float(value) for value in model.spec.prediction_horizons_ms)
-    control_index = horizons.index(float(model.spec.control_horizon_ms))
+    control_horizon_ms = (
+        float(model.spec.control_horizon_ms)
+        if args.control_horizon_ms is None
+        else float(args.control_horizon_ms)
+    )
+    if control_horizon_ms not in horizons:
+        raise ValueError(
+            f"control horizon {control_horizon_ms:g}ms is not in {horizons}"
+        )
+    control_index = horizons.index(control_horizon_ms)
     for row in rows:
         ref_probs = row["reference_probabilities"]
         cand_probs = row["candidate_probabilities"]
@@ -421,7 +431,7 @@ def main() -> int:
                 "search_start_ms": args.search_start_ms,
                 "search_end_ms": search_end_ms,
                 "horizons_ms": list(horizons),
-                "control_horizon_ms": model.spec.control_horizon_ms,
+                "control_horizon_ms": control_horizon_ms,
                 "rows": rows,
             },
             indent=2,

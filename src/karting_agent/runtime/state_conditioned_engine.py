@@ -44,6 +44,7 @@ class StateConditionedRuntimeConfig:
     frame_offsets_ms: tuple[float, ...]
     prediction_horizon_ms: float
     switch_threshold: float = 0.6
+    min_state_hold_ms: float = 0.0
     execute_pending_at_due: bool = False
 
     def validate(self) -> None:
@@ -62,6 +63,8 @@ class StateConditionedRuntimeConfig:
             raise ValueError("prediction_horizon_ms must be finite and >= 0")
         if not 0.0 < self.switch_threshold < 1.0:
             raise ValueError("switch_threshold must be in (0, 1)")
+        if not math.isfinite(self.min_state_hold_ms) or self.min_state_hold_ms < 0.0:
+            raise ValueError("min_state_hold_ms must be finite and >= 0")
 
     @property
     def history_ms(self) -> float:
@@ -131,6 +134,7 @@ class StateConditionedRuntimeEngine:
         self.config = config
         self.scheduler = scheduler
         self.pressed = bool(initial_pressed)
+        self._last_direct_switch_ms: float | None = None
         self._buffer = TemporalFrameBuffer(config.history_ms)
         self._interval_ms = 1000.0 / config.target_fps
         self._next_regular_due_ms: float | None = None
@@ -280,8 +284,24 @@ class StateConditionedRuntimeEngine:
             if self.scheduler is None:
                 if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
                     raise ValueError("model probability must be finite and in [0, 1]")
-                should_switch = probability >= self.config.switch_threshold
-                scheduler_reason = None
+                wants_switch = probability >= self.config.switch_threshold
+                inside_direct_hold = (
+                    wants_switch
+                    and self.config.min_state_hold_ms > 0.0
+                    and self._last_direct_switch_ms is not None
+                    and frame.timestamp_ms
+                    < self._last_direct_switch_ms + self.config.min_state_hold_ms - 1e-6
+                )
+                should_switch = wants_switch and not inside_direct_hold
+                if self.config.min_state_hold_ms > 0.0:
+                    if inside_direct_hold:
+                        scheduler_reason = "min_hold"
+                    elif should_switch:
+                        scheduler_reason = "primary"
+                    else:
+                        scheduler_reason = "hold"
+                else:
+                    scheduler_reason = None
                 pending_due_ms = None
                 pending_delay_ms = None
             else:
@@ -298,6 +318,8 @@ class StateConditionedRuntimeEngine:
             if should_switch:
                 self._cancel_pending_timer_locked()
                 self.pressed = not before
+                if self.scheduler is None:
+                    self._last_direct_switch_ms = frame.timestamp_ms
                 action = ControlAction.PRESS if self.pressed else ControlAction.RELEASE
                 self.executor.set_pressed(self.pressed)
             else:

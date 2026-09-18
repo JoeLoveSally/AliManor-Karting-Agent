@@ -565,7 +565,9 @@ def print_replay_summary(name: str, summary: dict[str, object]) -> None:
         f"pred={target_transition['predicted']} "
         f"short_recall={target_short['recall']:.3f} "
         f"press_mae={press_timing['mae_ms']:.1f}ms "
+        f"press_bias={press_timing['mean_error_ms']:+.1f}ms "
         f"release_mae={release_timing['mae_ms']:.1f}ms "
+        f"release_bias={release_timing['mean_error_ms']:+.1f}ms "
         f"obs_f1={observation_transition['f1']:.3f} "
         f"chatter_lt100={chatter['lt_100ms']} "
         f"lt200={chatter['lt_200ms']}",

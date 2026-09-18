@@ -328,7 +328,7 @@ def main() -> int:
             scheduler_event = step.scheduler_reason in {
                 "pending_armed",
                 "pending_cancelled",
-            }
+            } or (direct_h0 and step.scheduler_reason == "min_hold")
             if args.verbose or step.action is not ControlAction.HOLD or scheduler_event:
                 if video_input is None:
                     input_detail = f"capture={adb_input.last_capture_ms:.1f}ms "

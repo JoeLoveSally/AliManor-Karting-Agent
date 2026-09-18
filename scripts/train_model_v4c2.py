@@ -656,7 +656,7 @@ def main() -> int:
         )
         for dataset in datasets.values():
             dataset.close()
-        print("V4-C2 smoke test passed.", flush=True)
+        print(f"{model_family} smoke test passed.", flush=True)
         return 0
 
     artifact_config = raw.get("artifact", {})

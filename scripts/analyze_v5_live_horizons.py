@@ -19,6 +19,10 @@ if str(SRC) not in sys.path:
 from karting_agent.model.state_conditioned_runner import (  # noqa: E402
     StateConditionedModelRunner,
 )
+from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402
+    ConsensusDenseConfig,
+    ConsensusDenseHorizonScheduler,
+)
 from karting_agent.train.live_horizon_analysis import (  # noqa: E402
     crossing_lead_ms,
     first_threshold_crossing,
@@ -42,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--window-steps", type=int, default=12)
+    parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
+    parser.add_argument("--consensus-heads", type=int, default=3)
+    parser.add_argument("--consensus-window-ms", type=float, default=60.0)
     return parser.parse_args()
 
 
@@ -120,6 +127,12 @@ def main() -> int:
     args = parse_args()
     if args.window_steps < 1:
         raise ValueError("--window-steps must be >= 1")
+    if args.min_state_hold_ms < 0:
+        raise ValueError("--min-state-hold-ms must be >= 0")
+    if args.consensus_heads < 2:
+        raise ValueError("--consensus-heads must be >= 2")
+    if args.consensus_window_ms < 0:
+        raise ValueError("--consensus-window-ms must be >= 0")
 
     run_path = args.run.resolve()
     run = _load_run(run_path)
@@ -224,6 +237,75 @@ def main() -> int:
         raise RuntimeError("H0 did not cross threshold at the first executed switch")
     _, reference_timestamp = reference_crossing
 
+    causal_scheduler = ConsensusDenseHorizonScheduler(
+        ConsensusDenseConfig(
+            horizons_ms=horizons,
+            threshold=threshold,
+            min_state_hold_ms=float(args.min_state_hold_ms),
+            min_consensus_heads=int(args.consensus_heads),
+            consensus_window_ms=float(args.consensus_window_ms),
+        )
+    )
+    causal_candidate: dict[str, object] | None = None
+    causal_state = initial_pressed
+    for row in causal_rows:
+        timestamp_ms = float(row["timestamp_ms"])
+        due_ms = causal_scheduler.pending_due_ms
+        if due_ms is not None and due_ms <= timestamp_ms + 1e-6:
+            execution = causal_scheduler.execute_pending_if_due(
+                timestamp_ms=due_ms,
+                current_pressed=causal_state,
+            )
+            if execution is not None:
+                causal_candidate = {
+                    "timestamp_ms": due_ms,
+                    "reason": "consensus_execute_deadline",
+                    "state_before": causal_state,
+                    "state_after": not causal_state,
+                    "armed_at_ms": execution.armed_at_ms,
+                    "delay_ms": execution.delay_ms,
+                    "support_heads_ms": list(execution.support_heads_ms),
+                    "due_spread_ms": execution.due_spread_ms,
+                }
+                break
+
+        decision = causal_scheduler.update(
+            timestamp_ms=timestamp_ms,
+            probabilities=tuple(float(value) for value in row["probabilities"]),
+            current_pressed=causal_state,
+        )
+        if decision.switch:
+            causal_candidate = {
+                "timestamp_ms": timestamp_ms,
+                "reason": decision.reason,
+                "state_before": causal_state,
+                "state_after": not causal_state,
+                "armed_at_ms": None,
+                "delay_ms": decision.evidence_lead_ms,
+                "support_heads_ms": list(decision.consensus_heads_ms),
+                "due_spread_ms": decision.consensus_due_spread_ms,
+            }
+            break
+
+    if causal_candidate is None:
+        due_ms = causal_scheduler.pending_due_ms
+        if due_ms is not None and due_ms < first_switch_timestamp - 1e-6:
+            execution = causal_scheduler.execute_pending_if_due(
+                timestamp_ms=due_ms,
+                current_pressed=causal_state,
+            )
+            if execution is not None:
+                causal_candidate = {
+                    "timestamp_ms": due_ms,
+                    "reason": "consensus_execute_deadline",
+                    "state_before": causal_state,
+                    "state_after": not causal_state,
+                    "armed_at_ms": execution.armed_at_ms,
+                    "delay_ms": execution.delay_ms,
+                    "support_heads_ms": list(execution.support_heads_ms),
+                    "due_spread_ms": execution.due_spread_ms,
+                }
+
     print(
         f"run={run_path.name} recording={recording_path.name} "
         f"steps={len(rows)} device={model.device} threshold={threshold:.2f}",
@@ -243,6 +325,25 @@ def main() -> int:
         f"h0={float(first_switch['probabilities'][h0_index]):.3f}",
         flush=True,
     )
+    if causal_candidate is None:
+        print("causal consensus first switch: no earlier candidate", flush=True)
+    else:
+        candidate_timestamp = float(causal_candidate["timestamp_ms"])
+        lead_vs_actual = first_switch_timestamp - candidate_timestamp
+        heads = ",".join(
+            f"h{float(value):g}"
+            for value in causal_candidate["support_heads_ms"]
+        )
+        print(
+            "causal consensus first switch: "
+            f"t={candidate_timestamp:.1f}ms "
+            f"reason={causal_candidate['reason']} "
+            f"lead_vs_actual={lead_vs_actual:+.1f}ms "
+            f"armed_at={causal_candidate['armed_at_ms']} "
+            f"delay={causal_candidate['delay_ms']} "
+            f"heads=[{heads}] spread={causal_candidate['due_spread_ms']}",
+            flush=True,
+        )
     print("pre-first-switch threshold crossings:", flush=True)
 
     for horizon_index, horizon_ms in enumerate(horizons):
@@ -311,6 +412,7 @@ def main() -> int:
         },
         "first_executed_switch": first_switch,
         "pre_first_switch_crossings": crossings,
+        "causal_consensus_first_switch": causal_candidate,
         "steps": rows,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

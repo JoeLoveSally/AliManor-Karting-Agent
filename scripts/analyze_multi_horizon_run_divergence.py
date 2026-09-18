@@ -510,14 +510,13 @@ def main() -> int:
     ):
         ref_next = reference_transitions[next_index]
         cand_next = candidate_transitions[next_index]
+        ref_delay_ms = ref_next.timestamp_ms - ref_anchor.timestamp_ms
+        cand_delay_ms = cand_next.timestamp_ms - cand_anchor.timestamp_ms
         print(
             "next transition after anchor: "
-            f"reference={ref_next.action}@"
-            f"{ref_next.timestamp_ms - ref_anchor.timestamp_ms:.1f}ms "
-            f"candidate={cand_next.action}@"
-            f"{cand_next.timestamp_ms - cand_anchor.timestamp_ms:.1f}ms "
-            f"delay_delta="
-            f"{(cand_next.timestamp_ms - cand_anchor.timestamp_ms) - (ref_next.timestamp_ms - ref_anchor.timestamp_ms):+.1f}ms",
+            f"reference={ref_next.action}@{ref_delay_ms:.1f}ms "
+            f"candidate={cand_next.action}@{cand_delay_ms:.1f}ms "
+            f"delay_delta={cand_delay_ms - ref_delay_ms:+.1f}ms",
             flush=True,
         )
 

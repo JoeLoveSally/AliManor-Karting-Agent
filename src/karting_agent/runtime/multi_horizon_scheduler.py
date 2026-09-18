@@ -22,6 +22,7 @@ SchedulerReason = Literal[
 ]
 
 PendingKind = Literal["anticipation", "hold_reversal"]
+AnticipationDirection = Literal["both", "press_only", "release_only"]
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class MultiHorizonSchedulerConfig:
     arm_pending_during_min_hold: bool = False
     execute_short_horizon_overdue: bool = False
     reserve_bounded_reversal_during_min_hold: bool = False
+    anticipation_direction: AnticipationDirection = "both"
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 2:
@@ -92,6 +94,15 @@ class MultiHorizonSchedulerConfig:
             raise ValueError("min_state_hold_ms must be finite and >= 0")
         if not math.isfinite(self.pending_advance_ms) or self.pending_advance_ms < 0:
             raise ValueError("pending_advance_ms must be finite and >= 0")
+        if self.anticipation_direction not in (
+            "both",
+            "press_only",
+            "release_only",
+        ):
+            raise ValueError(
+                "anticipation_direction must be one of: "
+                "both, press_only, release_only"
+            )
         anticipation_span_ms = (
             self.anticipation_horizon_ms - self.control_horizon_ms
         )
@@ -245,10 +256,22 @@ class MultiHorizonSwitchScheduler:
             and probabilities[self._anticipation_index] < threshold
         )
 
+    def _anticipation_enabled(self, current_pressed: bool) -> bool:
+        direction = self.config.anticipation_direction
+        if direction == "both":
+            return True
+        if direction == "press_only":
+            return not current_pressed
+        return current_pressed
+
     def _candidate(
         self,
         probabilities: tuple[float, ...],
+        *,
+        current_pressed: bool,
     ) -> tuple[float, float] | None:
+        if not self._anticipation_enabled(current_pressed):
+            return None
         control = probabilities[self._control_index]
         anticipation = probabilities[self._anticipation_index]
         threshold = self.config.threshold
@@ -448,7 +471,10 @@ class MultiHorizonSwitchScheduler:
                 probabilities=probabilities,
             )
 
-        candidate = self._candidate(probabilities)
+        candidate = self._candidate(
+            probabilities,
+            current_pressed=current_pressed,
+        )
         if self._pending is not None:
             pending = self._pending
             warning_valid = (

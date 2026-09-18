@@ -151,3 +151,24 @@ def test_pending_executes_on_deadline() -> None:
 
     assert execution is not None
     assert execution.due_at_ms == pytest.approx(armed.pending_due_ms)
+
+
+def test_h0_inside_hold_does_not_create_deadline() -> None:
+    scheduler = make_scheduler()
+    first = scheduler.update(
+        timestamp_ms=0.0,
+        probabilities=(0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
+        current_pressed=False,
+    )
+    assert first.switch
+
+    blocked = scheduler.update(
+        timestamp_ms=50.0,
+        probabilities=(0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
+        current_pressed=True,
+    )
+
+    assert not blocked.switch
+    assert blocked.reason == "min_hold"
+    assert blocked.pending_due_ms is None
+    assert scheduler.pending_due_ms is None

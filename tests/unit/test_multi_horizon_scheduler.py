@@ -532,3 +532,143 @@ def test_scheduler_rejects_non_increasing_timestamps() -> None:
             probabilities=(0.0, 0.0, 0.0),
             current_pressed=False,
         )
+
+
+def test_bounded_hold_reversal_is_opt_in() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+        )
+    )
+    first = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    assert first.switch is True
+
+    blocked = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.98, 0.86, 0.03),
+        current_pressed=True,
+    )
+
+    assert blocked.switch is False
+    assert blocked.reason == "min_hold"
+    assert scheduler.pending_due_ms is None
+
+
+def test_bounded_hold_reversal_reserves_until_hold_expiry() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            reserve_bounded_reversal_during_min_hold=True,
+        )
+    )
+    first = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    assert first.switch is True
+
+    armed = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.98, 0.86, 0.03),
+        current_pressed=True,
+    )
+    faded = scheduler.update(
+        timestamp_ms=1080.0,
+        probabilities=(0.25, 0.10, 0.05),
+        current_pressed=True,
+    )
+    executed = scheduler.update(
+        timestamp_ms=1100.0,
+        probabilities=(0.10, 0.05, 0.05),
+        current_pressed=True,
+    )
+
+    assert armed.switch is False
+    assert armed.reason == "hold_reversal_armed"
+    assert armed.pending_due_ms == pytest.approx(1100.0)
+    assert armed.pending_delay_ms == pytest.approx(50.0)
+    assert faded.switch is False
+    assert faded.reason == "hold_reversal_wait"
+    assert faded.pending_due_ms == pytest.approx(1100.0)
+    assert executed.switch is True
+    assert executed.reason == "hold_reversal_execute"
+    assert executed.pending_due_ms == pytest.approx(1100.0)
+    assert scheduler.pending_due_ms is None
+
+
+def test_bounded_hold_reversal_requires_return_by_anticipation_horizon() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            reserve_bounded_reversal_during_min_hold=True,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+
+    blocked = scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.98, 0.86, 0.75),
+        current_pressed=True,
+    )
+
+    assert blocked.switch is False
+    assert blocked.reason == "min_hold"
+    assert scheduler.pending_due_ms is None
+
+
+def test_bounded_hold_reversal_deadline_can_be_consumed_exactly() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            reserve_bounded_reversal_during_min_hold=True,
+        )
+    )
+    scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=False,
+    )
+    scheduler.update(
+        timestamp_ms=1050.0,
+        probabilities=(0.98, 0.86, 0.03),
+        current_pressed=True,
+    )
+
+    early = scheduler.execute_pending_if_due(
+        timestamp_ms=1099.0,
+        current_pressed=True,
+    )
+    executed = scheduler.execute_pending_if_due(
+        timestamp_ms=1100.0,
+        current_pressed=True,
+    )
+
+    assert early is None
+    assert executed is not None
+    assert executed.kind == "hold_reversal"
+    assert executed.due_at_ms == pytest.approx(1100.0)

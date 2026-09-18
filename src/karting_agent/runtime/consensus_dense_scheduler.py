@@ -33,7 +33,9 @@ class ConsensusDenseConfig:
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 4:
-            raise ValueError(\n                "consensus scheduler requires H0 plus at least three future heads"\n            )
+            raise ValueError(
+                "consensus scheduler requires H0 plus at least three future heads"
+            )
         if self.horizons_ms[0] != 0.0:
             raise ValueError("consensus scheduler requires H0 as the first horizon")
         if tuple(sorted(self.horizons_ms)) != self.horizons_ms:
@@ -50,7 +52,10 @@ class ConsensusDenseConfig:
             raise ValueError("min_consensus_heads must be >= 2")
         if self.min_consensus_heads > len(self.horizons_ms) - 1:
             raise ValueError("min_consensus_heads exceeds number of future heads")
-        if (\n            not math.isfinite(self.consensus_window_ms)\n            or self.consensus_window_ms < 0.0\n        ):
+        if (
+            not math.isfinite(self.consensus_window_ms)
+            or self.consensus_window_ms < 0.0
+        ):
             raise ValueError("consensus_window_ms must be finite and >= 0")
 
 
@@ -124,7 +129,8 @@ class ConsensusDenseHorizonScheduler:
     def _inside_min_hold(self, timestamp_ms: float) -> bool:
         return (
             self._last_switch_ms is not None
-            and timestamp_ms\n            < self._last_switch_ms + self.config.min_state_hold_ms - 1e-6
+            and timestamp_ms
+            < self._last_switch_ms + self.config.min_state_hold_ms - 1e-6
         )
 
     def _hold_expiry_ms(self) -> float | None:
@@ -212,7 +218,10 @@ class ConsensusDenseHorizonScheduler:
                 if not cluster:
                     cluster.append(forecast)
                     continue
-                if (\n                    forecast.due_at_ms - cluster[0].due_at_ms\n                    <= self.config.consensus_window_ms + 1e-6\n                ):
+                if (
+                    forecast.due_at_ms - cluster[0].due_at_ms
+                    <= self.config.consensus_window_ms + 1e-6
+                ):
                     cluster.append(forecast)
                 else:
                     break
@@ -267,7 +276,9 @@ class ConsensusDenseHorizonScheduler:
             control_probability=probabilities[0],
             pending_due_ms=pending_due_ms,
             pending_delay_ms=(
-                None\n                if pending_due_ms is None\n                else max(0.0, pending_due_ms - timestamp_ms)
+                None
+                if pending_due_ms is None
+                else max(0.0, pending_due_ms - timestamp_ms)
             ),
             consensus_heads_ms=heads,
             consensus_due_spread_ms=spread_ms,
@@ -345,7 +356,10 @@ class ConsensusDenseHorizonScheduler:
         timestamp_ms = float(timestamp_ms)
         if not math.isfinite(timestamp_ms):
             raise ValueError("timestamp_ms must be finite")
-        if (\n            self._last_timestamp_ms is not None\n            and timestamp_ms < self._last_timestamp_ms - 1e-6\n        ):
+        if (
+            self._last_timestamp_ms is not None
+            and timestamp_ms < self._last_timestamp_ms - 1e-6
+        ):
             raise ValueError("timestamps must be nondecreasing")
 
         current_pressed = bool(current_pressed)

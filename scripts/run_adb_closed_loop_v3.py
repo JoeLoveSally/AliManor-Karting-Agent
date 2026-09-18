@@ -107,6 +107,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reserve-bounded-reversal-during-min-hold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Remember a bounded near-horizon reversal observed during minimum "
+            "state hold and execute one reversal when the hold expires."
+        ),
+    )
+    parser.add_argument(
         "--execute-pending-at-due",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -152,6 +161,14 @@ def main() -> int:
     if args.arm_pending_during_min_hold and not args.multi_horizon_scheduler:
         raise ValueError(
             "--arm-pending-during-min-hold requires --multi-horizon-scheduler"
+        )
+    if (
+        args.reserve_bounded_reversal_during_min_hold
+        and not args.multi_horizon_scheduler
+    ):
+        raise ValueError(
+            "--reserve-bounded-reversal-during-min-hold requires "
+            "--multi-horizon-scheduler"
         )
     if args.execute_pending_at_due and not (
         args.multi_horizon_scheduler or args.consensus_dense_scheduler
@@ -230,6 +247,9 @@ def main() -> int:
                 min_state_hold_ms=float(args.min_state_hold_ms),
                 pending_advance_ms=float(args.pending_advance_ms),
                 arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
+                reserve_bounded_reversal_during_min_hold=bool(
+                    args.reserve_bounded_reversal_during_min_hold
+                ),
             )
         )
     elif args.consensus_dense_scheduler:
@@ -329,6 +349,8 @@ def main() -> int:
             f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
             f", pending_advance={scheduler.config.pending_advance_ms:g}ms"
             f", arm_pending_during_min_hold={scheduler.config.arm_pending_during_min_hold}"
+            f", reserve_bounded_reversal_during_min_hold="
+            f"{scheduler.config.reserve_bounded_reversal_during_min_hold}"
             f", execute_pending_at_due={args.execute_pending_at_due}"
         )
     print(runtime_detail, flush=True)
@@ -414,6 +436,8 @@ def main() -> int:
             scheduler_event = step.scheduler_reason in {
                 "pending_armed",
                 "pending_cancelled",
+                "hold_reversal_armed",
+                "hold_reversal_wait",
                 "consensus_armed",
                 "consensus_cancelled",
             } or (

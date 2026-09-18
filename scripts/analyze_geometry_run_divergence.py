@@ -91,8 +91,10 @@ def _nearest_preview(
 def _relation_values(row: dict[str, Any]) -> dict[str, Any]:
     relation = row.get("kart_road_relation")
     tracker = row.get("tracker")
+    pose = row.get("kart_pose")
     relation_map = relation if isinstance(relation, dict) else {}
     tracker_map = tracker if isinstance(tracker, dict) else {}
+    pose_map = pose if isinstance(pose, dict) else {}
     return {
         "frame_index": int(row["frame_index"]),
         "timestamp_ms": row.get("timestamp_ms"),
@@ -101,6 +103,8 @@ def _relation_values(row: dict[str, Any]) -> dict[str, Any]:
         "heading_error_deg": relation_map.get("heading_error_deg"),
         "road_angle_deg": relation_map.get("road_angle_deg"),
         "confidence": relation_map.get("confidence"),
+        "kart_heading_deg": pose_map.get("heading_angle_deg"),
+        "kart_heading_quality": pose_map.get("heading_quality"),
         "tracker_mode": tracker_map.get("mode"),
         "stable_angle_deg": tracker_map.get("stable_angle_deg"),
         "pending_angle_deg": tracker_map.get("pending_angle_deg"),
@@ -162,6 +166,8 @@ def main() -> int:
                 "candidate": cand_values,
                 "delta_lateral_offset_norm": delta("lateral_offset_norm"),
                 "delta_heading_error_deg": delta("heading_error_deg"),
+                "delta_road_angle_deg": delta("road_angle_deg"),
+                "delta_kart_heading_deg": delta("kart_heading_deg"),
                 "delta_confidence": delta("confidence"),
             }
         )
@@ -178,9 +184,9 @@ def main() -> int:
     )
     print(
         " offset | "
-        " ref_frame  ref_lat ref_herr ref_in | "
-        " cur_frame  cur_lat cur_herr cur_in | "
-        " d_lat  d_herr",
+        " ref_frame ref_lat ref_kart ref_road ref_herr ref_conf ref_mode | "
+        " cur_frame cur_lat cur_kart cur_road cur_herr cur_conf cur_mode | "
+        " d_lat d_herr",
         flush=True,
     )
     for row in rows:
@@ -191,13 +197,19 @@ def main() -> int:
         print(
             f"{float(row['offset_ms']):+7.0f} | "
             f"{int(ref['frame_index']):9d} "
-            f"{_fmt(ref['lateral_offset_norm'])} "
-            f"{_fmt(ref['heading_error_deg'])} "
-            f"{_fmt(ref['inside_road'], width=6)} | "
+            f"{_fmt(ref['lateral_offset_norm'], width=7)} "
+            f"{_fmt(ref['kart_heading_deg'], width=8, decimals=1)} "
+            f"{_fmt(ref['road_angle_deg'], width=8, decimals=1)} "
+            f"{_fmt(ref['heading_error_deg'], width=8, decimals=1)} "
+            f"{_fmt(ref['confidence'], width=8)} "
+            f"{str(ref['tracker_mode']):>9} | "
             f"{int(cand['frame_index']):9d} "
-            f"{_fmt(cand['lateral_offset_norm'])} "
-            f"{_fmt(cand['heading_error_deg'])} "
-            f"{_fmt(cand['inside_road'], width=6)} | "
+            f"{_fmt(cand['lateral_offset_norm'], width=7)} "
+            f"{_fmt(cand['kart_heading_deg'], width=8, decimals=1)} "
+            f"{_fmt(cand['road_angle_deg'], width=8, decimals=1)} "
+            f"{_fmt(cand['heading_error_deg'], width=8, decimals=1)} "
+            f"{_fmt(cand['confidence'], width=8)} "
+            f"{str(cand['tracker_mode']):>9} | "
             f"{_fmt(row['delta_lateral_offset_norm'], width=6)} "
             f"{_fmt(row['delta_heading_error_deg'], width=7)}",
             flush=True,

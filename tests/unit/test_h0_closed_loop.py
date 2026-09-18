@@ -23,7 +23,7 @@ def test_h0_replay_uses_probability_for_simulated_state() -> None:
 def test_h0_replay_min_hold_blocks_early_reversal() -> None:
     decisions = simulate_h0_closed_loop(
         [0.0, 50.0, 100.0, 150.0],
-        switch_if_release=[0.9, 0.1, 0.1, 0.1],
+        switch_if_release=[0.9, 0.1, 0.1, 0.9],
         switch_if_press=[0.1, 0.9, 0.9, 0.9],
         initial_pressed=False,
         threshold=0.6,

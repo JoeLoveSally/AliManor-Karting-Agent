@@ -230,6 +230,21 @@ class MultiHorizonSwitchScheduler:
             for probability in probabilities[: self._control_index]
         )
 
+    def _bounded_hold_reversal(
+        self,
+        probabilities: tuple[float, ...],
+    ) -> bool:
+        if not self.config.reserve_bounded_reversal_during_min_hold:
+            return False
+        threshold = self.config.threshold
+        near_probabilities = probabilities[: self._control_index + 1]
+        if not near_probabilities:
+            return False
+        return (
+            all(value >= threshold for value in near_probabilities)
+            and probabilities[self._anticipation_index] < threshold
+        )
+
     def _candidate(
         self,
         probabilities: tuple[float, ...],
@@ -284,7 +299,12 @@ class MultiHorizonSwitchScheduler:
         self,
         *,
         timestamp_ms: float,
-        reason: Literal["primary", "short_overdue", "pending_execute"],
+        reason: Literal[
+            "primary",
+            "short_overdue",
+            "pending_execute",
+            "hold_reversal_execute",
+        ],
         current_pressed: bool,
         probabilities: tuple[float, ...],
         crossing_horizon_ms: float | None = None,
@@ -341,14 +361,74 @@ class MultiHorizonSwitchScheduler:
             self._pending = None
 
         inside_min_hold = self._inside_min_hold(timestamp_ms)
-        if inside_min_hold and not self.config.arm_pending_during_min_hold:
-            self._pending = None
+        if inside_min_hold:
+            if self._pending is not None and self._pending.kind == "hold_reversal":
+                pending = self._pending
+                return self._decision(
+                    timestamp_ms=timestamp_ms,
+                    switch=False,
+                    reason="hold_reversal_wait",
+                    current_pressed=current_pressed,
+                    probabilities=probabilities,
+                    crossing_horizon_ms=pending.crossing_horizon_ms,
+                    pending_due_ms=pending.due_at_ms,
+                    pending_delay_ms=pending.delay_ms,
+                )
+
+            if self._bounded_hold_reversal(probabilities):
+                hold_expiry_ms = self._hold_expiry_ms()
+                assert hold_expiry_ms is not None
+                delay_ms = max(0.0, hold_expiry_ms - timestamp_ms)
+                self._pending = _PendingSwitch(
+                    state_before=current_pressed,
+                    armed_at_ms=timestamp_ms,
+                    due_at_ms=hold_expiry_ms,
+                    crossing_horizon_ms=self.config.control_horizon_ms,
+                    delay_ms=delay_ms,
+                    kind="hold_reversal",
+                )
+                return self._decision(
+                    timestamp_ms=timestamp_ms,
+                    switch=False,
+                    reason="hold_reversal_armed",
+                    current_pressed=current_pressed,
+                    probabilities=probabilities,
+                    crossing_horizon_ms=self.config.control_horizon_ms,
+                    pending_due_ms=hold_expiry_ms,
+                    pending_delay_ms=delay_ms,
+                )
+
+            if not self.config.arm_pending_during_min_hold:
+                self._pending = None
+                return self._decision(
+                    timestamp_ms=timestamp_ms,
+                    switch=False,
+                    reason="min_hold",
+                    current_pressed=current_pressed,
+                    probabilities=probabilities,
+                )
+
+        if self._pending is not None and self._pending.kind == "hold_reversal":
+            pending = self._pending
+            if timestamp_ms + 1e-6 >= pending.due_at_ms:
+                return self._switch_decision(
+                    timestamp_ms=timestamp_ms,
+                    reason="hold_reversal_execute",
+                    current_pressed=current_pressed,
+                    probabilities=probabilities,
+                    crossing_horizon_ms=pending.crossing_horizon_ms,
+                    pending_due_ms=pending.due_at_ms,
+                    pending_delay_ms=pending.delay_ms,
+                )
             return self._decision(
                 timestamp_ms=timestamp_ms,
                 switch=False,
-                reason="min_hold",
+                reason="hold_reversal_wait",
                 current_pressed=current_pressed,
                 probabilities=probabilities,
+                crossing_horizon_ms=pending.crossing_horizon_ms,
+                pending_due_ms=pending.due_at_ms,
+                pending_delay_ms=pending.delay_ms,
             )
 
         control = probabilities[self._control_index]
@@ -431,6 +511,7 @@ class MultiHorizonSwitchScheduler:
             due_at_ms=due_at_ms,
             crossing_horizon_ms=crossing_horizon_ms,
             delay_ms=delay_ms,
+            kind="anticipation",
         )
         return self._decision(
             timestamp_ms=timestamp_ms,

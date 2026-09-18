@@ -366,7 +366,11 @@ def main() -> int:
             )
             matched_predicted = {match.predicted for match in evaluation.matches}
             matched_expected = {match.expected for match in evaluation.matches}
-            metadata = event_metadata_by_video.get(video, []) if event_metadata_by_video else []
+            metadata = (
+                event_metadata_by_video.get(video, [])
+                if event_metadata_by_video
+                else []
+            )
             metadata_by_key = {
                 (float(item["timestamp_ms"]), bool(item["pressed"])): item
                 for item in metadata

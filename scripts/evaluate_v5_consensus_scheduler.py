@@ -204,6 +204,7 @@ def main() -> int:
 
     consensus_points_by_video: dict[str, list[SequencePoint]] = {}
     consensus_switch_times: dict[str, list[float]] = {}
+    consensus_event_details: dict[str, list[dict[str, object]]] = {}
     event_counts: Counter[str] = Counter()
     armed_delays: list[float] = []
     armed_spreads: list[float] = []
@@ -235,6 +236,7 @@ def main() -> int:
             )
         ]
         switch_times: list[float] = []
+        event_details: list[dict[str, object]] = []
 
         expert_states = [bool(samples[index].current_pressed) for index in indices]
         expert_states_by_video[video] = expert_states
@@ -268,6 +270,17 @@ def main() -> int:
                         )
                     )
                     event_counts["consensus_execute_deadline"] += 1
+                    event_details.append(
+                        {
+                            "timestamp_ms": due_ms,
+                            "pressed": state,
+                            "source": "consensus_deadline",
+                            "support_heads_ms": list(execution.support_heads_ms),
+                            "due_spread_ms": execution.due_spread_ms,
+                            "armed_at_ms": execution.armed_at_ms,
+                            "delay_ms": execution.delay_ms,
+                        }
+                    )
                     transition_events.append(
                         {
                             "timestamp_ms": due_ms,
@@ -307,6 +320,16 @@ def main() -> int:
                         probability=1.0 if state else 0.0,
                     )
                 )
+                event_details.append(
+                    {
+                        "timestamp_ms": timestamp_ms,
+                        "pressed": state,
+                        "source": "primary",
+                        "h0_probability": decision.control_probability,
+                        "support_heads_ms": list(decision.consensus_heads_ms),
+                        "due_spread_ms": decision.consensus_due_spread_ms,
+                    }
+                )
                 transition_events.append(
                     {
                         "timestamp_ms": timestamp_ms,
@@ -333,6 +356,7 @@ def main() -> int:
             )
         consensus_points_by_video[video] = points
         consensus_switch_times[video] = switch_times
+        consensus_event_details[video] = event_details
 
     h0_summary = base.replay_summary(
         h0_decisions_by_video,
@@ -528,6 +552,116 @@ def main() -> int:
                 flush=True,
             )
 
+    diagnostic_rows: list[dict[str, object]] = []
+    changed_videos: list[dict[str, object]] = []
+    for video, points in consensus_points_by_video.items():
+        truth_transitions, _ = label_data[video]
+        expected = tuple(
+            event
+            for event in truth_transitions
+            if points[0].timestamp_ms <= event.timestamp_ms <= points[-1].timestamp_ms
+        )
+        predicted = transitions_from_points(points, threshold=0.5)
+        matches = match_transitions(expected, predicted, tolerance_ms)
+        matched_predicted = {
+            (match.predicted.timestamp_ms, match.predicted.pressed) for match in matches
+        }
+
+        h0_points = base.points_from_decisions(video, h0_decisions_by_video[video])
+        h0_predicted = transitions_from_points(h0_points, threshold=0.5)
+        h0_matches = match_transitions(expected, h0_predicted, tolerance_ms)
+
+        if len(predicted) != len(h0_predicted) or len(matches) != len(h0_matches):
+            changed_videos.append(
+                {
+                    "video": video,
+                    "h0_predicted": len(h0_predicted),
+                    "h0_matched": len(h0_matches),
+                    "consensus_predicted": len(predicted),
+                    "consensus_matched": len(matches),
+                }
+            )
+
+        details = consensus_event_details[video]
+        for event in predicted:
+            key = (event.timestamp_ms, event.pressed)
+            if key in matched_predicted:
+                continue
+            same_direction_truth = [
+                truth for truth in expected if truth.pressed == event.pressed
+            ]
+            nearest_truth_error_ms = (
+                min(
+                    (
+                        event.timestamp_ms - truth.timestamp_ms
+                        for truth in same_direction_truth
+                    ),
+                    key=abs,
+                )
+                if same_direction_truth
+                else None
+            )
+            same_direction_h0 = [
+                item for item in h0_predicted if item.pressed == event.pressed
+            ]
+            nearest_h0_error_ms = (
+                min(
+                    (
+                        event.timestamp_ms - item.timestamp_ms
+                        for item in same_direction_h0
+                    ),
+                    key=abs,
+                )
+                if same_direction_h0
+                else None
+            )
+            detail = next(
+                (
+                    item
+                    for item in details
+                    if abs(float(item["timestamp_ms"]) - event.timestamp_ms) <= 1e-6
+                    and bool(item["pressed"]) == event.pressed
+                ),
+                {},
+            )
+            diagnostic_rows.append(
+                {
+                    "video": video,
+                    "timestamp_ms": event.timestamp_ms,
+                    "pressed": event.pressed,
+                    "source": detail.get("source", "unknown"),
+                    "nearest_truth_error_ms": nearest_truth_error_ms,
+                    "nearest_h0_error_ms": nearest_h0_error_ms,
+                    "support_heads_ms": detail.get("support_heads_ms", []),
+                    "due_spread_ms": detail.get("due_spread_ms"),
+                    "h0_probability": detail.get("h0_probability"),
+                }
+            )
+
+    print("consensus videos differing from H0 baseline:", flush=True)
+    for row in changed_videos:
+        print(
+            f"  {row['video']}: "
+            f"h0={row['h0_matched']}/{row['h0_predicted']} "
+            f"consensus={row['consensus_matched']}/{row['consensus_predicted']}",
+            flush=True,
+        )
+    print("consensus unmatched transitions:", flush=True)
+    for row in diagnostic_rows:
+        truth_error = row["nearest_truth_error_ms"]
+        h0_error = row["nearest_h0_error_ms"]
+        truth_text = "n/a" if truth_error is None else f"{truth_error:+.1f}ms"
+        h0_text = "n/a" if h0_error is None else f"{h0_error:+.1f}ms"
+        support = ",".join(f"h{value:g}" for value in row["support_heads_ms"])
+        print(
+            f"  {row['video']} t={row['timestamp_ms']:.1f}ms "
+            f"state={'PRESS' if row['pressed'] else 'RELEASE'} "
+            f"source={row['source']} nearest_truth={truth_text} "
+            f"nearest_h0={h0_text} support=[{support}] "
+            f"spread={row['due_spread_ms']}",
+            flush=True,
+        )
+
     payload = {
         "split": "validation",
         "samples": len(samples),
@@ -541,6 +675,10 @@ def main() -> int:
         "consensus_armed_delay_ms": delay_summary,
         "consensus_due_spread_ms": spread_summary,
         "consensus_support_size": support_summary,
+        "diagnostics": {
+            "videos_differing_from_h0": changed_videos,
+            "unmatched_transitions": diagnostic_rows,
+        },
         "test_evaluated": False,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

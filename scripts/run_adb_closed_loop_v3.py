@@ -86,6 +86,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--consensus-heads", type=int, default=3)
     parser.add_argument("--consensus-window-ms", type=float, default=60.0)
+    parser.add_argument(
+        "--future-action-h0",
+        action="store_true",
+        help=(
+            "Use the visual-only future-action H0 as the immediate control and "
+            "lifecycle H0 while keeping native future switch heads for consensus."
+        ),
+    )
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
     parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
     parser.add_argument("--pending-advance-ms", type=float, default=0.0)
@@ -137,6 +145,10 @@ def main() -> int:
         raise ValueError("--consensus-heads must be >= 2")
     if args.consensus_window_ms < 0:
         raise ValueError("--consensus-window-ms must be >= 0")
+    if args.future_action_h0 and not args.consensus_dense_scheduler:
+        raise ValueError(
+            "--future-action-h0 requires --consensus-dense-scheduler"
+        )
     if args.arm_pending_during_min_hold and not args.multi_horizon_scheduler:
         raise ValueError(
             "--arm-pending-during-min-hold requires --multi-horizon-scheduler"
@@ -187,6 +199,13 @@ def main() -> int:
         metadata_path=args.metadata,
         device=args.device,
     )
+    if args.future_action_h0:
+        if model.model_family != "state_conditioned_kart_relative_v5_h0":
+            raise ValueError(
+                "--future-action-h0 requires a V5-H0 model artifact"
+            )
+        if 0.0 not in model.spec.prediction_horizons_ms:
+            raise ValueError("--future-action-h0 requires an H0 prediction head")
     warmup = model.warmup()
     if args.arm:
         assert coordinates is not None
@@ -240,6 +259,11 @@ def main() -> int:
             switch_threshold=args.switch_threshold,
             min_state_hold_ms=(float(args.min_state_hold_ms) if direct_h0 else 0.0),
             execute_pending_at_due=bool(args.execute_pending_at_due),
+            control_h0_source=(
+                "future_action_projection"
+                if args.future_action_h0
+                else "native_switch"
+            ),
         ),
         initial_pressed=False,
         scheduler=scheduler,
@@ -260,7 +284,9 @@ def main() -> int:
         adb_input = AdbInput(client)
 
     mode = "ARMED" if args.arm else "DRY-RUN"
-    if args.consensus_dense_scheduler:
+    if args.consensus_dense_scheduler and args.future_action_h0:
+        policy = "v5-future-h0-consensus-lifecycle"
+    elif args.consensus_dense_scheduler:
         policy = "v5-h0-consensus-lifecycle"
     elif scheduler is not None:
         policy = "v3-state-conditioned-multi-horizon"
@@ -294,6 +320,7 @@ def main() -> int:
             f", consensus_heads={scheduler.config.min_consensus_heads}"
             f", consensus_window={scheduler.config.consensus_window_ms:g}ms"
             f", lifecycle_guard=True"
+            f", control_h0_source={'future_action' if args.future_action_h0 else 'native_switch'}"
             f", execute_pending_at_due={args.execute_pending_at_due}"
         )
     elif scheduler is not None:
@@ -610,9 +637,12 @@ def main() -> int:
     payload = {
         "mode": mode,
         "policy": (
-            "state_conditioned_kart_relative_v5_h0_consensus_lifecycle"
-            if args.consensus_dense_scheduler
+            "state_conditioned_kart_relative_v5_h0_future_consensus_lifecycle"
+            if args.consensus_dense_scheduler and args.future_action_h0
             else (
+                "state_conditioned_kart_relative_v5_h0_consensus_lifecycle"
+                if args.consensus_dense_scheduler
+                else (
                 "state_conditioned_transition_v3_multi_horizon"
                 if scheduler is not None
                 else (
@@ -621,6 +651,7 @@ def main() -> int:
                     else "state_conditioned_transition_v3"
                 )
             )
+        )
         ),
         "input_mode": args.input,
         "wait_for_start": args.wait_for_start,
@@ -652,6 +683,11 @@ def main() -> int:
                 else None
             ),
             "transition_lifecycle": bool(transition_lifecycle is not None),
+            "control_h0_source": (
+                "future_action_projection"
+                if args.future_action_h0
+                else "native_switch"
+            ),
         },
         "capture": capture_payload,
         "recording": recording_payload,

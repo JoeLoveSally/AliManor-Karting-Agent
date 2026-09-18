@@ -19,8 +19,10 @@ if str(SRC) not in sys.path:
 
 from karting_agent.train.state_conditioned_dataset import load_v3_samples  # noqa: E402
 from karting_agent.train.trainer import (  # noqa: E402
+    load_sampling_config,
     load_video_split,
     partition_samples,
+    sample_weight,
 )
 
 
@@ -137,6 +139,7 @@ def _audit_split(
     labels_dir: Path,
     max_horizon_ms: float,
     bin_ms: float,
+    sampling_config,
 ) -> dict[str, object]:
     transitions_by_video = {
         sample.video: _load_transition_times(labels_dir, sample.video)
@@ -144,9 +147,12 @@ def _audit_split(
     }
 
     aligned_bins: Counter[str] = Counter()
+    aligned_weighted_bins: Counter[str] = Counter()
     counterfactual_bins: Counter[str] = Counter()
     aligned_ttes: list[float] = []
     future_transition_counts: Counter[int] = Counter()
+    current_action_counts: Counter[str] = Counter()
+    current_action_weighted: Counter[str] = Counter()
 
     for sample in samples:
         observation_ms = float(sample.input_timestamps_ms[-1])
@@ -168,13 +174,17 @@ def _audit_split(
             if first_transition_ms is None
             else first_transition_ms - observation_ms
         )
-        aligned_bins[
-            _bin_label(
-                aligned_tte,
-                max_horizon_ms=max_horizon_ms,
-                bin_ms=bin_ms,
-            )
-        ] += 1
+        label = _bin_label(
+            aligned_tte,
+            max_horizon_ms=max_horizon_ms,
+            bin_ms=bin_ms,
+        )
+        weight = float(sample_weight(sample, sampling_config))
+        aligned_bins[label] += 1
+        aligned_weighted_bins[label] += weight
+        current_label = "press" if bool(sample.current_pressed) else "release"
+        current_action_counts[current_label] += 1
+        current_action_weighted[current_label] += weight
         if aligned_tte is not None and aligned_tte <= max_horizon_ms:
             aligned_ttes.append(aligned_tte)
 
@@ -198,7 +208,10 @@ def _audit_split(
     return {
         "samples": total,
         "aligned_bins": dict(sorted(aligned_bins.items())),
+        "aligned_weighted_bins": dict(sorted(aligned_weighted_bins.items())),
         "counterfactual_bins": dict(sorted(counterfactual_bins.items())),
+        "current_action_counts": dict(sorted(current_action_counts.items())),
+        "current_action_weighted": dict(sorted(current_action_weighted.items())),
         "aligned_first_transition_ms": _quantiles(aligned_ttes),
         "future_transition_count_within_horizon": dict(
             sorted(future_transition_counts.items())
@@ -221,7 +234,9 @@ def main() -> int:
     if not requested_splits:
         raise ValueError("--splits must contain at least one split")
 
-    split_config = load_video_split(args.config.resolve())
+    config_path = args.config.resolve()
+    split_config = load_video_split(config_path)
+    sampling_config = load_sampling_config(config_path)
     samples = load_v3_samples(args.samples.resolve())
     partitions = partition_samples(samples, split_config)
     unknown = [name for name in requested_splits if name not in partitions]
@@ -235,10 +250,14 @@ def main() -> int:
             labels_dir=args.labels_dir.resolve(),
             max_horizon_ms=float(args.max_horizon_ms),
             bin_ms=float(args.bin_ms),
+            sampling_config=sampling_config,
         )
         results[name] = summary
         print(f"\n{name}: samples={summary['samples']}")
         print(f"  aligned bins: {summary['aligned_bins']}")
+        print(f"  weighted bins: {summary['aligned_weighted_bins']}")
+        print(f"  current action: {summary['current_action_counts']}")
+        print(f"  weighted current action: {summary['current_action_weighted']}")
         print(f"  counterfactual bins: {summary['counterfactual_bins']}")
         print(
             "  aligned first transition: "

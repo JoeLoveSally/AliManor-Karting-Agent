@@ -14,8 +14,7 @@ from karting_agent.control.controller import ControlAction
 from karting_agent.data_flow.execute.common import Executor
 from karting_agent.data_flow.input.common import Frame
 from karting_agent.runtime.engine import RuntimeStep
-from karting_agent.runtime.multi_horizon_scheduler import MultiHorizonSwitchScheduler
-from karting_agent.vision.preprocess import PreprocessConfig
+from karting_agent.runtime.consensus_dense_scheduler import (\n    ConsensusDenseHorizonScheduler,\n)\nfrom karting_agent.runtime.consensus_transition_lifecycle import (\n    ConsensusTransitionLifecycle,\n)\nfrom karting_agent.runtime.multi_horizon_scheduler import MultiHorizonSwitchScheduler\nfrom karting_agent.vision.preprocess import PreprocessConfig
 from karting_agent.vision.temporal import TemporalFrameBuffer
 
 
@@ -79,8 +78,7 @@ class StateConditionedRuntimeStep(RuntimeStep):
     scheduler_reason: str | None = None
     pending_due_ms: float | None = None
     pending_delay_ms: float | None = None
-    inference_trigger: str = "regular"
-
+    inference_trigger: str = "regular"\n    lifecycle_status: str | None = None\n
 
 @dataclass(frozen=True)
 class DeadlineControlEvent:
@@ -105,14 +103,11 @@ class StateConditionedRuntimeEngine:
         executor: Executor,
         config: StateConditionedRuntimeConfig,
         initial_pressed: bool = False,
-        scheduler: MultiHorizonSwitchScheduler | None = None,
-        timer_factory: TimerFactory = Timer,
+        scheduler: (\n            MultiHorizonSwitchScheduler\n            | ConsensusDenseHorizonScheduler\n            | None\n        ) = None,\n        transition_lifecycle: ConsensusTransitionLifecycle | None = None,\n        timer_factory: TimerFactory = Timer,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         config.validate()
-        if config.execute_pending_at_due and scheduler is None:
-            raise ValueError("execute_pending_at_due requires a multi-horizon scheduler")
-        if scheduler is not None:
+        if config.execute_pending_at_due and scheduler is None:\n            raise ValueError("execute_pending_at_due requires a scheduler")\n        if transition_lifecycle is not None and not isinstance(\n            scheduler, ConsensusDenseHorizonScheduler\n        ):\n            raise ValueError(\n                "transition_lifecycle requires ConsensusDenseHorizonScheduler"\n            )\n        if scheduler is not None:
             scheduler_config = scheduler.config
             if not math.isclose(
                 scheduler_config.control_horizon_ms,
@@ -132,9 +127,7 @@ class StateConditionedRuntimeEngine:
         self.preprocess_config = preprocess_config
         self.executor = executor
         self.config = config
-        self.scheduler = scheduler
-        self.pressed = bool(initial_pressed)
-        self._last_direct_switch_ms: float | None = None
+        self.scheduler = scheduler\n        self.transition_lifecycle = transition_lifecycle\n        self.pressed = bool(initial_pressed)\n        self._last_direct_switch_ms: float | None = None
         self._buffer = TemporalFrameBuffer(config.history_ms)
         self._interval_ms = 1000.0 / config.target_fps
         self._next_regular_due_ms: float | None = None
@@ -212,16 +205,29 @@ class StateConditionedRuntimeEngine:
             if execution is None:
                 return
 
+            before = self.pressed
             self.pressed = not self.pressed
+            if self.transition_lifecycle is not None:
+                self.transition_lifecycle.begin(
+                    executed_at_ms=pending_due_ms,
+                    previous_pressed=before,
+                    current_pressed=self.pressed,
+                    evidence_lead_ms=float(execution.delay_ms),
+                )
             action = ControlAction.PRESS if self.pressed else ControlAction.RELEASE
             self.executor.set_pressed(self.pressed)
             lateness_ms = max(0.0, (self._clock() - wall_due) * 1000.0)
+            deadline_reason = (
+                "consensus_execute_deadline"
+                if self.transition_lifecycle is not None
+                else "pending_execute_deadline"
+            )
             self._deadline_events.append(
                 DeadlineControlEvent(
                     timestamp_ms=pending_due_ms,
                     action=action,
                     pressed=self.pressed,
-                    scheduler_reason="pending_execute_deadline",
+                    scheduler_reason=deadline_reason,
                     pending_due_ms=pending_due_ms,
                     timer_lateness_ms=lateness_ms,
                 )
@@ -266,6 +272,7 @@ class StateConditionedRuntimeEngine:
 
             before = self.pressed
             started = time.perf_counter()
+            lifecycle_status: str | None = None
             if self.scheduler is None:
                 probability = float(self.model.predict_switch(temporal.input, before))
                 probabilities = (probability,)
@@ -274,11 +281,30 @@ class StateConditionedRuntimeEngine:
                     float(value)
                     for value in self.model.predict_switch_all(temporal.input, before)
                 )
-                probability = probabilities[
-                    self.scheduler.config.horizons_ms.index(
-                        self.scheduler.config.control_horizon_ms
+                control_index = self.scheduler.config.horizons_ms.index(
+                    self.scheduler.config.control_horizon_ms
+                )
+                if self.transition_lifecycle is not None and self.transition_lifecycle.active:
+                    pending = self.transition_lifecycle.pending
+                    assert pending is not None
+                    previous_probabilities = tuple(
+                        float(value)
+                        for value in self.model.predict_switch_all(
+                            temporal.input,
+                            pending.previous_pressed,
+                        )
                     )
-                ]
+                    lifecycle_status = self.transition_lifecycle.observe(
+                        timestamp_ms=frame.timestamp_ms,
+                        previous_state_h0_probability=previous_probabilities[
+                            control_index
+                        ],
+                    )
+                    if lifecycle_status in {"waiting", "confirmed"}:
+                        masked = list(probabilities)
+                        masked[control_index] = 0.0
+                        probabilities = tuple(masked)
+                probability = probabilities[control_index]
             inference_ms = (time.perf_counter() - started) * 1000.0
 
             if self.scheduler is None:
@@ -320,6 +346,19 @@ class StateConditionedRuntimeEngine:
                 self.pressed = not before
                 if self.scheduler is None:
                     self._last_direct_switch_ms = frame.timestamp_ms
+                elif self.transition_lifecycle is not None:
+                    if scheduler_reason == "consensus_execute":
+                        evidence_lead_ms = float(
+                            getattr(decision, "evidence_lead_ms", 0.0) or 0.0
+                        )
+                        self.transition_lifecycle.begin(
+                            executed_at_ms=frame.timestamp_ms,
+                            previous_pressed=before,
+                            current_pressed=self.pressed,
+                            evidence_lead_ms=evidence_lead_ms,
+                        )
+                    else:
+                        self.transition_lifecycle.clear()
                 action = ControlAction.PRESS if self.pressed else ControlAction.RELEASE
                 self.executor.set_pressed(self.pressed)
             else:
@@ -352,15 +391,11 @@ class StateConditionedRuntimeEngine:
                 scheduler_reason=scheduler_reason,
                 pending_due_ms=pending_due_ms,
                 pending_delay_ms=pending_delay_ms,
-                inference_trigger=inference_trigger,
-            )
-
+                inference_trigger=inference_trigger,\n                lifecycle_status=lifecycle_status,\n            )\n
     def shutdown(self) -> bool:
         with self._lock:
             self._cancel_pending_timer_locked()
-            if self.scheduler is not None:
-                self.scheduler.reset()
-            if not self.pressed:
+            if self.scheduler is not None:\n                self.scheduler.reset()\n            if self.transition_lifecycle is not None:\n                self.transition_lifecycle.clear()\n            if not self.pressed:
                 return False
             self.executor.set_pressed(False)
             self.pressed = False

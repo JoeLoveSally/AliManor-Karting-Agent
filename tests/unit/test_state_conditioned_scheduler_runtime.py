@@ -93,12 +93,14 @@ def make_frame(index: int, timestamp_ms: float) -> Frame:
 def make_runtime_config(
     *,
     execute_pending_at_due: bool = False,
+    min_state_hold_ms: float = 0.0,
 ) -> StateConditionedRuntimeConfig:
     return StateConditionedRuntimeConfig(
         target_fps=30.0,
         frame_offsets_ms=(0.0,),
         prediction_horizon_ms=200.0,
         switch_threshold=0.6,
+        min_state_hold_ms=min_state_hold_ms,
         execute_pending_at_due=execute_pending_at_due,
     )
 
@@ -340,3 +342,32 @@ def test_fixed_runtime_path_remains_unchanged() -> None:
     assert step.probabilities == (0.7,)
     assert step.scheduler_reason is None
     assert executor.states == [True]
+
+
+def test_fixed_runtime_can_apply_direct_min_state_hold() -> None:
+    executor = RecordingExecutor()
+    engine = StateConditionedRuntimeEngine(
+        model=FixedModel(),
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=make_runtime_config(min_state_hold_ms=100.0),
+    )
+
+    first = engine.ingest(make_frame(0, 0.0))
+    blocked = engine.ingest(make_frame(1, 50.0))
+    reversed_step = engine.ingest(make_frame(2, 100.0))
+    blocked_again = engine.ingest(make_frame(3, 150.0))
+
+    assert first is not None
+    assert first.action is ControlAction.PRESS
+    assert first.scheduler_reason == "primary"
+    assert blocked is not None
+    assert blocked.action is ControlAction.HOLD
+    assert blocked.scheduler_reason == "min_hold"
+    assert reversed_step is not None
+    assert reversed_step.action is ControlAction.RELEASE
+    assert reversed_step.scheduler_reason == "primary"
+    assert blocked_again is not None
+    assert blocked_again.action is ControlAction.HOLD
+    assert blocked_again.scheduler_reason == "min_hold"
+    assert executor.states == [True, False]

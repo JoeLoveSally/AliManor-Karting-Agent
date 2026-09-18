@@ -16,7 +16,12 @@ SchedulerReason = Literal[
     "pending_wait",
     "pending_execute",
     "pending_cancelled",
+    "hold_reversal_armed",
+    "hold_reversal_wait",
+    "hold_reversal_execute",
 ]
+
+PendingKind = Literal["anticipation", "hold_reversal"]
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ class MultiHorizonSchedulerConfig:
     pending_advance_ms: float = 0.0
     arm_pending_during_min_hold: bool = False
     execute_short_horizon_overdue: bool = False
+    reserve_bounded_reversal_during_min_hold: bool = False
 
     def validate(self) -> None:
         if len(self.horizons_ms) < 2:
@@ -118,6 +124,7 @@ class PendingExecution:
     due_at_ms: float
     crossing_horizon_ms: float
     delay_ms: float
+    kind: PendingKind
 
 
 @dataclass(frozen=True)
@@ -127,6 +134,7 @@ class _PendingSwitch:
     due_at_ms: float
     crossing_horizon_ms: float
     delay_ms: float
+    kind: PendingKind
 
 
 class MultiHorizonSwitchScheduler:
@@ -192,6 +200,7 @@ class MultiHorizonSwitchScheduler:
             due_at_ms=pending.due_at_ms,
             crossing_horizon_ms=pending.crossing_horizon_ms,
             delay_ms=pending.delay_ms,
+            kind=pending.kind,
         )
 
     def _validated_probabilities(self, values: Sequence[float]) -> tuple[float, ...]:

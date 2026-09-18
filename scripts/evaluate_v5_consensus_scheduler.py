@@ -32,7 +32,7 @@ from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402
 )
 from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa: E402
 from karting_agent.train.h0_closed_loop import simulate_h0_closed_loop  # noqa: E402
-from karting_agent.train.sequence_evaluator import SequencePoint  # noqa: E402
+from karting_agent.train.sequence_evaluator import (  # noqa: E402\n    SequencePoint,\n    evaluate_sequence,\n)
 from karting_agent.train.state_conditioned_dataset import (  # noqa: E402
     StateConditionedVideoDataset,
     load_v3_samples,
@@ -268,6 +268,17 @@ def main() -> int:
                         )
                     )
                     event_counts["consensus_execute_deadline"] += 1
+                    transition_events.append(
+                        {
+                            "timestamp_ms": due_ms,
+                            "pressed": state,
+                            "reason": "consensus_execute_deadline",
+                            "support_heads_ms": list(execution.support_heads_ms),
+                            "due_spread_ms": execution.due_spread_ms,
+                            "armed_at_ms": execution.armed_at_ms,
+                            "delay_ms": execution.delay_ms,
+                        }
+                    )
 
             probabilities = (
                 switch_if_press[sample_index]
@@ -295,6 +306,17 @@ def main() -> int:
                         timestamp_ms=timestamp_ms,
                         probability=1.0 if state else 0.0,
                     )
+                )
+                transition_events.append(
+                    {
+                        "timestamp_ms": timestamp_ms,
+                        "pressed": state,
+                        "reason": decision.reason,
+                        "support_heads_ms": list(decision.consensus_heads_ms),
+                        "due_spread_ms": decision.consensus_due_spread_ms,
+                        "armed_at_ms": None,
+                        "delay_ms": None,
+                    }
                 )
 
             state_total += 1
@@ -324,6 +346,102 @@ def main() -> int:
         (state_correct, state_total),
         label_data,
         tolerance_ms=tolerance_ms,
+    )
+
+    def unmatched_diagnostics(
+        points_by_video: dict[str, list[SequencePoint]],
+        event_metadata_by_video: dict[str, list[dict[str, object]]] | None,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        false_positives: list[dict[str, object]] = []
+        false_negatives: list[dict[str, object]] = []
+
+        for video, points in points_by_video.items():
+            truth_transitions, releases = label_data[video]
+            evaluation = evaluate_sequence(
+                points,
+                truth_transitions,
+                releases,
+                threshold=0.5,
+                tolerance_ms=tolerance_ms,
+            )
+            matched_predicted = {match.predicted for match in evaluation.matches}
+            matched_expected = {match.expected for match in evaluation.matches}
+            metadata = event_metadata_by_video.get(video, []) if event_metadata_by_video else []
+            metadata_by_key = {
+                (float(item["timestamp_ms"]), bool(item["pressed"])): item
+                for item in metadata
+            }
+            predicted = list(evaluation.predicted_transitions)
+
+            for index, event in enumerate(predicted):
+                if event in matched_predicted:
+                    continue
+                same_direction = [
+                    expected
+                    for expected in evaluation.expected_transitions
+                    if expected.pressed == event.pressed
+                ]
+                nearest_delta = (
+                    min(
+                        (
+                            event.timestamp_ms - expected.timestamp_ms
+                            for expected in same_direction
+                        ),
+                        key=abs,
+                    )
+                    if same_direction
+                    else None
+                )
+                details = dict(
+                    metadata_by_key.get(
+                        (float(event.timestamp_ms), bool(event.pressed)),
+                        {},
+                    )
+                )
+                details.update(
+                    {
+                        "video": video,
+                        "timestamp_ms": event.timestamp_ms,
+                        "pressed": event.pressed,
+                        "nearest_same_direction_gt_delta_ms": nearest_delta,
+                        "previous_transition_gap_ms": (
+                            event.timestamp_ms - predicted[index - 1].timestamp_ms
+                            if index > 0
+                            else None
+                        ),
+                        "next_transition_gap_ms": (
+                            predicted[index + 1].timestamp_ms - event.timestamp_ms
+                            if index + 1 < len(predicted)
+                            else None
+                        ),
+                    }
+                )
+                false_positives.append(details)
+
+            for event in evaluation.expected_transitions:
+                if event in matched_expected:
+                    continue
+                false_negatives.append(
+                    {
+                        "video": video,
+                        "timestamp_ms": event.timestamp_ms,
+                        "pressed": event.pressed,
+                    }
+                )
+
+        return false_positives, false_negatives
+
+    h0_points_by_video = {
+        video: base.points_from_decisions(video, decisions)
+        for video, decisions in h0_decisions_by_video.items()
+    }
+    h0_false_positives, h0_false_negatives = unmatched_diagnostics(
+        h0_points_by_video,
+        None,
+    )
+    consensus_false_positives, consensus_false_negatives = unmatched_diagnostics(
+        consensus_points_by_video,
+        transition_events_by_video,
     )
 
     delay_array = np.asarray(armed_delays, dtype=np.float64)
@@ -372,6 +490,39 @@ def main() -> int:
         f"support_range={support_summary['min']:.0f}..{support_summary['max']:.0f}",
         flush=True,
     )
+
+    print(
+        f"unmatched transitions: h0_fp={len(h0_false_positives)} "
+        f"h0_fn={len(h0_false_negatives)} "
+        f"consensus_fp={len(consensus_false_positives)} "
+        f"consensus_fn={len(consensus_false_negatives)}",
+        flush=True,
+    )
+    print("consensus false positives:", flush=True)
+    for item in consensus_false_positives:
+        heads = ",".join(f"h{value:g}" for value in item.get("support_heads_ms", []))
+        nearest = item["nearest_same_direction_gt_delta_ms"]
+        previous_gap = item["previous_transition_gap_ms"]
+        next_gap = item["next_transition_gap_ms"]
+        print(
+            f"  {Path(str(item['video'])).name} "
+            f"t={float(item['timestamp_ms']):.1f}ms "
+            f"{'PRESS' if item['pressed'] else 'RELEASE'} "
+            f"reason={item.get('reason', '<unknown>')} "
+            f"heads=[{heads}] spread={item.get('due_spread_ms')} "
+            f"nearest_gt_delta={nearest} "
+            f"prev_gap={previous_gap} next_gap={next_gap}",
+            flush=True,
+        )
+    if consensus_false_negatives:
+        print("consensus false negatives:", flush=True)
+        for item in consensus_false_negatives:
+            print(
+                f"  {Path(str(item['video'])).name} "
+                f"t={float(item['timestamp_ms']):.1f}ms "
+                f"{'PRESS' if item['pressed'] else 'RELEASE'}",
+                flush=True,
+            )
 
     payload = {
         "split": "validation",

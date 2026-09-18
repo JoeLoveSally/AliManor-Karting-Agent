@@ -27,8 +27,7 @@ from karting_agent.data_flow.input.adb_video import AdbVideoInput  # noqa: E402
 from karting_agent.model.state_conditioned_runner import (  # noqa: E402
     StateConditionedModelRunner,
 )
-from karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402
-    MultiHorizonSchedulerConfig,
+from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402\n    ConsensusDenseConfig,\n    ConsensusDenseHorizonScheduler,\n)\nfrom karting_agent.runtime.consensus_transition_lifecycle import (  # noqa: E402\n    ConsensusTransitionLifecycle,\n)\nfrom karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402\n    MultiHorizonSchedulerConfig,
     MultiHorizonSwitchScheduler,
 )
 from karting_agent.runtime.state_conditioned_engine import (  # noqa: E402
@@ -69,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the selected metadata control horizon with a farther anticipation horizon.",
     )
+    parser.add_argument(
+        "--consensus-dense-scheduler",
+        action="store_true",
+        help=(
+            "Use H0 immediately plus dense future-horizon transition-time "
+            "consensus with lifecycle protection."
+        ),
+    )
+    parser.add_argument("--consensus-heads", type=int, default=3)
+    parser.add_argument("--consensus-window-ms", type=float, default=60.0)
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
     parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
     parser.add_argument("--pending-advance-ms", type=float, default=0.0)
@@ -111,12 +120,27 @@ def main() -> int:
         raise ValueError("--min-state-hold-ms must be >= 0")
     if args.pending_advance_ms < 0:
         raise ValueError("--pending-advance-ms must be >= 0")
+    if args.multi_horizon_scheduler and args.consensus_dense_scheduler:
+        raise ValueError(
+            "--multi-horizon-scheduler and --consensus-dense-scheduler "
+            "are mutually exclusive"
+        )
+    if args.consensus_heads < 2:
+        raise ValueError("--consensus-heads must be >= 2")
+    if args.consensus_window_ms < 0:
+        raise ValueError("--consensus-window-ms must be >= 0")
     if args.arm_pending_during_min_hold and not args.multi_horizon_scheduler:
         raise ValueError(
             "--arm-pending-during-min-hold requires --multi-horizon-scheduler"
         )
-    if args.execute_pending_at_due and not args.multi_horizon_scheduler:
-        raise ValueError("--execute-pending-at-due requires --multi-horizon-scheduler")
+    if args.execute_pending_at_due and not (
+        args.multi_horizon_scheduler or args.consensus_dense_scheduler
+    ):
+        raise ValueError("--execute-pending-at-due requires a scheduler")
+    if args.consensus_dense_scheduler and not args.execute_pending_at_due:
+        raise ValueError(
+            "--consensus-dense-scheduler requires --execute-pending-at-due"
+        )
     if args.wait_for_start and not args.arm:
         raise ValueError("--wait-for-start requires --arm")
 
@@ -163,8 +187,10 @@ def main() -> int:
         executor = MockExecutor()
 
     scheduler = None
+    transition_lifecycle = None
     direct_h0 = (
         not args.multi_horizon_scheduler
+        and not args.consensus_dense_scheduler
         and abs(float(model.spec.control_horizon_ms)) <= 1e-6
     )
     if args.multi_horizon_scheduler:
@@ -178,6 +204,20 @@ def main() -> int:
                 pending_advance_ms=float(args.pending_advance_ms),
                 arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
             )
+        )
+    elif args.consensus_dense_scheduler:
+        scheduler = ConsensusDenseHorizonScheduler(
+            ConsensusDenseConfig(
+                horizons_ms=model.spec.prediction_horizons_ms,
+                threshold=args.switch_threshold,
+                min_state_hold_ms=float(args.min_state_hold_ms),
+                min_consensus_heads=int(args.consensus_heads),
+                consensus_window_ms=float(args.consensus_window_ms),
+            )
+        )
+        transition_lifecycle = ConsensusTransitionLifecycle(
+            threshold=args.switch_threshold,
+            min_state_hold_ms=float(args.min_state_hold_ms),
         )
 
     target_fps = float(runtime_raw.get("target_fps", 30.0))
@@ -194,9 +234,7 @@ def main() -> int:
             execute_pending_at_due=bool(args.execute_pending_at_due),
         ),
         initial_pressed=False,
-        scheduler=scheduler,
-    )
-
+        scheduler=scheduler,\n        transition_lifecycle=transition_lifecycle,\n    )\n
     video_input: AdbVideoInput | None = None
     if args.input == "video":
         video_config = legacy.resolve_adb_video_config(hardware_raw, args)
@@ -211,7 +249,9 @@ def main() -> int:
         adb_input = AdbInput(client)
 
     mode = "ARMED" if args.arm else "DRY-RUN"
-    if scheduler is not None:
+    if args.consensus_dense_scheduler:
+        policy = "v5-h0-consensus-lifecycle"
+    elif scheduler is not None:
         policy = "v3-state-conditioned-multi-horizon"
     elif direct_h0:
         policy = "v5-h0-immediate"
@@ -237,7 +277,15 @@ def main() -> int:
     )
     if direct_h0:
         runtime_detail += f", min_state_hold={args.min_state_hold_ms:g}ms"
-    if scheduler is not None:
+    if args.consensus_dense_scheduler:
+        runtime_detail += (
+            f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
+            f", consensus_heads={scheduler.config.min_consensus_heads}"
+            f", consensus_window={scheduler.config.consensus_window_ms:g}ms"
+            f", lifecycle_guard=True"
+            f", execute_pending_at_due={args.execute_pending_at_due}"
+        )
+    elif scheduler is not None:
         runtime_detail += (
             f", anticipation_horizon={scheduler.config.anticipation_horizon_ms:g}ms"
             f", min_state_hold={scheduler.config.min_state_hold_ms:g}ms"
@@ -328,7 +376,11 @@ def main() -> int:
             scheduler_event = step.scheduler_reason in {
                 "pending_armed",
                 "pending_cancelled",
-            } or (direct_h0 and step.scheduler_reason == "min_hold")
+                "consensus_armed",
+                "consensus_cancelled",
+            } or (
+                direct_h0 and step.scheduler_reason == "min_hold"
+            ) or step.lifecycle_status is not None
             if args.verbose or step.action is not ControlAction.HOLD or scheduler_event:
                 if video_input is None:
                     input_detail = f"capture={adb_input.last_capture_ms:.1f}ms "
@@ -353,6 +405,8 @@ def main() -> int:
                     )
                     if step.pending_due_ms is not None:
                         suffix += f" pending_due={step.pending_due_ms:.1f}ms"
+                    if step.lifecycle_status is not None:
+                        suffix += f" lifecycle={step.lifecycle_status}"
                 elif direct_h0 and step.scheduler_reason is not None:
                     suffix += f" reason={step.scheduler_reason}"
                 print(
@@ -395,6 +449,15 @@ def main() -> int:
         step.scheduler_reason for step in steps if step.scheduler_reason is not None
     )
     scheduler_counter.update(event.scheduler_reason for event in deadline_events)
+    lifecycle_events = dict(
+        sorted(
+            Counter(
+                step.lifecycle_status
+                for step in steps
+                if step.lifecycle_status is not None
+            ).items()
+        )
+    )
     scheduler_events = (
         dict(sorted(scheduler_counter.items()))
         if scheduler is not None or direct_h0
@@ -450,6 +513,12 @@ def main() -> int:
         print(
             f"{event_label}: "
             + ", ".join(f"{key}={value}" for key, value in scheduler_events.items()),
+            flush=True,
+        )
+    if lifecycle_events:
+        print(
+            "Lifecycle events: "
+            + ", ".join(f"{key}={value}" for key, value in lifecycle_events.items()),
             flush=True,
         )
     if args.execute_pending_at_due:
@@ -521,12 +590,16 @@ def main() -> int:
     payload = {
         "mode": mode,
         "policy": (
-            "state_conditioned_transition_v3_multi_horizon"
-            if scheduler is not None
+            "state_conditioned_kart_relative_v5_h0_consensus_lifecycle"
+            if args.consensus_dense_scheduler
             else (
-                "state_conditioned_kart_relative_v5_h0_direct"
-                if direct_h0
-                else "state_conditioned_transition_v3"
+                "state_conditioned_transition_v3_multi_horizon"
+                if scheduler is not None
+                else (
+                    "state_conditioned_kart_relative_v5_h0_direct"
+                    if direct_h0
+                    else "state_conditioned_transition_v3"
+                )
             )
         ),
         "input_mode": args.input,
@@ -549,8 +622,16 @@ def main() -> int:
             ),
             "execute_pending_at_due": bool(args.execute_pending_at_due),
             "multi_horizon_scheduler": (
-                asdict(scheduler.config) if scheduler is not None else None
+                asdict(scheduler.config)
+                if args.multi_horizon_scheduler and scheduler is not None
+                else None
             ),
+            "consensus_dense_scheduler": (
+                asdict(scheduler.config)
+                if args.consensus_dense_scheduler and scheduler is not None
+                else None
+            ),
+            "transition_lifecycle": bool(transition_lifecycle is not None),
         },
         "capture": capture_payload,
         "recording": recording_payload,
@@ -559,8 +640,7 @@ def main() -> int:
         "execute": {"semantics": "persistent_shell_enqueue", **execute_stats}
         if args.arm
         else None,
-        "scheduler_events": scheduler_events,
-        "deadline_events": [
+        "scheduler_events": scheduler_events,\n        "lifecycle_events": lifecycle_events,\n        "deadline_events": [
             {**asdict(event), "action": event.action.value} for event in deadline_events
         ],
         "state_changes": state_changes,

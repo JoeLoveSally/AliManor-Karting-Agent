@@ -46,6 +46,36 @@ class SequenceModel:
         raise AssertionError("consensus runtime must use predict_switch_all")
 
 
+class CoherentSequenceModel:
+    def __init__(
+        self,
+        outputs: list[tuple[tuple[float, ...], tuple[float, ...]]],
+    ) -> None:
+        self.outputs = iter(outputs)
+        self.calls = 0
+
+    def predict_native_switch_and_future_all(
+        self,
+        inputs: np.ndarray,
+        current_pressed: bool,
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        del inputs, current_pressed
+        self.calls += 1
+        return next(self.outputs)
+
+    def predict_switch_all(
+        self,
+        inputs: np.ndarray,
+        current_pressed: bool,
+    ) -> tuple[float, ...]:
+        del inputs, current_pressed
+        raise AssertionError("coherent H0 path must use one-pass native+future output")
+
+    def predict_switch(self, inputs: np.ndarray, current_pressed: bool) -> float:
+        del inputs, current_pressed
+        raise AssertionError("coherent H0 path must not use predict_switch")
+
+
 class ManualTimer:
     def __init__(self, interval: float, callback: Callable[[], None]) -> None:
         self.interval = float(interval)
@@ -191,4 +221,82 @@ def test_lifecycle_requires_consensus_scheduler() -> None:
                 prediction_horizon_ms=0.0,
             ),
             transition_lifecycle=lifecycle,
+        )
+
+
+def test_future_action_h0_uses_one_pass_and_coherent_lifecycle() -> None:
+    executor = RecordingExecutor()
+    timers = ManualTimerFactory()
+    model = CoherentSequenceModel(
+        [
+            ((0.9, 0.1, 0.1, 0.7), (0.1, 0.0, 0.0, 0.0)),
+            ((0.9, 0.1, 0.7, 0.8), (0.1, 0.0, 0.0, 0.0)),
+            ((0.9, 0.7, 0.8, 0.9), (0.1, 0.0, 0.0, 0.0)),
+            ((0.9, 0.1, 0.1, 0.1), (0.8, 0.0, 0.0, 0.0)),
+            ((0.9, 0.1, 0.1, 0.1), (0.2, 0.0, 0.0, 0.0)),
+        ]
+    )
+    engine = StateConditionedRuntimeEngine(
+        model=model,
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=StateConditionedRuntimeConfig(
+            target_fps=30.0,
+            frame_offsets_ms=(0.0,),
+            prediction_horizon_ms=0.0,
+            switch_threshold=0.6,
+            execute_pending_at_due=True,
+            control_h0_source="future_action_projection",
+        ),
+        scheduler=make_scheduler(),
+        transition_lifecycle=ConsensusTransitionLifecycle(
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+        ),
+        timer_factory=timers,
+        clock=lambda: 10.0,
+    )
+
+    engine.ingest(make_frame(0, 0.0))
+    engine.ingest(make_frame(1, 50.0))
+    armed = engine.ingest(make_frame(2, 100.0))
+    assert armed is not None
+    assert armed.scheduler_reason == "consensus_armed"
+    assert armed.raw_control_probability == pytest.approx(0.1)
+
+    timers.timers[-1].fire()
+    deadline_events = engine.drain_deadline_events()
+    assert len(deadline_events) == 1
+    assert deadline_events[0].action is ControlAction.PRESS
+
+    confirmed = engine.ingest(make_frame(3, 170.0))
+    assert confirmed is not None
+    assert confirmed.action is ControlAction.HOLD
+    assert confirmed.lifecycle_status == "confirmed"
+    assert confirmed.raw_control_probability == pytest.approx(0.2)
+    assert confirmed.lifecycle_previous_state_probability == pytest.approx(0.8)
+
+    resumed = engine.ingest(make_frame(4, 210.0))
+    assert resumed is not None
+    assert resumed.action is ControlAction.RELEASE
+    assert resumed.scheduler_reason == "primary"
+    assert model.calls == 5
+    assert executor.states == [True, False]
+
+
+def test_future_action_h0_requires_consensus_scheduler() -> None:
+    with pytest.raises(
+        ValueError,
+        match="requires ConsensusDenseHorizonScheduler",
+    ):
+        StateConditionedRuntimeEngine(
+            model=CoherentSequenceModel([]),
+            preprocess_config=make_preprocess_config(),
+            executor=RecordingExecutor(),
+            config=StateConditionedRuntimeConfig(
+                target_fps=30.0,
+                frame_offsets_ms=(0.0,),
+                prediction_horizon_ms=0.0,
+                control_h0_source="future_action_projection",
+            ),
         )

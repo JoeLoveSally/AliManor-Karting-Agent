@@ -14,7 +14,14 @@ from karting_agent.control.controller import ControlAction
 from karting_agent.data_flow.execute.common import Executor
 from karting_agent.data_flow.input.common import Frame
 from karting_agent.runtime.engine import RuntimeStep
-from karting_agent.runtime.consensus_dense_scheduler import (\n    ConsensusDenseHorizonScheduler,\n)\nfrom karting_agent.runtime.consensus_transition_lifecycle import (\n    ConsensusTransitionLifecycle,\n)\nfrom karting_agent.runtime.multi_horizon_scheduler import MultiHorizonSwitchScheduler\nfrom karting_agent.vision.preprocess import PreprocessConfig
+from karting_agent.runtime.consensus_dense_scheduler import (
+    ConsensusDenseHorizonScheduler,
+)
+from karting_agent.runtime.consensus_transition_lifecycle import (
+    ConsensusTransitionLifecycle,
+)
+from karting_agent.runtime.multi_horizon_scheduler import MultiHorizonSwitchScheduler
+from karting_agent.vision.preprocess import PreprocessConfig
 from karting_agent.vision.temporal import TemporalFrameBuffer
 
 
@@ -78,7 +85,9 @@ class StateConditionedRuntimeStep(RuntimeStep):
     scheduler_reason: str | None = None
     pending_due_ms: float | None = None
     pending_delay_ms: float | None = None
-    inference_trigger: str = "regular"\n    lifecycle_status: str | None = None\n
+    inference_trigger: str = "regular"
+    lifecycle_status: str | None = None
+
 
 @dataclass(frozen=True)
 class DeadlineControlEvent:
@@ -103,11 +112,25 @@ class StateConditionedRuntimeEngine:
         executor: Executor,
         config: StateConditionedRuntimeConfig,
         initial_pressed: bool = False,
-        scheduler: (\n            MultiHorizonSwitchScheduler\n            | ConsensusDenseHorizonScheduler\n            | None\n        ) = None,\n        transition_lifecycle: ConsensusTransitionLifecycle | None = None,\n        timer_factory: TimerFactory = Timer,
+        scheduler: (
+            MultiHorizonSwitchScheduler
+            | ConsensusDenseHorizonScheduler
+            | None
+        ) = None,
+        transition_lifecycle: ConsensusTransitionLifecycle | None = None,
+        timer_factory: TimerFactory = Timer,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         config.validate()
-        if config.execute_pending_at_due and scheduler is None:\n            raise ValueError("execute_pending_at_due requires a scheduler")\n        if transition_lifecycle is not None and not isinstance(\n            scheduler, ConsensusDenseHorizonScheduler\n        ):\n            raise ValueError(\n                "transition_lifecycle requires ConsensusDenseHorizonScheduler"\n            )\n        if scheduler is not None:
+        if config.execute_pending_at_due and scheduler is None:
+            raise ValueError("execute_pending_at_due requires a scheduler")
+        if transition_lifecycle is not None and not isinstance(
+            scheduler, ConsensusDenseHorizonScheduler
+        ):
+            raise ValueError(
+                "transition_lifecycle requires ConsensusDenseHorizonScheduler"
+            )
+        if scheduler is not None:
             scheduler_config = scheduler.config
             if not math.isclose(
                 scheduler_config.control_horizon_ms,
@@ -127,7 +150,10 @@ class StateConditionedRuntimeEngine:
         self.preprocess_config = preprocess_config
         self.executor = executor
         self.config = config
-        self.scheduler = scheduler\n        self.transition_lifecycle = transition_lifecycle\n        self.pressed = bool(initial_pressed)\n        self._last_direct_switch_ms: float | None = None
+        self.scheduler = scheduler
+        self.transition_lifecycle = transition_lifecycle
+        self.pressed = bool(initial_pressed)
+        self._last_direct_switch_ms: float | None = None
         self._buffer = TemporalFrameBuffer(config.history_ms)
         self._interval_ms = 1000.0 / config.target_fps
         self._next_regular_due_ms: float | None = None
@@ -391,11 +417,18 @@ class StateConditionedRuntimeEngine:
                 scheduler_reason=scheduler_reason,
                 pending_due_ms=pending_due_ms,
                 pending_delay_ms=pending_delay_ms,
-                inference_trigger=inference_trigger,\n                lifecycle_status=lifecycle_status,\n            )\n
+                inference_trigger=inference_trigger,
+                lifecycle_status=lifecycle_status,
+            )
+
     def shutdown(self) -> bool:
         with self._lock:
             self._cancel_pending_timer_locked()
-            if self.scheduler is not None:\n                self.scheduler.reset()\n            if self.transition_lifecycle is not None:\n                self.transition_lifecycle.clear()\n            if not self.pressed:
+            if self.scheduler is not None:
+                self.scheduler.reset()
+            if self.transition_lifecycle is not None:
+                self.transition_lifecycle.clear()
+            if not self.pressed:
                 return False
             self.executor.set_pressed(False)
             self.pressed = False

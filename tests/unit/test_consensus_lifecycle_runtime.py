@@ -234,6 +234,7 @@ def test_future_action_h0_uses_one_pass_and_coherent_lifecycle() -> None:
             ((0.9, 0.7, 0.8, 0.9), (0.1, 0.0, 0.0, 0.0)),
             ((0.9, 0.1, 0.1, 0.1), (0.8, 0.0, 0.0, 0.0)),
             ((0.9, 0.1, 0.1, 0.1), (0.2, 0.0, 0.0, 0.0)),
+            ((0.9, 0.1, 0.1, 0.1), (0.2, 0.0, 0.0, 0.0)),
         ]
     )
     engine = StateConditionedRuntimeEngine(
@@ -276,11 +277,16 @@ def test_future_action_h0_uses_one_pass_and_coherent_lifecycle() -> None:
     assert confirmed.raw_control_probability == pytest.approx(0.2)
     assert confirmed.lifecycle_previous_state_probability == pytest.approx(0.8)
 
-    resumed = engine.ingest(make_frame(4, 210.0))
+    still_held = engine.ingest(make_frame(4, 210.0))
+    assert still_held is not None
+    assert still_held.action is ControlAction.HOLD
+    assert still_held.scheduler_reason == "min_hold"
+
+    resumed = engine.ingest(make_frame(5, 250.0))
     assert resumed is not None
     assert resumed.action is ControlAction.RELEASE
     assert resumed.scheduler_reason == "primary"
-    assert model.calls == 5
+    assert model.calls == 6
     assert executor.states == [True, False]
 
 

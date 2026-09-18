@@ -418,6 +418,15 @@ def main() -> int:
                         suffix += f" pending_due={step.pending_due_ms:.1f}ms"
                     if step.lifecycle_status is not None:
                         suffix += f" lifecycle={step.lifecycle_status}"
+                        if step.raw_control_probability is not None:
+                            suffix += (
+                                f" raw_h0={step.raw_control_probability:.3f}"
+                            )
+                        if step.lifecycle_previous_state_probability is not None:
+                            suffix += (
+                                " previous_state_h0="
+                                f"{step.lifecycle_previous_state_probability:.3f}"
+                            )
                 elif direct_h0 and step.scheduler_reason is not None:
                     suffix += f" reason={step.scheduler_reason}"
                 print(

@@ -34,6 +34,57 @@ def test_primary_control_horizon_switches_immediately() -> None:
     assert scheduler.last_switch_ms == pytest.approx(1000.0)
 
 
+def test_press_only_anticipation_arms_only_from_released_state() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            anticipation_direction="press_only",
+        )
+    )
+
+    press_candidate = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.2, 0.8),
+        current_pressed=False,
+    )
+
+    assert press_candidate.reason == "pending_armed"
+
+    scheduler.reset()
+    release_candidate = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.2, 0.8),
+        current_pressed=True,
+    )
+
+    assert release_candidate.reason == "hold"
+    assert scheduler.pending_due_ms is None
+
+
+def test_press_only_anticipation_keeps_primary_release_switches() -> None:
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            anticipation_direction="press_only",
+        )
+    )
+
+    decision = scheduler.update(
+        timestamp_ms=1000.0,
+        probabilities=(0.1, 0.7, 0.9),
+        current_pressed=True,
+    )
+
+    assert decision.switch is True
+    assert decision.reason == "primary"
+
+
 def test_far_horizon_arms_interpolated_pending_switch() -> None:
     scheduler = make_scheduler()
 

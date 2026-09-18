@@ -7,26 +7,15 @@ from karting_agent.train.event_time_dataset import event_time_class
 
 
 def test_event_time_class_maps_each_50ms_bin() -> None:
-    transitions = np.asarray([25.0, 75.0, 125.0, 175.0, 225.0, 275.0])
-
-    assert event_time_class(
-        transitions,
-        0.0,
-        max_horizon_ms=300.0,
-        bin_ms=50.0,
-    ) == (0, 25.0)
-    assert event_time_class(
-        transitions,
-        25.0,
-        max_horizon_ms=300.0,
-        bin_ms=50.0,
-    ) == (1, 50.0)
-    assert event_time_class(
-        transitions,
-        75.0,
-        max_horizon_ms=300.0,
-        bin_ms=50.0,
-    ) == (2, 50.0)
+    for class_index, delay_ms in enumerate(
+        (25.0, 75.0, 125.0, 175.0, 225.0, 275.0)
+    ):
+        assert event_time_class(
+            np.asarray([delay_ms]),
+            0.0,
+            max_horizon_ms=300.0,
+            bin_ms=50.0,
+        ) == (class_index, delay_ms)
 
 
 def test_event_time_class_uses_no_event_class_beyond_horizon() -> None:

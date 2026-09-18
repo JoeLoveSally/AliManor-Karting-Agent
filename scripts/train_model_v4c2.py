@@ -505,7 +505,16 @@ def main() -> int:
         ).resolve()
     )
     relation_labels = load_kart_relative_pseudo_labels(relation_labels_path)
-    samples = load_v3_samples(args.samples.resolve())
+    samples_path = args.samples.resolve()
+    samples = load_v3_samples(samples_path)
+    target_widths = {len(sample.target_states) for sample in samples}
+    expected_target_width = len(horizons)
+    if target_widths != {expected_target_width}:
+        raise ValueError(
+            "sample manifest horizon width does not match training config: "
+            f"manifest={sorted(target_widths)}, config={expected_target_width}; "
+            f"rebuild {samples_path} with prediction_horizons_ms={list(horizons)}"
+        )
     partitions = partition_samples(samples, split)
 
     random.seed(loop_config.seed)

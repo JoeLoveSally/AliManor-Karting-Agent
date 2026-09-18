@@ -141,7 +141,7 @@ def main() -> int:
         require_cache=args.require_cache,
         counterfactual_states=False,
     )
-    num_workers = loop_config.num_workers if args.num_workers is None else args.num_workers
+    num_workers = (\n        loop_config.num_workers if args.num_workers is None else args.num_workers\n    )
     loader_kwargs: dict[str, object] = {
         "batch_size": loop_config.batch_size,
         "shuffle": False,
@@ -177,7 +177,7 @@ def main() -> int:
     switch_if_release = np.concatenate(release_batches, axis=0)
     switch_if_press = np.concatenate(press_batches, axis=0)
     expected_shape = (len(samples), len(horizons))
-    if switch_if_release.shape != expected_shape or switch_if_press.shape != expected_shape:
+    if (\n        switch_if_release.shape != expected_shape\n        or switch_if_press.shape != expected_shape\n    ):
         raise RuntimeError("switch prediction shape mismatch")
 
     indices_by_video: dict[str, list[int]] = defaultdict(list)
@@ -214,7 +214,7 @@ def main() -> int:
             raw_indices,
             key=lambda index: float(samples[index].input_timestamps_ms[-1]),
         )
-        timestamps = [float(samples[index].input_timestamps_ms[-1]) for index in indices]
+        timestamps = [\n            float(samples[index].input_timestamps_ms[-1]) for index in indices\n        ]
         initial = samples[indices[0]].current_pressed
         if initial is None:
             raise ValueError("validation sample missing current_pressed")

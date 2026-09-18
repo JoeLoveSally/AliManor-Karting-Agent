@@ -40,6 +40,10 @@ import evaluate_v5_h0_closed_loop as base  # noqa: E402
 from karting_agent.model.kart_relative_supervised import (  # noqa: E402
     build_kart_relative_model,
 )
+from karting_agent.runtime.h0_coherence import (  # noqa: E402
+    desired_press_from_switch_pair,
+    project_desired_press_to_switch,
+)
 from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa: E402
 from karting_agent.train.h0_closed_loop import simulate_h0_closed_loop  # noqa: E402
 from karting_agent.train.state_conditioned_dataset import (  # noqa: E402
@@ -83,13 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-state-hold-ms", type=float, default=100.0)
     parser.add_argument("--tolerance-ms", type=float, default=None)
     return parser.parse_args()
-
-
-def _project_from_desired_press(
-    desired_press: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    desired_press = np.asarray(desired_press, dtype=np.float64)
-    return desired_press, 1.0 - desired_press
 
 
 def _conflict_summary(
@@ -291,15 +288,16 @@ def main() -> int:
     native_release = switch_if_release[:, h0_index].astype(np.float64)
     native_press = switch_if_press[:, h0_index].astype(np.float64)
 
-    paired_desired_press = 0.5 * (
-        native_release + (1.0 - native_press)
+    paired_desired_press = desired_press_from_switch_pair(
+        native_release,
+        native_press,
     )
-    paired_release, paired_press = _project_from_desired_press(
+    paired_release, paired_press = project_desired_press_to_switch(
         paired_desired_press
     )
 
     future_desired_press = future_press[:, h0_index].astype(np.float64)
-    future_release, future_press_switch = _project_from_desired_press(
+    future_release, future_press_switch = project_desired_press_to_switch(
         future_desired_press
     )
 

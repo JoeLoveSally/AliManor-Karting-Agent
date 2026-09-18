@@ -34,6 +34,7 @@ from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa
 from karting_agent.train.h0_closed_loop import simulate_h0_closed_loop  # noqa: E402
 from karting_agent.train.sequence_evaluator import (  # noqa: E402
     SequencePoint,
+    evaluate_sequence,
     match_transitions,
     transitions_from_points,
 )

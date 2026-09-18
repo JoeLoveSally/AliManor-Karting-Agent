@@ -150,6 +150,16 @@ def _probabilities(step: dict[str, object]) -> tuple[float, ...]:
     return tuple(float(value) for value in raw)
 
 
+def _state_before(step: dict[str, object]) -> bool:
+    action = str(step.get("action", "HOLD"))
+    state_after = bool(step.get("pressed", False))
+    if action == "PRESS":
+        return False
+    if action == "RELEASE":
+        return True
+    return state_after
+
+
 def _source_frame(step: dict[str, object]) -> int:
     raw = step.get("input_frame_indices")
     if not isinstance(raw, list) or not raw:
@@ -314,6 +324,15 @@ def main() -> int:
             float(best_step["observation_timestamp_ms"]) - ref_anchor.timestamp_ms
         )
 
+        reference_model_probabilities = model.predict_switch_all(
+            reference_inputs[ref_index],
+            _state_before(ref_step),
+        )
+        candidate_model_probabilities = model.predict_switch_all(
+            candidate_inputs[cand_index],
+            _state_before(cand_step),
+        )
+
         rows.append(
             {
                 "requested_offset_ms": requested_offset_ms,
@@ -325,6 +344,8 @@ def main() -> int:
                 "same_time_input_cosine": same_input_cosine,
                 "reference_probabilities": _probabilities(ref_step),
                 "candidate_probabilities": _probabilities(cand_step),
+                "reference_model_probabilities": reference_model_probabilities,
+                "candidate_model_probabilities": candidate_model_probabilities,
                 "best_reference_relative_ms": best_relative_ms,
                 "best_reference_source_frame": _source_frame(best_step),
                 "best_feature_cosine": best_feature_cosine,
@@ -348,7 +369,7 @@ def main() -> int:
     )
     print(
         " offset | same_feat same_input | best_ref phase_shift best_feat "
-        "best_input | ref_h200 cur_h200 best_h200",
+        "best_input | rec_ref rec_cur | model_ref model_cur",
         flush=True,
     )
     horizons = tuple(float(value) for value in model.spec.prediction_horizons_ms)
@@ -357,9 +378,13 @@ def main() -> int:
         ref_probs = row["reference_probabilities"]
         cand_probs = row["candidate_probabilities"]
         best_probs = row["best_reference_probabilities"]
+        ref_model_probs = row["reference_model_probabilities"]
+        cand_model_probs = row["candidate_model_probabilities"]
         assert isinstance(ref_probs, tuple)
         assert isinstance(cand_probs, tuple)
         assert isinstance(best_probs, tuple)
+        assert isinstance(ref_model_probs, tuple)
+        assert isinstance(cand_model_probs, tuple)
         print(
             f"{float(row['requested_offset_ms']):+7.0f} | "
             f"{float(row['same_time_feature_cosine']):9.4f} "
@@ -368,9 +393,10 @@ def main() -> int:
             f"{float(row['visual_phase_shift_ms']):+11.1f} "
             f"{float(row['best_feature_cosine']):9.4f} "
             f"{float(row['best_input_cosine']):10.4f} | "
-            f"{ref_probs[control_index]:8.3f} "
-            f"{cand_probs[control_index]:8.3f} "
-            f"{best_probs[control_index]:9.3f}",
+            f"{ref_probs[control_index]:7.3f} "
+            f"{cand_probs[control_index]:7.3f} | "
+            f"{ref_model_probs[control_index]:9.3f} "
+            f"{cand_model_probs[control_index]:9.3f}",
             flush=True,
         )
 

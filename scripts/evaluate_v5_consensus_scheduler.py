@@ -605,6 +605,10 @@ def main() -> int:
         consensus_points_by_video,
         transition_events_by_video,
     )
+    lifecycle_false_positives, lifecycle_false_negatives = unmatched_diagnostics(
+        lifecycle_points_by_video,
+        None,
+    )
     for item in consensus_false_positives:
         h0_same_direction = [
             event
@@ -686,7 +690,9 @@ def main() -> int:
         f"unmatched transitions: h0_fp={len(h0_false_positives)} "
         f"h0_fn={len(h0_false_negatives)} "
         f"consensus_fp={len(consensus_false_positives)} "
-        f"consensus_fn={len(consensus_false_negatives)}",
+        f"consensus_fn={len(consensus_false_negatives)} "
+        f"lifecycle_fp={len(lifecycle_false_positives)} "
+        f"lifecycle_fn={len(lifecycle_false_negatives)}",
         flush=True,
     )
     print("consensus false positives:", flush=True)
@@ -736,6 +742,8 @@ def main() -> int:
             "h0_false_negatives": h0_false_negatives,
             "consensus_false_positives": consensus_false_positives,
             "consensus_false_negatives": consensus_false_negatives,
+            "lifecycle_false_positives": lifecycle_false_positives,
+            "lifecycle_false_negatives": lifecycle_false_negatives,
         },
         "test_evaluated": False,
     }

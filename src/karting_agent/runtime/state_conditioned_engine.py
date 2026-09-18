@@ -34,6 +34,13 @@ class SwitchModel(Protocol):
     ) -> tuple[float, ...]:
         """Return switch probabilities for all prediction horizons."""
 
+    def predict_native_switch_and_future_all(
+        self,
+        inputs: np.ndarray,
+        current_pressed: bool,
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Return native switch and absolute future-action probabilities."""
+
 
 class TimerHandle(Protocol):
     def start(self) -> None: ...
@@ -52,6 +59,7 @@ class StateConditionedRuntimeConfig:
     switch_threshold: float = 0.6
     min_state_hold_ms: float = 0.0
     execute_pending_at_due: bool = False
+    control_h0_source: str = "native_switch"
 
     def validate(self) -> None:
         if not math.isfinite(self.target_fps) or self.target_fps <= 0:
@@ -71,6 +79,14 @@ class StateConditionedRuntimeConfig:
             raise ValueError("switch_threshold must be in (0, 1)")
         if not math.isfinite(self.min_state_hold_ms) or self.min_state_hold_ms < 0.0:
             raise ValueError("min_state_hold_ms must be finite and >= 0")
+        if self.control_h0_source not in {
+            "native_switch",
+            "future_action_projection",
+        }:
+            raise ValueError(
+                "control_h0_source must be native_switch or "
+                "future_action_projection"
+            )
 
     @property
     def history_ms(self) -> float:
@@ -126,6 +142,12 @@ class StateConditionedRuntimeEngine:
         config.validate()
         if config.execute_pending_at_due and scheduler is None:
             raise ValueError("execute_pending_at_due requires a scheduler")
+        if config.control_h0_source == "future_action_projection" and not isinstance(
+            scheduler, ConsensusDenseHorizonScheduler
+        ):
+            raise ValueError(
+                "future_action_projection H0 requires ConsensusDenseHorizonScheduler"
+            )
         if transition_lifecycle is not None and not isinstance(
             scheduler, ConsensusDenseHorizonScheduler
         ):
@@ -308,13 +330,36 @@ class StateConditionedRuntimeEngine:
                 probabilities = (probability,)
                 raw_control_probability = probability
             else:
-                probabilities = tuple(
-                    float(value)
-                    for value in self.model.predict_switch_all(temporal.input, before)
-                )
                 control_index = self.scheduler.config.horizons_ms.index(
                     self.scheduler.config.control_horizon_ms
                 )
+                future_h0_desired_press: float | None = None
+                if self.config.control_h0_source == "future_action_projection":
+                    native_switch, future_action = (
+                        self.model.predict_native_switch_and_future_all(
+                            temporal.input,
+                            before,
+                        )
+                    )
+                    probabilities = tuple(float(value) for value in native_switch)
+                    future_h0_desired_press = float(future_action[control_index])
+                    projected_h0 = (
+                        1.0 - future_h0_desired_press
+                        if before
+                        else future_h0_desired_press
+                    )
+                    projected = list(probabilities)
+                    projected[control_index] = projected_h0
+                    probabilities = tuple(projected)
+                else:
+                    probabilities = tuple(
+                        float(value)
+                        for value in self.model.predict_switch_all(
+                            temporal.input,
+                            before,
+                        )
+                    )
+
                 raw_control_probability = probabilities[control_index]
                 if (
                     self.transition_lifecycle is not None
@@ -322,16 +367,23 @@ class StateConditionedRuntimeEngine:
                 ):
                     pending = self.transition_lifecycle.pending
                     assert pending is not None
-                    previous_probabilities = tuple(
-                        float(value)
-                        for value in self.model.predict_switch_all(
-                            temporal.input,
-                            pending.previous_pressed,
+                    if future_h0_desired_press is not None:
+                        lifecycle_previous_state_probability = (
+                            1.0 - future_h0_desired_press
+                            if pending.previous_pressed
+                            else future_h0_desired_press
                         )
-                    )
-                    lifecycle_previous_state_probability = previous_probabilities[
-                        control_index
-                    ]
+                    else:
+                        previous_probabilities = tuple(
+                            float(value)
+                            for value in self.model.predict_switch_all(
+                                temporal.input,
+                                pending.previous_pressed,
+                            )
+                        )
+                        lifecycle_previous_state_probability = (
+                            previous_probabilities[control_index]
+                        )
                     lifecycle_status = self.transition_lifecycle.observe(
                         timestamp_ms=frame.timestamp_ms,
                         previous_state_h0_probability=(

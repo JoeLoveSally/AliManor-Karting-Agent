@@ -32,7 +32,11 @@ from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402
 )
 from karting_agent.train.frame_cache import frame_cache_root_from_config  # noqa: E402
 from karting_agent.train.h0_closed_loop import simulate_h0_closed_loop  # noqa: E402
-from karting_agent.train.sequence_evaluator import (  # noqa: E402\n    SequencePoint,\n    evaluate_sequence,\n)
+from karting_agent.train.sequence_evaluator import (  # noqa: E402
+    SequencePoint,
+    match_transitions,
+    transitions_from_points,
+)
 from karting_agent.train.state_conditioned_dataset import (  # noqa: E402
     StateConditionedVideoDataset,
     load_v3_samples,

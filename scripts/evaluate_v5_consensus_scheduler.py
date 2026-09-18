@@ -472,7 +472,7 @@ def main() -> int:
                         executed_at_ms=timestamp_ms,
                         previous_pressed=previous_state,
                         current_pressed=state,
-                        evidence_lead_ms=args.min_state_hold_ms,
+                        evidence_lead_ms=0.0,
                     )
                 else:
                     lifecycle.clear()

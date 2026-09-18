@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
 import time

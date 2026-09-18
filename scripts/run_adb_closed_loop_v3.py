@@ -27,7 +27,15 @@ from karting_agent.data_flow.input.adb_video import AdbVideoInput  # noqa: E402
 from karting_agent.model.state_conditioned_runner import (  # noqa: E402
     StateConditionedModelRunner,
 )
-from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402\n    ConsensusDenseConfig,\n    ConsensusDenseHorizonScheduler,\n)\nfrom karting_agent.runtime.consensus_transition_lifecycle import (  # noqa: E402\n    ConsensusTransitionLifecycle,\n)\nfrom karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402\n    MultiHorizonSchedulerConfig,
+from karting_agent.runtime.consensus_dense_scheduler import (  # noqa: E402
+    ConsensusDenseConfig,
+    ConsensusDenseHorizonScheduler,
+)
+from karting_agent.runtime.consensus_transition_lifecycle import (  # noqa: E402
+    ConsensusTransitionLifecycle,
+)
+from karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402
+    MultiHorizonSchedulerConfig,
     MultiHorizonSwitchScheduler,
 )
 from karting_agent.runtime.state_conditioned_engine import (  # noqa: E402
@@ -234,7 +242,10 @@ def main() -> int:
             execute_pending_at_due=bool(args.execute_pending_at_due),
         ),
         initial_pressed=False,
-        scheduler=scheduler,\n        transition_lifecycle=transition_lifecycle,\n    )\n
+        scheduler=scheduler,
+        transition_lifecycle=transition_lifecycle,
+    )
+
     video_input: AdbVideoInput | None = None
     if args.input == "video":
         video_config = legacy.resolve_adb_video_config(hardware_raw, args)
@@ -640,7 +651,9 @@ def main() -> int:
         "execute": {"semantics": "persistent_shell_enqueue", **execute_stats}
         if args.arm
         else None,
-        "scheduler_events": scheduler_events,\n        "lifecycle_events": lifecycle_events,\n        "deadline_events": [
+        "scheduler_events": scheduler_events,
+        "lifecycle_events": lifecycle_events,
+        "deadline_events": [
             {**asdict(event), "action": event.action.value} for event in deadline_events
         ],
         "state_changes": state_changes,

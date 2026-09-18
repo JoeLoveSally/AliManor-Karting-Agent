@@ -175,6 +175,7 @@ def run_epoch(
     timing_errors: list[float] = []
     totals = {
         "loss": 0.0,
+        "primary_loss": 0.0,
         "current_action_loss": 0.0,
         "event_time_loss": 0.0,
         "lateral_loss": 0.0,
@@ -257,9 +258,12 @@ def run_epoch(
                 edge_target,
                 relation_weights,
             )
-            loss = (
+            primary_loss = (
                 action_weight * action_loss
                 + event_time_weight * event_loss
+            )
+            loss = (
+                primary_loss
                 + lateral_weight * lateral_loss
                 + heading_weight * heading_loss
                 + edge_risk_weight * edge_loss
@@ -272,6 +276,7 @@ def run_epoch(
             total_samples += batch_size
             for name, value in (
                 ("loss", loss),
+                ("primary_loss", primary_loss),
                 ("current_action_loss", action_loss),
                 ("event_time_loss", event_loss),
                 ("lateral_loss", lateral_loss),
@@ -372,6 +377,7 @@ def print_summary(prefix: str, summary: dict[str, object]) -> None:
     edge = summary["edge_risk"]
     print(
         f"{prefix}: loss={summary['loss']:.4f} "
+        f"primary_loss={summary['primary_loss']:.4f} "
         f"action_loss={summary['current_action_loss']:.4f} "
         f"event_loss={summary['event_time_loss']:.4f} "
         f"action_f1={action['f1']:.3f} "
@@ -638,7 +644,7 @@ def main() -> int:
             print_summary(f"epoch {epoch:02d}/validation", validation_summary)
             print(f"epoch {epoch:02d}/time: {elapsed:.1f}s", flush=True)
 
-            validation_loss = float(validation_summary["event_time_loss"])
+            validation_loss = float(validation_summary["primary_loss"])
             if validation_loss < best_loss:
                 best_loss = validation_loss
                 best_epoch = epoch
@@ -653,7 +659,7 @@ def main() -> int:
                     "train": train_summary,
                     "validation": validation_summary,
                     "best_epoch": best_epoch,
-                    "best_validation_event_time_loss": best_loss,
+                    "best_validation_primary_loss": best_loss,
                 }
             )
             write_json_atomic(history_path, history)
@@ -663,14 +669,14 @@ def main() -> int:
                     "status": "running",
                     "last_epoch": epoch,
                     "best_epoch": best_epoch,
-                    "best_validation_event_time_loss": best_loss,
+                    "best_validation_primary_loss": best_loss,
                     "epochs_without_improvement": without_improvement,
                 },
             )
             if should_stop_early(without_improvement, patience):
                 print(
                     f"Early stopping: best_epoch={best_epoch} "
-                    f"best_event_time_loss={best_loss:.6f}",
+                    f"best_primary_loss={best_loss:.6f}",
                     flush=True,
                 )
                 break
@@ -705,7 +711,7 @@ def main() -> int:
                 "event_time_classes": event_time_classes,
                 "no_event_class": no_event_class,
                 "best_epoch": best_epoch,
-                "best_validation_event_time_loss": best_loss,
+                "best_validation_primary_loss": best_loss,
                 "loss_weights": weights,
                 "config": str(config_path),
                 "test_evaluated": not args.skip_test,
@@ -718,7 +724,7 @@ def main() -> int:
                 "status": "complete",
                 "last_epoch": history[-1]["epoch"],
                 "best_epoch": best_epoch,
-                "best_validation_event_time_loss": best_loss,
+                "best_validation_primary_loss": best_loss,
             },
         )
     finally:

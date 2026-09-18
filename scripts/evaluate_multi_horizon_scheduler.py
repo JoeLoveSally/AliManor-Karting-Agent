@@ -239,6 +239,68 @@ def simulate_fixed_horizon(
     return decisions
 
 
+def simulate_fixed_horizon_min_hold(
+    video: str,
+    samples,
+    sample_indices: list[int],
+    switch_if_release: np.ndarray,
+    switch_if_press: np.ndarray,
+    *,
+    horizon_index: int,
+    threshold: float,
+    min_state_hold_ms: float,
+) -> list[ReplayDecision]:
+    """Replay one horizon with only a deterministic minimum state hold."""
+
+    ordered = sorted(
+        sample_indices,
+        key=lambda index: float(samples[index].input_timestamps_ms[-1]),
+    )
+    if not ordered:
+        return []
+    initial = samples[ordered[0]].current_pressed
+    if initial is None:
+        raise ValueError("sample is missing current_pressed")
+    state = bool(initial)
+    last_switch_ms: float | None = None
+    decisions: list[ReplayDecision] = []
+
+    for index in ordered:
+        observation_ms = float(samples[index].input_timestamps_ms[-1])
+        all_probabilities = (
+            switch_if_press[index] if state else switch_if_release[index]
+        )
+        probability = float(all_probabilities[horizon_index])
+        before = state
+        inside_hold = (
+            last_switch_ms is not None
+            and observation_ms - last_switch_ms < min_state_hold_ms - 1e-6
+        )
+        switched = probability >= threshold and not inside_hold
+        if switched:
+            state = not state
+            last_switch_ms = observation_ms
+        decisions.append(
+            ReplayDecision(
+                video=video,
+                observation_timestamp_ms=observation_ms,
+                state_before=before,
+                switched=switched,
+                state_after=state,
+                probability=probability,
+                reason=(
+                    "primary"
+                    if switched
+                    else ("min_hold" if inside_hold else "hold")
+                ),
+                probabilities=tuple(
+                    float(value) for value in all_probabilities
+                ),
+            )
+        )
+    return decisions
+
+
 def simulate_scheduler(
     video: str,
     samples,
@@ -665,6 +727,7 @@ def main() -> int:
     }
 
     baseline_by_video: dict[str, list[ReplayDecision]] = {}
+    baseline_min_hold_by_video: dict[str, list[ReplayDecision]] = {}
     scheduler_control_by_video: dict[str, list[ReplayDecision]] = {}
     scheduler_by_video: dict[str, list[ReplayDecision]] = {}
     for video, indices in indices_by_video.items():
@@ -676,6 +739,16 @@ def main() -> int:
             switch_if_press,
             horizon_index=control_index,
             threshold=args.threshold,
+        )
+        baseline_min_hold_by_video[video] = simulate_fixed_horizon_min_hold(
+            video,
+            samples,
+            indices,
+            switch_if_release,
+            switch_if_press,
+            horizon_index=control_index,
+            threshold=args.threshold,
+            min_state_hold_ms=scheduler_config.min_state_hold_ms,
         )
         if scheduler_config.reserve_bounded_reversal_during_min_hold:
             scheduler_control_by_video[video] = simulate_scheduler(
@@ -700,6 +773,12 @@ def main() -> int:
 
     baseline_summary = replay_summary(
         baseline_by_video,
+        label_data,
+        control_horizon_ms=scheduler_config.control_horizon_ms,
+        tolerance_ms=tolerance_ms,
+    )
+    baseline_min_hold_summary = replay_summary(
+        baseline_min_hold_by_video,
         label_data,
         control_horizon_ms=scheduler_config.control_horizon_ms,
         tolerance_ms=tolerance_ms,
@@ -741,6 +820,10 @@ def main() -> int:
         flush=True,
     )
     print_replay_summary("baseline_h200", baseline_summary)
+    print_replay_summary(
+        "baseline_h200_min_hold",
+        baseline_min_hold_summary,
+    )
     if scheduler_control_summary is not None:
         print_replay_summary("scheduler_control", scheduler_control_summary)
     print_replay_summary("scheduler", scheduler_summary)
@@ -799,6 +882,7 @@ def main() -> int:
         "input_representation": input_representation,
         "transition_tolerance_ms": tolerance_ms,
         "baseline_h200": baseline_summary,
+        "baseline_h200_min_hold": baseline_min_hold_summary,
         "scheduler_control": scheduler_control_summary,
         "scheduler": scheduler_summary,
         "scheduler_diagnostics": diagnostics,

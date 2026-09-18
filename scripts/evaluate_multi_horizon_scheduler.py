@@ -384,16 +384,30 @@ def scheduler_diagnostics(
         ],
         dtype=np.float64,
     )
+    hold_reversal_delays = np.asarray(
+        [
+            decision.pending_delay_ms
+            for decision in decisions
+            if decision.reason == "hold_reversal_armed"
+            and decision.pending_delay_ms is not None
+        ],
+        dtype=np.float64,
+    )
+
+    def summarize(values: np.ndarray) -> dict[str, float | int]:
+        return {
+            "count": int(values.size),
+            "mean": float(values.mean()) if values.size else 0.0,
+            "p50": float(np.percentile(values, 50)) if values.size else 0.0,
+            "p95": float(np.percentile(values, 95)) if values.size else 0.0,
+            "min": float(values.min()) if values.size else 0.0,
+            "max": float(values.max()) if values.size else 0.0,
+        }
+
     return {
         "reasons": dict(sorted(reasons.items())),
-        "armed_delay_ms": {
-            "count": int(delays.size),
-            "mean": float(delays.mean()) if delays.size else 0.0,
-            "p50": float(np.percentile(delays, 50)) if delays.size else 0.0,
-            "p95": float(np.percentile(delays, 95)) if delays.size else 0.0,
-            "min": float(delays.min()) if delays.size else 0.0,
-            "max": float(delays.max()) if delays.size else 0.0,
-        },
+        "armed_delay_ms": summarize(delays),
+        "hold_reversal_delay_ms": summarize(hold_reversal_delays),
     }
 
 
@@ -623,6 +637,17 @@ def main() -> int:
         f"armed delay: n={delays['count']} mean={delays['mean']:.1f}ms "
         f"p50={delays['p50']:.1f}ms p95={delays['p95']:.1f}ms "
         f"range={delays['min']:.1f}..{delays['max']:.1f}ms",
+        flush=True,
+    )
+    reversal_delays = diagnostics["hold_reversal_delay_ms"]
+    print(
+        "hold reversal delay: "
+        f"n={reversal_delays['count']} "
+        f"mean={reversal_delays['mean']:.1f}ms "
+        f"p50={reversal_delays['p50']:.1f}ms "
+        f"p95={reversal_delays['p95']:.1f}ms "
+        f"range={reversal_delays['min']:.1f}.."
+        f"{reversal_delays['max']:.1f}ms",
         flush=True,
     )
 

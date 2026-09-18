@@ -423,3 +423,53 @@ def test_runtime_preserves_bounded_reversal_seen_during_min_hold() -> None:
     assert reversed_step.action is ControlAction.RELEASE
     assert reversed_step.scheduler_reason == "hold_reversal_execute"
     assert executor.states == [True, False]
+
+
+def test_hold_reversal_reservation_can_execute_on_exact_deadline() -> None:
+    executor = RecordingExecutor()
+    timers = ManualTimerFactory()
+    scheduler = MultiHorizonSwitchScheduler(
+        MultiHorizonSchedulerConfig(
+            horizons_ms=(100.0, 200.0, 300.0),
+            control_horizon_ms=200.0,
+            anticipation_horizon_ms=300.0,
+            threshold=0.6,
+            min_state_hold_ms=100.0,
+            reserve_bounded_reversal_during_min_hold=True,
+        )
+    )
+    model = SequenceModel(
+        [
+            (0.10, 0.70, 0.90),
+            (0.98, 0.86, 0.03),
+        ]
+    )
+    engine = StateConditionedRuntimeEngine(
+        model=model,
+        preprocess_config=make_preprocess_config(),
+        executor=executor,
+        config=make_runtime_config(execute_pending_at_due=True),
+        scheduler=scheduler,
+        timer_factory=timers,
+        clock=lambda: 10.0,
+    )
+
+    first = engine.ingest(make_frame(0, 0.0))
+    armed = engine.ingest(make_frame(1, 50.0))
+
+    assert first is not None
+    assert first.action is ControlAction.PRESS
+    assert armed is not None
+    assert armed.scheduler_reason == "hold_reversal_armed"
+    assert armed.pending_due_ms == pytest.approx(100.0)
+    assert timers.timers[-1].interval == pytest.approx(0.05)
+
+    timers.timers[-1].fire()
+    events = engine.drain_deadline_events()
+
+    assert executor.states == [True, False]
+    assert len(events) == 1
+    assert events[0].action is ControlAction.RELEASE
+    assert events[0].pressed is False
+    assert events[0].timestamp_ms == pytest.approx(100.0)
+    assert events[0].scheduler_reason == "hold_reversal_execute_deadline"

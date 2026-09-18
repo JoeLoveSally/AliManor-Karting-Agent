@@ -21,6 +21,10 @@ if str(SRC) not in sys.path:
 from karting_agent.model.kart_relative_supervised import (  # noqa: E402
     build_kart_relative_model,
 )
+from karting_agent.model.temporal_delta import (  # noqa: E402
+    transform_temporal_input_torch,
+    validate_temporal_input_representation,
+)
 from karting_agent.runtime.multi_horizon_scheduler import (  # noqa: E402
     MultiHorizonSchedulerConfig,
     MultiHorizonSwitchScheduler,
@@ -553,10 +557,16 @@ def main() -> int:
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     model_family = str(metadata.get("model_family", ""))
-    if model_family != "state_conditioned_kart_relative_v4c2":
+    if model_family not in {
+        "state_conditioned_kart_relative_v4c2",
+        "state_conditioned_kart_relative_v4c3_delta",
+    }:
         raise ValueError(
-            "scheduler evaluator currently expects state_conditioned_kart_relative_v4c2"
+            "scheduler evaluator expects a v4-C2/C3 kart-relative artifact"
         )
+    input_representation = validate_temporal_input_representation(
+        str(metadata.get("input_representation", "raw_rgb_stack"))
+    )
     horizons = tuple(float(value) for value in metadata["prediction_horizons_ms"])
     scheduler_config = MultiHorizonSchedulerConfig(
         horizons_ms=horizons,
@@ -621,6 +631,11 @@ def main() -> int:
                     device=device,
                     dtype=torch.float32,
                     non_blocking=device.type == "cuda",
+                )
+                inputs = transform_temporal_input_torch(
+                    inputs,
+                    frame_stack=int(metadata["frame_stack"]),
+                    representation=input_representation,
                 )
                 features = model.encode_visual(inputs)
                 batch_size = int(inputs.shape[0])
@@ -780,6 +795,8 @@ def main() -> int:
         "model": str(model_path),
         "metadata": str(metadata_path),
         "scheduler_config": asdict(scheduler_config),
+        "model_family": model_family,
+        "input_representation": input_representation,
         "transition_tolerance_ms": tolerance_ms,
         "baseline_h200": baseline_summary,
         "scheduler_control": scheduler_control_summary,

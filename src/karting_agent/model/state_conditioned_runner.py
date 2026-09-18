@@ -10,6 +10,10 @@ import numpy as np
 
 from karting_agent.model.runner import _runtime_spec, _select_device
 from karting_agent.model.state_conditioned import build_state_conditioned_model
+from karting_agent.model.temporal_delta import (
+    transform_temporal_input_numpy,
+    validate_temporal_input_representation,
+)
 from karting_agent.runtime.future_action_projection import project_switch_probabilities
 
 
@@ -17,6 +21,7 @@ _SUPPORTED_MODEL_FAMILIES = {
     "state_conditioned_transition_v3",
     "state_conditioned_axis_v4c1",
     "state_conditioned_kart_relative_v4c2",
+    "state_conditioned_kart_relative_v4c3_delta",
     "state_conditioned_kart_relative_v5_h0",
 }
 
@@ -28,6 +33,11 @@ _SUPPORTED_SWITCH_PROBABILITY_SOURCES = {
 _AUXILIARY_HEAD_PREFIXES = {
     "state_conditioned_axis_v4c1": ("axis_head.",),
     "state_conditioned_kart_relative_v4c2": (
+        "lateral_head.",
+        "heading_error_head.",
+        "edge_risk_head.",
+    ),
+    "state_conditioned_kart_relative_v4c3_delta": (
         "lateral_head.",
         "heading_error_head.",
         "edge_risk_head.",
@@ -106,6 +116,9 @@ class StateConditionedModelRunner:
         self.metadata = metadata
         self.model_family = model_family
         self.switch_probability_source = _switch_probability_source(metadata)
+        self.input_representation = validate_temporal_input_representation(
+            str(metadata.get("input_representation", "raw_rgb_stack"))
+        )
         self.spec = _runtime_spec(metadata)
         self._torch = torch
         self.device = _select_device(torch, device)
@@ -146,7 +159,14 @@ class StateConditionedModelRunner:
                 f"model input must be float32 with shape {self.input_shape}, got "
                 f"{inputs.dtype} {inputs.shape}"
             )
-        tensor = self._torch.from_numpy(np.ascontiguousarray(inputs)).unsqueeze(0)
+        transformed = transform_temporal_input_numpy(
+            inputs,
+            frame_stack=self.spec.frame_stack,
+            representation=self.input_representation,
+        )
+        tensor = self._torch.from_numpy(
+            np.ascontiguousarray(transformed)
+        ).unsqueeze(0)
         return tensor.to(device=self.device, dtype=self._torch.float32)
 
     def predict_switch_all(

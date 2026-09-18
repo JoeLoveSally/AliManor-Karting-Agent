@@ -395,7 +395,11 @@ def main() -> int:
         step.scheduler_reason for step in steps if step.scheduler_reason is not None
     )
     scheduler_counter.update(event.scheduler_reason for event in deadline_events)
-    scheduler_events = dict(sorted(scheduler_counter.items())) if scheduler is not None else None
+    scheduler_events = (
+        dict(sorted(scheduler_counter.items()))
+        if scheduler is not None or direct_h0
+        else None
+    )
     inference_triggers = dict(sorted(Counter(step.inference_trigger for step in steps).items()))
 
     if video_input is not None:
@@ -442,8 +446,9 @@ def main() -> int:
         )
 
     if scheduler_events is not None:
+        event_label = "Scheduler events" if scheduler is not None else "Control events"
         print(
-            "Scheduler events: "
+            f"{event_label}: "
             + ", ".join(f"{key}={value}" for key, value in scheduler_events.items()),
             flush=True,
         )
@@ -518,7 +523,11 @@ def main() -> int:
         "policy": (
             "state_conditioned_transition_v3_multi_horizon"
             if scheduler is not None
-            else "state_conditioned_transition_v3"
+            else (
+                "state_conditioned_kart_relative_v5_h0_direct"
+                if direct_h0
+                else "state_conditioned_transition_v3"
+            )
         ),
         "input_mode": args.input,
         "wait_for_start": args.wait_for_start,
@@ -535,6 +544,9 @@ def main() -> int:
             "prediction_horizons_ms": model.spec.prediction_horizons_ms,
             "frame_offsets_ms": model.spec.frame_offsets_ms,
             "initial_pressed": False,
+            "direct_min_state_hold_ms": (
+                float(args.min_state_hold_ms) if direct_h0 else 0.0
+            ),
             "execute_pending_at_due": bool(args.execute_pending_at_due),
             "multi_horizon_scheduler": (
                 asdict(scheduler.config) if scheduler is not None else None

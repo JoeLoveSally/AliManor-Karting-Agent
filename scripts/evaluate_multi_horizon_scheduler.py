@@ -96,6 +96,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.60)
     parser.add_argument("--control-horizon-ms", type=float, default=200.0)
     parser.add_argument("--anticipation-horizon-ms", type=float, default=300.0)
+    parser.add_argument(
+        "--anticipation-direction",
+        choices=("both", "press_only", "release_only"),
+        default="both",
+        help=(
+            "Restrict H300 anticipation to transitions into PRESS or RELEASE; "
+            "the primary control horizon remains bidirectional."
+        ),
+    )
     parser.add_argument("--pending-advance-ms", type=float, default=0.0)
     parser.add_argument(
         "--arm-pending-during-min-hold",
@@ -612,6 +621,8 @@ def main() -> int:
             suffix_parts.append("short_overdue")
         if args.reserve_bounded_reversal_during_min_hold:
             suffix_parts.append("hold_reversal")
+        if args.anticipation_direction != "both":
+            suffix_parts.append(str(args.anticipation_direction))
         suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
         output_path = (
             artifact
@@ -637,6 +648,7 @@ def main() -> int:
         control_horizon_ms=float(args.control_horizon_ms),
         anticipation_horizon_ms=float(args.anticipation_horizon_ms),
         threshold=float(args.threshold),
+        anticipation_direction=str(args.anticipation_direction),
         pending_advance_ms=float(args.pending_advance_ms),
         arm_pending_during_min_hold=bool(args.arm_pending_during_min_hold),
         execute_short_horizon_overdue=bool(args.execute_short_horizon_overdue),
@@ -814,6 +826,7 @@ def main() -> int:
         f"threshold={args.threshold:.2f} "
         f"control_h={scheduler_config.control_horizon_ms:g}ms "
         f"anticipation_h={scheduler_config.anticipation_horizon_ms:g}ms "
+        f"anticipation_direction={scheduler_config.anticipation_direction} "
         f"pending_advance={scheduler_config.pending_advance_ms:g}ms "
         f"hold_arm={scheduler_config.arm_pending_during_min_hold} "
         f"short_overdue={scheduler_config.execute_short_horizon_overdue} "

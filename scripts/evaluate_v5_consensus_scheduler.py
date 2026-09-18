@@ -571,8 +571,10 @@ def main() -> int:
         "consensus_due_spread_ms": spread_summary,
         "consensus_support_size": support_summary,
         "diagnostics": {
-            "videos_differing_from_h0": changed_videos,
-            "unmatched_transitions": diagnostic_rows,
+            "h0_false_positives": h0_false_positives,
+            "h0_false_negatives": h0_false_negatives,
+            "consensus_false_positives": consensus_false_positives,
+            "consensus_false_negatives": consensus_false_negatives,
         },
         "test_evaluated": False,
     }

@@ -1,0 +1,93 @@
+model:
+  family: event_time_v4c4
+  architecture: mobilenet_v3_small
+  pretrained: true
+  input_size: 224
+  frame_stack: 5
+  visual_feature_dim: 128
+  hidden_dim: 128
+  input_representation: current_rgb_plus_adjacent_deltas
+
+train:
+  batch_size: 64
+  epochs: 30
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  num_workers: 0
+  seed: 42
+  early_stopping_patience: 4
+  early_stopping_min_delta: 0.0
+
+loss:
+  current_action_weight: 1.0
+  event_time_weight: 1.0
+  lateral_weight: 0.03
+  heading_weight: 0.03
+  edge_risk_weight: 0.01
+
+sampling:
+  stable_weight: 1.0
+  transition_weight: 2.0
+  short_correction_weight: 3.0
+  replacement: true
+
+dataset:
+  sample_fps: 30
+  history_ms: 200
+  frame_interval_ms: 50
+  prediction_horizon_ms: 200
+  prediction_horizons_ms: [100, 150, 200, 250, 300]
+  sampling_horizons_ms: [100, 200, 300]
+  control_horizon_ms: 200
+  transition_window_ms: 200
+  short_correction_min_ms: 100
+  short_correction_max_ms: 300
+  clean_isolated_one_frame_glitches: true
+  counterfactual_train_states: false
+
+event_time:
+  labels_dir: data/processed/v4c3_temporal_delta_dense/labels
+  max_horizon_ms: 300
+  bin_ms: 50
+
+kart_relative_supervision:
+  labels: data/processed/v4c2_temporal_v2/kart_relative_labels.jsonl
+  lateral_encoding: offset_div_half_road_width
+  heading_encoding: cos_2error_sin_2error
+  edge_risk_semantics: abs_lateral_offset_ge_0p70
+
+preprocess:
+  mask_touch_area: true
+  touch_roi: [0.78, 0.82, 0.98, 0.98]
+  mask_rois:
+    - [0.18, 0.03, 0.62, 0.14]
+    - [0.72, 0.00, 1.00, 0.13]
+
+frame_cache:
+  enabled: true
+  root: data/processed/frame_cache_v2
+
+split:
+  name: v4c4_event_time
+  strategy: video_holdout_visual_theme_stratified
+  train:
+    - data/raw/video_20260130_172959.mp4
+    - data/raw/video_20260130_173101.mp4
+    - data/raw/video_20260130_173228.mp4
+    - data/raw/video_20260130_173316.mp4
+    - data/raw/video_20260130_173505.mp4
+    - data/raw/video_20260130_173750.mp4
+    - data/raw/video_20260130_173917.mp4
+    - data/raw/video_20260130_174257.mp4
+    - data/raw/video_20260130_174434.mp4
+    - data/raw/video_20260130_174616.mp4
+    - data/raw/video_20260130_175811.mp4
+  validation:
+    - data/raw/video_20260130_173545.mp4
+    - data/raw/video_20260130_174012.mp4
+  test:
+    - data/raw/video_20260130_173426.mp4
+    - data/raw/video_20260130_173835.mp4
+
+artifact:
+  name: mobilenet_v3_small_v4c4_event_time

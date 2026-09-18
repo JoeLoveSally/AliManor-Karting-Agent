@@ -17,6 +17,7 @@ _SUPPORTED_MODEL_FAMILIES = {
     "state_conditioned_transition_v3",
     "state_conditioned_axis_v4c1",
     "state_conditioned_kart_relative_v4c2",
+    "state_conditioned_kart_relative_v5_h0",
 }
 
 _SUPPORTED_SWITCH_PROBABILITY_SOURCES = {
@@ -27,6 +28,11 @@ _SUPPORTED_SWITCH_PROBABILITY_SOURCES = {
 _AUXILIARY_HEAD_PREFIXES = {
     "state_conditioned_axis_v4c1": ("axis_head.",),
     "state_conditioned_kart_relative_v4c2": (
+        "lateral_head.",
+        "heading_error_head.",
+        "edge_risk_head.",
+    ),
+    "state_conditioned_kart_relative_v5_h0": (
         "lateral_head.",
         "heading_error_head.",
         "edge_risk_head.",

@@ -104,7 +104,14 @@ class EventTimePolicyDecoder:
         *,
         timestamp_ms: float,
         current_pressed: bool,
+        execution_timestamp_ms: float | None = None,
     ) -> PendingEventExecution | None:
+        """Consume a due event.
+
+        The optional execution timestamp is for frame-driven runtime: its actual
+        observation can arrive after the planned deadline. Omitting it preserves
+        historical offline replay behavior and its due-time-based hold clock.
+        """
         timestamp_ms = float(timestamp_ms)
         if not math.isfinite(timestamp_ms):
             raise ValueError("timestamp_ms must be finite")
@@ -118,8 +125,19 @@ class EventTimePolicyDecoder:
         if timestamp_ms + 1e-6 < pending.due_at_ms:
             return None
 
+        executed_at = (
+            pending.due_at_ms
+            if execution_timestamp_ms is None
+            else float(execution_timestamp_ms)
+        )
+        if (
+            not math.isfinite(executed_at)
+            or executed_at + 1e-6 < pending.due_at_ms
+            or executed_at > timestamp_ms + 1e-6
+        ):
+            raise ValueError("execution_timestamp_ms must be within due time and observation")
         self._pending = None
-        self._last_switch_ms = pending.due_at_ms
+        self._last_switch_ms = executed_at
         return PendingEventExecution(
             due_at_ms=pending.due_at_ms,
             state_before=pending.state_before,

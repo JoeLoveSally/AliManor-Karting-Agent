@@ -54,30 +54,44 @@ def test_history_waits_for_full_200ms_and_preserves_train_stack_order() -> None:
     step = engine.ingest(frame(200.0, 4))
     assert step is not None
     assert step["history_frame_indices"] == (0, 1, 2, 3, 4)
-    expected = stack_frames([frame(t, i).image for i, t in enumerate((0, 50, 100, 150, 200))], PreprocessConfig())
+    expected = stack_frames(
+        [frame(t, i).image for i, t in enumerate((0, 50, 100, 150, 200))],
+        PreprocessConfig(),
+    )
     np.testing.assert_array_equal(model.inputs[0], expected)
     assert executor.calls == []
     assert engine.shutdown() is False
     assert executor.calls == []
 
 
-def test_minimum_hold_pending_executes_only_when_a_frame_arrives() -> None:
-    engine, _, executor = make_engine([0.99, 0.01, 0.01, 0.01])
+def test_minimum_hold_pending_executes_only_on_arriving_frame() -> None:
+    engine, _, executor = make_engine([0.99, 0.01, 0.01, 0.01, 0.99])
     for index, timestamp in enumerate((0.0, 50.0, 100.0, 150.0)):
         assert engine.ingest(frame(timestamp, index)) is None
     first = engine.ingest(frame(200.0, 4))
+    assert first is not None
     assert first["events"][0]["reason"] == "action_mismatch"
     assert executor.calls == [True]
-    held = engine.ingest(frame(233.333, 5))
+    # Use timestamps that actually cross the 30fps scheduler deadlines.
+    held = engine.ingest(frame(233.334, 5))
+    assert held is not None
     assert held["decoder_reason"] == "action_hold"
     assert held["pending_due_ms"] == pytest.approx(300.0)
     assert executor.calls == [True]
-    assert engine.ingest(frame(266.667, 6)) is not None
+    assert engine.ingest(frame(266.668, 6)) is not None
     assert executor.calls == [True]
-    executed = engine.ingest(frame(333.333, 7))
+    executed = engine.ingest(frame(333.334, 7))
+    assert executed is not None
     assert executed["events"][0]["reason"] == "pending_execute"
     assert executed["events"][0]["pending_due_at_ms"] == pytest.approx(300.0)
-    assert executed["events"][0]["observation_timestamp_ms"] == pytest.approx(333.333)
+    assert executed["events"][0]["observation_timestamp_ms"] == pytest.approx(333.334)
+    assert engine.decoder.last_switch_ms == pytest.approx(333.334)
+    assert executor.calls == [True, False]
+    # A reverse action at 366ms is inside the *real* hold begun at 333ms.
+    opposite = engine.ingest(frame(366.668, 8))
+    assert opposite is not None
+    assert opposite["decoder_reason"] == "action_hold"
+    assert opposite["pending_due_ms"] == pytest.approx(433.334)
     assert executor.calls == [True, False]
     assert engine.shutdown() is False
 
@@ -137,13 +151,12 @@ def test_model_runner_matches_direct_offline_inference(tmp_path: Path) -> None:
 
 def test_entrypoint_requires_explicit_touch_coordinates() -> None:
     import importlib.util
+    import sys
 
     script_path = Path(__file__).resolve().parents[2] / "scripts/run_adb_closed_loop_v4c4.py"
     spec = importlib.util.spec_from_file_location("run_adb_closed_loop_v4c4", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    # The script imports its legacy helper by script-directory name.
-    import sys
     sys.path.insert(0, str(script_path.parent))
     try:
         spec.loader.exec_module(module)

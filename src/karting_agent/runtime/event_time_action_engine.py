@@ -1,12 +1,12 @@
 """Frame-driven V4-C4 current-action controller (no event-time head or timer).
 
 Pending min-hold transitions execute at the next observed frame at/after the due
-instant. A planned due timestamp is never represented as an actual touch time.
+instant. Planned deadlines and actual host command timestamps are kept separate.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 import time
 from typing import Callable, Protocol
@@ -39,7 +39,10 @@ class ActionRuntimeConfig:
     def validate(self) -> None:
         if not math.isfinite(self.target_fps) or self.target_fps <= 0:
             raise ValueError("target_fps must be finite and positive")
-        if len(self.frame_offsets_ms) != 5 or tuple(sorted(self.frame_offsets_ms)) != self.frame_offsets_ms:
+        if (
+            len(self.frame_offsets_ms) != 5
+            or tuple(sorted(self.frame_offsets_ms)) != self.frame_offsets_ms
+        ):
             raise ValueError("expected five ascending frame offsets")
         if self.frame_offsets_ms[-1] != 0 or self.frame_offsets_ms[0] >= 0:
             raise ValueError("offsets must start in the past and end at now")
@@ -79,13 +82,20 @@ class EventTimeActionEngine:
         self.stopped = False
         self._next_due_ms: float | None = None
 
-    def _send(self, *, pressed: bool, frame: Frame, reason: str, due_at_ms: float | None = None) -> dict[str, object]:
+    def _send(
+        self,
+        *,
+        pressed: bool,
+        frame: Frame,
+        reason: str,
+        due_at_ms: float | None = None,
+    ) -> dict[str, object]:
         if pressed == self.pressed:
             raise RuntimeError("attempted a redundant control transition")
-        # This is the host command timestamp, not the time Android applies touch.
+        # Host command timing does not measure when Android physically applies touch.
         start_ms = self.clock() * 1000.0
         self.executor.set_pressed(pressed)
-        sent_ms = self.clock() * 1000.0
+        returned_ms = self.clock() * 1000.0
         self.pressed = pressed
         return {
             "pressed": pressed,
@@ -94,7 +104,7 @@ class EventTimeActionEngine:
             "source_frame_index": frame.frame_index,
             "pending_due_at_ms": due_at_ms,
             "host_command_started_monotonic_ms": start_ms,
-            "host_command_returned_monotonic_ms": sent_ms,
+            "host_command_returned_monotonic_ms": returned_ms,
         }
 
     def ingest(self, frame: Frame) -> dict[str, object] | None:
@@ -105,7 +115,9 @@ class EventTimeActionEngine:
             self._next_due_ms = frame.timestamp_ms - self.config.frame_offsets_ms[0]
         regular_due = frame.timestamp_ms + 1e-6 >= self._next_due_ms
         pending_due = self.decoder.pending_due_ms
-        pending_ready = pending_due is not None and frame.timestamp_ms + 1e-6 >= pending_due
+        pending_ready = (
+            pending_due is not None and frame.timestamp_ms + 1e-6 >= pending_due
+        )
         if not regular_due and not pending_ready:
             return None
         temporal = self.buffer.stack_at(
@@ -116,20 +128,25 @@ class EventTimeActionEngine:
         if regular_due:
             while self._next_due_ms <= frame.timestamp_ms + 1e-6:
                 self._next_due_ms += 1000.0 / self.config.target_fps
-        # In action-only replay a pending hold transition is considered before the
-        # current observation's decision; preserve that ordering here.
+        # Preserve offline replay ordering: consume pending hold before processing
+        # the current observation, but use actual observation time for the NEXT
+        # minimum hold; a delayed frame must not shorten the real hold interval.
         events: list[dict[str, object]] = []
         if pending_ready:
             pending = self.decoder.execute_pending_if_due(
-                timestamp_ms=frame.timestamp_ms, current_pressed=self.pressed
+                timestamp_ms=frame.timestamp_ms,
+                current_pressed=self.pressed,
+                execution_timestamp_ms=frame.timestamp_ms,
             )
             if pending is not None:
-                events.append(self._send(
-                    pressed=pending.state_after,
-                    frame=frame,
-                    reason="pending_execute",
-                    due_at_ms=pending.due_at_ms,
-                ))
+                events.append(
+                    self._send(
+                        pressed=pending.state_after,
+                        frame=frame,
+                        reason="pending_execute",
+                        due_at_ms=pending.due_at_ms,
+                    )
+                )
         started = self.clock()
         probability = float(self.model.predict_action(temporal.input))
         inference_ms = (self.clock() - started) * 1000.0
@@ -140,9 +157,13 @@ class EventTimeActionEngine:
             event_class=self.config.no_event_class,
         )
         if decision.switch:
-            events.append(self._send(
-                pressed=decision.state_after, frame=frame, reason=decision.reason
-            ))
+            events.append(
+                self._send(
+                    pressed=decision.state_after,
+                    frame=frame,
+                    reason=decision.reason,
+                )
+            )
         return {
             "observation_timestamp_ms": frame.timestamp_ms,
             "source_frame_index": frame.frame_index,
@@ -165,7 +186,7 @@ class EventTimeActionEngine:
         self.buffer.clear()
         if not self.pressed:
             return False
-        # For a MockExecutor this is recorded locally and cannot touch Android.
+        # MockExecutor is local only: dry-run cleanup never sends Android touch.
         self.executor.set_pressed(False)
         self.pressed = False
         return True

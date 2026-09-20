@@ -1,6 +1,6 @@
 """CPU/GPU inference adapter for the V4-C4 absolute current-action head.
 
-Inputs are the same normalized RGB history produced by TemporalVideoDataset.
+Inputs are the normalized RGB history produced by TemporalVideoDataset.
 The model's temporal-delta representation is applied exactly once here.
 """
 
@@ -12,7 +12,6 @@ import time
 
 import numpy as np
 
-from karting_agent.model.event_time import build_event_time_model
 from karting_agent.model.temporal_delta import (
     transform_temporal_input_numpy,
     validate_temporal_input_representation,
@@ -29,6 +28,7 @@ class EventTimeActionRunner:
         torch_num_threads: int | None = None,
     ) -> None:
         import torch
+        from karting_agent.model.event_time import build_event_time_model
 
         if torch_num_threads is not None:
             if torch_num_threads < 1:
@@ -69,7 +69,7 @@ class EventTimeActionRunner:
         self.model.eval()
 
     def predict_action(self, normalized_rgb_stack: np.ndarray) -> float:
-        """Return PRESS probability from (oldest ... newest) normalized RGB CHW frames."""
+        """Return PRESS probability from oldest-to-newest normalized RGB frames."""
         expected = (3 * self.frame_stack, 224, 224)
         if normalized_rgb_stack.shape != expected or normalized_rgb_stack.dtype != np.float32:
             raise ValueError(

@@ -68,10 +68,10 @@ def test_summary_counts_decision_disagreements_and_large_errors() -> None:
 
 
 def test_video_replay_reads_shared_history_frames_once(tmp_path: Path) -> None:
-    path = tmp_path / "capture.mp4"
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 96))
+    path = tmp_path / "capture.avi"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30.0, (64, 96))
     if not writer.isOpened():
-        pytest.skip("OpenCV MP4 video writer unavailable")
+        pytest.skip("OpenCV MJPEG video writer unavailable")
     for index in range(6):
         image = np.full((96, 64, 3), index * 20, dtype=np.uint8)
         writer.write(image)

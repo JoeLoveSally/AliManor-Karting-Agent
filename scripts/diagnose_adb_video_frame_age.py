@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Estimate host-stamp-to-video-observation age without game controls.
+"""Measure host-stamped browser frames through the game ADB video capture path.
 
-A local WSL HTTP server returns a 16-bit sequence number stamped with the
-host's perf_counter. An unlocked Android browser (connected via `adb reverse`)
-draws the sequence as large black/white bars. We decode it from the exact
-AdbVideoInput capture pipeline used by the karting runtime. Since the producer
-and observer share a host clock, no phone/host clock sync or OCR is required.
-
-Measured age INCLUDES USB HTTP response, browser scheduling/rendering,
-Android screen capture, USB video transport, FFmpeg, and host dequeue. It is
-NOT an isolated screenrecord latency or Android touch latency measurement.
+The phone browser renders bit bars carrying host-generated sequence IDs. Both
+stamp generation and observation use WSL's perf_counter; Android clock sync is
+unnecessary. Age includes HTTP over adb reverse, browser/rendering, screenrecord,
+transport, FFmpeg and queue polling. It is NOT isolated screenrecord latency.
+Never sends game touches, accesses the model, or stores screenshots.
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ from urllib.parse import urlsplit
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
+SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -38,8 +34,6 @@ from karting_agent.data_flow.input.adb_video import AdbVideoInput  # noqa: E402
 SYNC = 0xCA
 BITS = 24
 
-# 8 sync bits followed by a 16-bit sequence counter. Each bit occupies a full
-# vertical bar, wide enough to survive a 360px H.264 capture.
 HTML = r'''<!doctype html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>ADB video freshness probe</title>
@@ -74,6 +68,10 @@ class StampBook:
         with self.lock:
             return self.timestamps_ms.get(sequence)
 
+    def request_count(self) -> int:
+        with self.lock:
+            return len(self.timestamps_ms)
+
 
 def make_handler(book: StampBook):
     class Handler(BaseHTTPRequestHandler):
@@ -103,7 +101,6 @@ def make_handler(book: StampBook):
 
 
 def decode_stamp(image: np.ndarray) -> int | None:
-    """Decode a binary stamp from the center row of the fullscreen browser canvas."""
     if image.ndim != 3 or image.shape[2] != 3 or image.shape[1] < 240:
         return None
     height, width = image.shape[:2]
@@ -152,14 +149,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--video-warmup-seconds', type=float, default=None)
     parser.add_argument('--port', type=int, default=18765)
     parser.add_argument('--seconds', type=float, default=8.0)
+    parser.add_argument('--browser-ready-timeout', type=float, default=8.0)
     parser.add_argument('--output', type=Path, default=ROOT / 'artifacts/adb_runs/video_frame_age_360.json')
     return parser.parse_args(argv)
+
+
+def wait_for_browser_stamps(book: StampBook, *, timeout_seconds: float) -> int:
+    """Separate browser/adb-reverse failure from screenrecord/FFmpeg failure."""
+    if timeout_seconds <= 0:
+        raise ValueError('browser-ready-timeout must be > 0')
+    deadline = time.perf_counter() + timeout_seconds
+    while time.perf_counter() < deadline:
+        count = book.request_count()
+        if count >= 3:
+            return count
+        time.sleep(0.05)
+    raise RuntimeError(
+        f'phone browser requested only {book.request_count()} time stamps; '
+        'check that the binary bars are visible on the PHONE browser, '
+        'adb reverse is connected, and JavaScript is running'
+    )
+
+
+def video_health(video: AdbVideoInput) -> dict[str, object]:
+    """Avoid blocking on child stderr while a process remains alive."""
+    details: dict[str, object] = {
+        'video_started': video.started,
+        'decoded_frames': video.decoded_frames,
+        'dropped_frames': video.dropped_frames,
+        'reader_error': getattr(video, '_error', None),
+    }
+    for name in ('_recorder', '_ffmpeg'):
+        process = getattr(video, name, None)
+        details[name.removeprefix('_') + '_returncode'] = None if process is None else process.poll()
+    return details
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.seconds <= 0 or not 1024 <= args.port <= 65535:
         raise ValueError('--seconds must be positive and --port must be in [1024, 65535]')
+    if args.browser_ready_timeout <= 0:
+        raise ValueError('--browser-ready-timeout must be > 0')
     raw = legacy.load_mapping(args.hardware_config)
     client = AdbClient(legacy.resolve_adb_config(raw, args))
     client.require_device()
@@ -172,8 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     video = None
     output = args.output.resolve()
     payload: dict[str, object] = {
-        'measurement': 'WSL HTTP timestamp generation -> WSL first ADB-video observation of the rendered stamp',
-        'limitations': 'Includes HTTP over adb reverse, browser scheduling/rendering, screenrecord, video transport, FFmpeg and host dequeue; NOT pure camera, touch or game-frame latency.',
+        'measurement': 'WSL HTTP timestamp generation -> first ADB-video observation of the rendered stamp',
+        'limitations': 'Includes adb reverse HTTP, browser scheduling/rendering, screenrecord, USB video, FFmpeg and host dequeue; NOT isolated screenrecord or game/touch latency.',
         'decode_width_requested': args.decode_width,
         'seconds_requested': args.seconds,
         'samples': [],
@@ -184,20 +215,55 @@ def main(argv: list[str] | None = None) -> int:
         reverse_created = True
         print(f'Phone (unlocked) browser URL: http://127.0.0.1:{args.port}/', flush=True)
         input('Open this URL on the PHONE, keep its binary bars visible, then press Enter here: ')
+        stamp_requests = wait_for_browser_stamps(book, timeout_seconds=args.browser_ready_timeout)
+        print(f'Browser active: received {stamp_requests} stamp requests; starting ADB video...', flush=True)
         screen = client.screen_size()
-        video = AdbVideoInput(client, screen_size=screen,
-                              config=legacy.resolve_adb_video_config(raw, args))
+        video = AdbVideoInput(
+            client,
+            screen_size=screen,
+            config=legacy.resolve_adb_video_config(raw, args),
+        )
+        # Crucial: do not replace the configured 15s video-startup timeout with
+        # a 3s regular frame timeout or charge startup against the sample window.
+        try:
+            first = video.read(timeout_seconds=video.config.startup_timeout_seconds)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f'ADB video did not deliver its first decoded frame within '
+                f'{video.config.startup_timeout_seconds:g}s; '
+                f'browser_stamp_requests={book.request_count()}, '
+                f'video_health={video_health(video)}; original_error={exc}'
+            ) from exc
+        print(
+            f'First decoded frame: index={first.frame_index}, '
+            f'video_startup_ms={video.startup_ms:.1f}',
+            flush=True,
+        )
         observed: set[int] = set()
-        start = time.perf_counter()
-        deadline = start + args.seconds
+        capture_started_ms = time.perf_counter() * 1000.0
+        deadline = time.perf_counter() + args.seconds
         decoded = 0
         invalid = 0
         duplicate = 0
-        while time.perf_counter() < deadline:
-            frame = video.read(timeout_seconds=min(3.0, max(0.1, deadline-time.perf_counter()+0.1)))
+        frame_timeouts = 0
+        frame = first
+        while True:
+            if frame is None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    frame = video.read(timeout_seconds=min(video.config.frame_timeout_seconds, remaining))
+                except RuntimeError as exc:
+                    if str(exc) == 'timed out waiting for Android video frame':
+                        frame_timeouts += 1
+                        frame = None
+                        continue
+                    raise
             read_at_ms = time.perf_counter() * 1000.0
             decoded += 1
             sequence = decode_stamp(frame.image)
+            frame = None
             if sequence is None:
                 invalid += 1
                 continue
@@ -208,20 +274,29 @@ def main(argv: list[str] | None = None) -> int:
             if produced_at_ms is None or produced_at_ms > read_at_ms:
                 invalid += 1
                 continue
+            # A stale warmup frame must not bias the measured steady-state age.
+            if produced_at_ms < capture_started_ms:
+                continue
             observed.add(sequence)
             payload['samples'].append({
                 'sequence': sequence,
-                'source_frame_index': frame.frame_index,
+                'source_frame_index': decoded,
                 'stamp_generated_monotonic_ms': produced_at_ms,
                 'first_video_observed_monotonic_ms': read_at_ms,
-                'stamp_to_video_observed_ms': read_at_ms-produced_at_ms,
+                'stamp_to_video_observed_ms': read_at_ms - produced_at_ms,
             })
         payload['decoded_frames_read'] = decoded
         payload['invalid_or_nonprobe_frames'] = invalid
         payload['duplicate_stamp_frames'] = duplicate
+        payload['frame_read_timeouts'] = frame_timeouts
         ages = [float(s['stamp_to_video_observed_ms']) for s in payload['samples']]
         if len(ages) < 15:
-            raise RuntimeError(f'only {len(ages)} valid unique stamps; keep the phone browser foreground with all 24 bars visible and retry')
+            raise RuntimeError(
+                f'only {len(ages)} unique stamps, {decoded} frames read, '
+                f'{invalid} undecodable frames, {frame_timeouts} frame gaps; '
+                f'browser_stamp_requests={book.request_count()}, '
+                f'video_health={video_health(video)}'
+            )
         payload['summary'] = summarize_ages(ages)
         payload['status'] = 'completed'
         status = 0
@@ -230,7 +305,9 @@ def main(argv: list[str] | None = None) -> int:
         payload['error'] = str(exc) or type(exc).__name__
         print(f"Probe stopped: {payload['error']}", file=sys.stderr, flush=True)
     finally:
+        payload['browser_stamp_requests'] = book.request_count()
         if video is not None:
+            payload['video_health_before_close'] = video_health(video)
             try:
                 video.close()
             except Exception as exc:

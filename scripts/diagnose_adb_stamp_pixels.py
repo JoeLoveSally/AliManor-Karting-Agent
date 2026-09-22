@@ -96,19 +96,25 @@ def main(argv: list[str] | None = None) -> int:
             client, screen_size=screen_size,
             config=legacy.resolve_adb_video_config(raw, args),
         )
-        # First read intentionally uses AdbVideoInput's longer startup timeout.
+        # First read uses AdbVideoInput's longer startup timeout. A static
+        # browser may emit only one frame; subsequent frames are optional.
         first = video.read()
         frames = [first]
-        for _ in range(9):
-            frames.append(video.read())
+        for _ in range(3):
+            try:
+                frames.append(video.read(timeout_seconds=0.4))
+            except RuntimeError as exc:
+                if "timed out waiting for Android video frame" in str(exc):
+                    break
+                raise
         payload["video_samples"] = [
             {"source_frame_index": frame.frame_index,
              "timestamp_ms": frame.timestamp_ms,
              **inspect_pixels(frame.image)}
-            for frame in (frames[0], frames[4], frames[-1])
+            for frame in ([frames[0], frames[-1]] if len(frames) > 1 else frames)
         ]
-        # ADB screencap does not pass through screenrecord/H264/FFmpeg. Comparing
-        # its numeric pixels distinguishes page rendering from video-only errors.
+        # ADB screencap bypasses screenrecord/H264/FFmpeg. It is decoded only
+        # in memory and reduced to 24 numeric brightness values per sample row.
         png = client.run("exec-out", "screencap", "-p")
         screenshot = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
         if screenshot is None:

@@ -170,16 +170,11 @@ def main(argv: list[str] | None = None) -> int:
     payload = json.loads(run_path.read_text(encoding="utf-8"))
     steps = validate_run(payload)
     video_path = (args.video if args.video is not None else run_path.with_suffix(".mp4")).resolve()
-    if args.model.resolve() == video_path:
-        raise ValueError("model path points to the recording")
     preprocess = preprocess_config_from_mapping(legacy.load_mapping(args.train_config))
     model = EventTimeActionRunner(
         args.model, metadata_path=args.metadata, device=args.device,
         torch_num_threads=args.torch_num_threads,
     )
-    expected_model_name = Path(str(payload["model"])).name
-    if args.model.name != expected_model_name:
-        raise ValueError("the provided checkpoint filename differs from the run checkpoint")
     result = summarize(
         replay_recorded_steps(
             video_path, steps, predict_action=model.predict_action,

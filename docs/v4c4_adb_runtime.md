@@ -61,8 +61,8 @@ replayed and logged probabilities disagree on the 0.5 PRESS threshold. The
 FFmpeg pixel conversion can create small numerical differences. A failed audit
 needs investigation; a passing audit confirms **recorded-frame replay
 consistency only**, not video freshness, training-domain equivalence or correct
-closed-loop behavior. A copied checkpoint with the same `model.pt` filename
-cannot be identified cryptographically from an older run JSON.
+closed-loop behavior. An older run JSON does not contain a cryptographic
+checkpoint identity: the operator must ensure this is the same model.pt file.
 
 The live video defaults to a 360-pixel decode width (`hardware.yaml`); several
 training recordings use a 720-pixel width. Compare the training and live game

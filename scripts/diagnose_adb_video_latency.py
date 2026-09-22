@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Measure host-command -> decoded-screen-change delay on a benign Android screen.
+"""Estimate host command -> Android screen-change observation through ADB video.
 
-Run with the phone UNLOCKED and showing the static Android Settings main page.
-This program alternates HOME and opening Settings; it never touches the game,
-uses the existing live screenrecord+FFmpeg video path, and saves NO screenshots.
-The measurement includes adb dispatch, Android UI/display response, screenrecord,
-transport, decode, and host polling. It is NOT pure screenrecord latency.
+Start unlocked on the static Android Settings main page, NOT in the game.
+Alternates HOME and Settings without game touches; saves JSON, never images.
+Includes ADB dispatch, Android UI/render response, screenrecord and host decode.
+It is NOT a measurement of screenrecord-only or Android touch latency.
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ from karting_agent.runtime.video_latency_probe import (  # noqa: E402
     changed_pixel_fraction,
 )
 
-
 MARKERS = (
     ("home", ("shell", "input", "keyevent", "KEYCODE_HOME")),
     ("settings", ("shell", "am", "start", "-a", "android.settings.SETTINGS")),
@@ -42,13 +40,14 @@ MARKERS = (
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Non-game ADB video responsiveness probe")
+    parser = argparse.ArgumentParser(description="No-game-touch ADB video latency probe")
     parser.add_argument("--hardware-config", type=Path, default=ROOT / "configs/hardware.yaml")
     parser.add_argument("--adb", type=str, default=None)
     parser.add_argument("--serial", type=str, default=None)
     parser.add_argument("--ffmpeg", type=str, default=None)
     parser.add_argument("--decode-width", type=int, default=360)
     parser.add_argument("--video-bit-rate", type=int, default=None)
+    parser.add_argument("--video-warmup-seconds", type=float, default=None)
     parser.add_argument("--trials", type=int, default=6)
     parser.add_argument("--settle-seconds", type=float, default=1.0)
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
@@ -58,38 +57,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def baseline_frame(video: AdbVideoInput, *, settle_seconds: float,
-                   pixel_delta: int) -> tuple[object, float]:
-    """Consume recent decoded frames before arming a marker; reject moving screens."""
+def baseline_frame(
+    video: AdbVideoInput, *, settle_seconds: float, pixel_delta: int,
+):
+    """Read through live frames; reject a visibly moving pre-trigger page."""
     deadline = time.perf_counter() + settle_seconds
     previous = None
-    last = None
-    seen = 0
-    while time.perf_counter() < deadline or seen < 3:
+    last_noise = None
+    count = 0
+    while time.perf_counter() < deadline or count < 3:
         current = video.read()
         if previous is not None:
-            last = changed_pixel_fraction(previous.image, current.image,
-                                          pixel_delta=pixel_delta)
+            last_noise = changed_pixel_fraction(
+                previous.image, current.image, pixel_delta=pixel_delta
+            )
         previous = current
-        seen += 1
-    assert previous is not None
-    if last is None or last > 0.08:
+        count += 1
+    if previous is None or last_noise is None or last_noise > 0.08:
         raise RuntimeError(
-            f"baseline changed too much (fraction={last!r}); "
-            "open Android Settings main page and wait for animations to stop"
+            f"unstable baseline (changed fraction={last_noise!r}); "
+            "open the Android Settings main page and let animations finish"
         )
-    return previous, last
+    return previous, last_noise
 
 
-def measure_marker(video: AdbVideoInput, client: AdbClient, *,
-                   baseline, target: str, command: tuple[str, ...],
-                   timeout_seconds: float, pixel_delta: int,
-                   changed_fraction: float) -> dict[str, object]:
-    """Watch video while a SECOND thread issues the screen change command."""
-    started = Event()
+def measure_marker(
+    video: AdbVideoInput,
+    client: AdbClient,
+    *,
+    baseline,
+    target: str,
+    command: tuple[str, ...],
+    timeout_seconds: float,
+    pixel_delta: int,
+    changed_fraction: float,
+) -> dict[str, object]:
+    """Read existing latest-frame queue concurrently with the ADB UI command."""
     timing: dict[str, object] = {}
+    started = Event()
 
-    def invoke() -> None:
+    def issue_command() -> None:
         timing["command_started_monotonic_ms"] = time.perf_counter() * 1000.0
         started.set()
         try:
@@ -105,90 +112,87 @@ def measure_marker(video: AdbVideoInput, client: AdbClient, *,
         pixel_delta=pixel_delta,
         consecutive_frames=2,
     )
-    worker = Thread(target=invoke, name="adb-screen-marker", daemon=True)
-    worker.start()
+    thread = Thread(target=issue_command, name="adb-screen-marker", daemon=True)
+    thread.start()
     if not started.wait(timeout=1.0):
-        raise RuntimeError("ADB marker command did not begin")
+        raise RuntimeError("marker command did not begin")
     issued_ms = float(timing["command_started_monotonic_ms"])
     deadline = time.perf_counter() + timeout_seconds
-    onset: tuple[float, int, float] | None = None
-    first_decode_ms: float | None = None
+    onset = None
+    confirmation_timestamp_ms = None
     while time.perf_counter() < deadline:
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             break
-        # read() consumes the same latest-frame queue as the closed-loop runner.
         frame = video.read(timeout_seconds=min(remaining, 2.0))
-        read_ms = time.perf_counter() * 1000.0
+        observed_ms = time.perf_counter() * 1000.0
         if frame.frame_index <= baseline.frame_index:
             continue
-        sample = gate.observe(
+        onset = gate.observe(
             image=frame.image,
-            observed_monotonic_ms=read_ms,
+            observed_monotonic_ms=observed_ms,
             frame_index=frame.frame_index,
         )
-        if sample is not None:
-            onset = sample
-            first_decode_ms = frame.timestamp_ms
+        if onset is not None:
+            confirmation_timestamp_ms = frame.timestamp_ms
             break
-    worker.join(timeout=client.config.command_timeout_seconds + 1.0)
-    if worker.is_alive():
-        raise RuntimeError("ADB marker thread did not finish")
+    thread.join(timeout=client.config.command_timeout_seconds + 1.0)
+    if thread.is_alive():
+        raise RuntimeError("ADB marker command thread did not finish")
     if "command_error" in timing:
         raise RuntimeError(f"ADB marker failed: {timing['command_error']}")
     completed_ms = float(timing["command_returned_monotonic_ms"])
     if onset is None:
         raise RuntimeError(
-            f"no confirmed {target} screen transition within {timeout_seconds:g}s; "
-            "make sure the phone is unlocked and initially on Android Settings"
+            f"no confirmed {target} screen change within {timeout_seconds:g}s; "
+            "check that the phone is unlocked and initially showing Android Settings"
         )
-    observed_ms, onset_index, fraction = onset
-    delay_ms = observed_ms - issued_ms
-    if delay_ms < 0:
-        raise RuntimeError("screen marker detected before the ADB command began")
+    first_observed_ms, first_frame_index, fraction = onset
+    latency_ms = first_observed_ms - issued_ms
+    if latency_ms < 0:
+        raise RuntimeError("screen changed before the marker command began")
     return {
         "target": target,
         "baseline_frame_index": baseline.frame_index,
-        "marker_first_frame_index": onset_index,
-        "marker_confirmation_frame_timestamp_ms": first_decode_ms,
+        "marker_first_frame_index": first_frame_index,
+        "marker_confirmation_frame_timestamp_ms": confirmation_timestamp_ms,
         "changed_fraction_at_confirmation": fraction,
         "command_started_monotonic_ms": issued_ms,
         "command_returned_monotonic_ms": completed_ms,
-        "marker_first_observed_monotonic_ms": observed_ms,
+        "marker_first_observed_monotonic_ms": first_observed_ms,
         "command_duration_ms": completed_ms - issued_ms,
-        "command_start_to_screen_observed_ms": delay_ms,
-        "command_return_to_screen_observed_ms": observed_ms - completed_ms,
+        "command_start_to_screen_observed_ms": latency_ms,
+        "command_return_to_screen_observed_ms": first_observed_ms - completed_ms,
     }
 
 
 def summarize(samples: list[dict[str, object]]) -> dict[str, float]:
-    values = np.asarray(
-        [float(sample["command_start_to_screen_observed_ms"]) for sample in samples],
+    latencies = np.asarray(
+        [float(item["command_start_to_screen_observed_ms"]) for item in samples],
         dtype=np.float64,
     )
     return {
-        "mean_ms": float(np.mean(values)),
-        "median_ms": float(np.median(values)),
-        "p95_ms": float(np.percentile(values, 95)),
-        "max_ms": float(np.max(values)),
-        "min_ms": float(np.min(values)),
+        "mean_ms": float(np.mean(latencies)),
+        "median_ms": float(np.median(latencies)),
+        "p95_ms": float(np.percentile(latencies, 95)),
+        "min_ms": float(np.min(latencies)),
+        "max_ms": float(np.max(latencies)),
         "command_duration_mean_ms": statistics.mean(
-            float(sample["command_duration_ms"]) for sample in samples
+            float(item["command_duration_ms"]) for item in samples
         ),
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.trials < 1 or args.trials > 30:
-        raise ValueError("--trials must be between 1 and 30")
+    if not 1 <= args.trials <= 30:
+        raise ValueError("--trials must be in [1, 30]")
     if args.settle_seconds < 0.5 or args.timeout_seconds <= 0:
         raise ValueError("settle >= 0.5s and timeout > 0s are required")
-    if not 0 < args.changed_fraction <= 1:
-        raise ValueError("--changed-fraction must be in (0, 1]")
+    if not 0 < args.changed_fraction <= 1 or not 1 <= args.pixel_delta <= 255:
+        raise ValueError("invalid marker thresholds")
     raw = legacy.load_mapping(args.hardware_config)
     adb_conf = legacy.resolve_adb_config(raw, args)
-    # Launching Settings may legitimately exceed the normal 3s query timeout.
     client = AdbClient(AdbConfig(
         executable=adb_conf.executable,
         serial=adb_conf.serial,
@@ -214,30 +218,30 @@ def main(argv: list[str] | None = None) -> int:
     payload: dict[str, object] = {
         "measurement": "host ADB command start -> first confirmed screen change observed by WSL",
         "limitations": (
-            "Includes ADB command dispatch, Android UI/display response, "
-            "screenrecord encode/transport, FFmpeg decode and host polling. "
-            "Not pure camera-to-host latency, not game-control latency; no screen images saved."
+            "Includes ADB dispatch, Android UI/render response, screenrecord/transport, "
+            "FFmpeg decode and host polling. Not pure screenrecord or touch latency; "
+            "screen pixels are not saved."
         ),
         "trials_requested": args.trials,
         "decode_width": video.decode_width,
         "decode_height": video.decode_height,
         "samples": [],
     }
-    last_target: str | None = None
+    last_target = None
     try:
-        print("Probe only: phone must be unlocked and showing static Android SETTINGS. "
-              "Will alternate HOME / SETTINGS; no game touches or screenshots.", flush=True)
-        video.read()  # start the normal screenrecord+FFmpeg pipeline
+        print("Probe only: unlock phone, show static Android SETTINGS first. "
+              "Alternates HOME/SETTINGS; no game touches or screenshots.", flush=True)
+        video.read()
         for index in range(args.trials):
             base, baseline_noise = baseline_frame(
-                video, settle_seconds=args.settle_seconds, pixel_delta=args.pixel_delta
+                video, settle_seconds=args.settle_seconds,
+                pixel_delta=args.pixel_delta,
             )
-            target, command = MARKERS[index % len(MARKERS)]
+            target, command = MARKERS[index % 2]
             last_target = target
             result = measure_marker(
                 video, client, baseline=base, target=target, command=command,
-                timeout_seconds=args.timeout_seconds,
-                pixel_delta=args.pixel_delta,
+                timeout_seconds=args.timeout_seconds, pixel_delta=args.pixel_delta,
                 changed_fraction=args.changed_fraction,
             )
             result["trial"] = index + 1
@@ -258,7 +262,6 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             payload["video_close_error"] = str(exc)
         if last_target == "home":
-            # Leave the phone on the benign Settings page, not in the game.
             try:
                 client.run("shell", "am", "start", "-a", "android.settings.SETTINGS")
             except Exception as exc:

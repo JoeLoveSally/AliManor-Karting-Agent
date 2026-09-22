@@ -21,7 +21,8 @@ python -m pytest \
   tests/unit/test_event_time_policy.py \
   tests/unit/test_event_time_actual_execution.py \
   tests/unit/test_v4c4_adb_runtime.py \
-  tests/unit/test_v4c4_adb_dry_run.py -q
+  tests/unit/test_v4c4_adb_dry_run.py \
+  tests/unit/test_v4c4_recorded_input_audit.py -q
 
 python scripts/run_adb_closed_loop_v4c4.py \
   --device cpu --max-seconds 8 --record-debug \
@@ -36,6 +37,48 @@ planned deadlines, host command timestamps, input/drop-frame counters and FPS.
 The optional MP4 file has a synthetic presentation frame rate: use
 `decoded_frame_timestamps_ms` and frame-index mappings in JSON for timing,
 not MP4 presentation timestamps.
+
+## Investigate an existing failure without starting another race
+
+Use the previous run JSON and its matching debug MP4, together with the exact
+checkpoint used in that run. This diagnostic **does not call ADB or issue touch**.
+
+```bash
+python scripts/diagnose_v4c4_recorded_input.py \
+  --run-json artifacts/adb_runs/v4c4_armed_01.json \
+  --video artifacts/adb_runs/v4c4_armed_01.mp4 \
+  --device cpu \
+  --output artifacts/adb_runs/v4c4_armed_01_replay_audit.json
+```
+
+The diagnostic takes the five *recorded* source-frame indices for each model
+step, decodes those frames again, runs the training-compatible preprocessing and
+V4-C4 current-action head, and compares the probabilities against those logged
+during the live run. It reports the largest probability errors and how often
+replayed and logged probabilities disagree on the 0.5 PRESS threshold. The
+`--max-acceptable-probability-error` option (default 0.05) controls only the
+**audit alarm**; it does not modify the game control threshold. MP4 versus live
+FFmpeg pixel conversion can create small numerical differences. A failed audit
+needs investigation; a passing audit confirms **recorded-frame replay
+consistency only**, not video freshness, training-domain equivalence or correct
+closed-loop behavior. A copied checkpoint with the same `model.pt` filename
+cannot be identified cryptographically from an older run JSON.
+
+The live video defaults to a 360-pixel decode width (`hardware.yaml`); several
+training recordings use a 720-pixel width. Compare the training and live game
+appearance, including player skin, course geometry and overlays. A safe way to
+check the runtime throughput at a higher capture resolution is another **Dry
+Run**, explicitly without `--arm`:
+
+```bash
+python scripts/run_adb_closed_loop_v4c4.py \
+  --device cpu --decode-width 720 --max-seconds 8 --record-debug \
+  --output artifacts/adb_runs/v4c4_dry_run_720.json
+```
+
+This changes the camera-resolution experiment, not the trained checkpoint or
+control policy. It cannot prove that the model would successfully steer: no
+real steering occurs during Dry Run.
 
 ## Armed test (after dry-run review)
 
@@ -63,7 +106,8 @@ at or after the hold deadline. The artifact records the planned due time,
 observation time and host command enqueue/return monotonic timestamps
 separately. The runtime starts the next minimum hold at the actual *observation*
 that triggered the pending execution, not retroactively at the planned time.
-Android's physical touch-application time remains unmeasured.
+Android's physical touch-application time remains unmeasured. FPS alone does
+not measure screen-capture-to-model frame age or phone touch latency.
 
 The default configuration is a diagnostic development POC, not a safety-critical
 controller. Preserve the original validation/test splits; do not use live test

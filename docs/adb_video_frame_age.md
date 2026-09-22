@@ -1,27 +1,25 @@
 # Browser-stamped ADB video freshness diagnostic
 
-The earlier Settings/HOME probe returned hundreds of milliseconds for a **UI command-to-screen-change** response. That result contains Android app startup and animation. It is not a clean measurement of camera/video freshness.
+The Settings/HOME probe measured command-to-screen-change response, including Android page startup/animation, not pure screenrecord latency. This experiment instead measures the age of a timestamp generated on the WSL host when it first appears in the same ADB video capture pipeline used by the karting controller. It does not start the game, issue game touches or load a model.
 
-This independent experiment measures how long it takes for a host-originated timestamp to become visible in the *same* `AdbVideoInput` stream used by V4-C4. It does not load the model, play the game, or issue touch events.
+## Run on WSL
 
-## Run (WSL, phone attached to ADB)
-
-Close the game; leave the phone unlocked. The probe creates a local HTTP server bound to WSL `127.0.0.1` and an `adb reverse` tunnel for port 18765. It never needs Internet access. It prints the local URL and waits for you to open it on the **phone's browser**. Keep the page foregrounded and its black/white vertical bars filling the screen; then press Enter in WSL.
+Exit the game, unlock the phone and keep its browser in the foreground. The script creates an HTTP server bound to WSL `127.0.0.1` and `adb reverse tcp:18765 tcp:18765`; no external Internet access is required. Open the printed `http://127.0.0.1:18765/` URL **in the phone browser**, confirm that its black-and-white vertical bars fill the page and press Enter at the WSL terminal.
 
 ```bash
-python -m pytest tests/unit/test_adb_video_frame_age.py -q
-
+git pull --ff-only origin feat/v4c4-adb-runtime
+python -m pytest tests/unit/test_adb_video_frame_age.py tests/unit/test_adb_video_frame_age_startup.py -q
 python scripts/diagnose_adb_video_frame_age.py \
   --decode-width 360 --seconds 8 \
   --output artifacts/adb_runs/video_frame_age_360.json
 ```
 
-If the page is not reachable, check `adb devices -l` and ensure WSL is using the same ADB server/device as the earlier successful probe. If another service owns port 18765, specify a different free `--port`; the URL printed by the script changes accordingly. The script removes its own `adb reverse` port mapping on exit. **Do not use a port with an existing ADB reverse mapping you want to preserve.**
+**Startup fix:** the first video frame is now allowed the `startup_timeout_seconds` in `configs/hardware.yaml` (15 seconds by default), rather than an accidental 3-second timeout. The 8-second sampling window starts **after** the first video frame is received; video startup does not consume measurement time. Occasional gaps between subsequent frames are counted and handled until the sampling deadline.
 
-The host HTTP server assigns a sequence number and records `time.perf_counter()` at `/stamp`. Android's browser polls the local endpoint approximately every 50 ms and renders the sequence using 8 sync bits and 16 data bits in 24 black/white bars. WSL decodes those bits from raw `AdbVideoInput` frames, recording only the **first frame showing each unique sequence**. Both timestamp creation and observation are measured with the same WSL monotonic clock. No OCR, phone clock synchronization, or video timestamp reconstruction is involved. The probe only writes numeric measurements to JSON; it does not save screen content.
+**Diagnostic stages:** before video starts, the terminal prints `Browser active: received N stamp requests`. If the browser makes no requests, check that the URL is open in the PHONE browser rather than WSL, the phone is unlocked, its browser can execute JavaScript and the `adb reverse` mapping is active. This failure is separate from video startup. After the first frame, it prints `First decoded frame: ...`. If startup times out, the JSON and terminal include HTTP request count, decoded-frame count, video-reader error and screenrecord/FFmpeg process return codes. A running process with no decoded frames is different from a terminated process; inspect those diagnostics before choosing a fix. If frames arrive but stamps cannot be decoded, keep the browser foreground, do not zoom/scroll and make the bars fill the view.
 
-`summary.median_ms` and `summary.p95_ms` are **server timestamp generation -> first video-observation ages**. Their components include HTTP transport through ADB reverse, Android browser event-loop/rendering/vsync, screenrecord encoding, ADB video transport, FFmpeg decoding, and host dequeue. They are **not** isolated screenrecord latency, Android touch latency, nor guaranteed in-game capture-to-action latency. They are especially useful for checking whether hundreds of milliseconds remain when Settings/HOME application startup is removed from the measurement. Displaying the diagnostic page itself imposes work that can differ from rendering the game.
+The producer logs WSL `time.perf_counter()` at `/stamp`. The Android browser polls at approximately 50 ms intervals and paints 24 black/white bars (8 sync bits and 16 sequence bits). The probe decodes the bars in WSL video frames, using the same host clock for stamp generation and first observation. It stores numeric observations only, not screenshots. `summary.median_ms` / `p95_ms` include `adb reverse` HTTP, browser scheduling/rendering, screenrecord encoding, USB video transfer, FFmpeg decode and host dequeue; these figures **are not isolated screenrecord latency or guaranteed game capture-to-control latency**.
 
-`status=error` due to fewer than 15 unique stamps indicates invalid/inadequate detection, **not zero lag**. Keep the mobile browser foreground, do not zoom, scroll or lock the screen during collection. If this probe reports consistently high age, investigate the capture/encode/transport/decode path before drawing conclusions about the model. If it reports low age but the Settings probe was high, the Settings/HOME response was likely dominated by UI command/transition work, though behavior may differ inside the game.
+`status=error` or fewer than 15 decoded unique stamps does not mean zero delay: consult `browser_stamp_requests`, `video_health_before_close`, `decoded_frames_read`, `invalid_or_nonprobe_frames` and `frame_read_timeouts`. If the 360px run succeeds and you need to compare resolution sensitivity, repeat at `--decode-width 720 --output artifacts/adb_runs/video_frame_age_720.json`. Do not retry Armed driving solely on the strength of this probe.
 
-Run a second 720px capture **only if 360px succeeds** and you want to test resolution sensitivity, with `--decode-width 720 --output artifacts/adb_runs/video_frame_age_720.json`. Do not run an Armed game test on the basis of these measurements alone.
+The script removes its own `adb reverse` mapping on exit. Do not use port 18765 if you have an existing reverse mapping you wish to preserve; choose another unused `--port`.

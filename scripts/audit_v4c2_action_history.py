@@ -9,7 +9,7 @@ No model inference or physical controls are performed.
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 import json
 from pathlib import Path
 from typing import Any
@@ -58,7 +58,7 @@ def audit_run(run: dict[str, Any], *, threshold: float = 0.6) -> dict[str, Any]:
         last_time = timestamps[last_index] if last_index >= 0 else None
         ages = None if last_time is None else observed_at - last_time
         inferred_states = [
-            changes[idx][1] if (idx := bisect_right(timestamps, frame_time) - 1) >= 0
+            changes[idx][1] if (idx := bisect_left(timestamps, frame_time) - 1) >= 0
             else initial
             for frame_time in frame_times
         ]

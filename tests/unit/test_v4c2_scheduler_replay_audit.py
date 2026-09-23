@@ -62,7 +62,7 @@ def test_different_recorded_action_blocks_parity():
     run["steps"][0]["pressed"] = True
     report = audit_module.audit(run, scheduler_module)
     assert report["parity_passed"] is False
-    assert report["first_errors"][0]["kind"] == "pre_state_mismatch"
+    assert report["first_errors"][0]["kind"] == "step_mismatch"
 
 
 def test_new_opt_in_source_option_cannot_be_silently_dropped():

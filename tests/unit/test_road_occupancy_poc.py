@@ -202,3 +202,35 @@ def test_existing_adb_mode_remains_unredacted_by_default():
     assert meta["label_ui_redaction_enabled"] is False
     assert meta["label_ui_redaction_fraction"] == 0.0
     assert images["unknown_mask"].shape == (240, 240)
+
+
+def test_source_viewport_is_normalized_before_kart_crops():
+    # Expert captures can be 720x1600 while recorded ADB previews are 360x800.
+    source = np.zeros((1600, 720, 3), dtype=np.uint8)
+    source[600:1000, 200:520, 1] = 200
+    normalized = module.normalize_game_frame(source)
+    assert normalized.shape == (800, 360, 3)
+    assert normalized[400, 180, 1] > 150
+
+
+def test_native_adb_frame_is_unchanged():
+    source = np.zeros((800, 360, 3), dtype=np.uint8)
+    source[300:350, 120:140] = (10, 20, 30)
+    normalized = module.normalize_game_frame(source)
+    assert normalized is source
+
+
+def test_viewport_normalization_rejects_non_matching_aspect():
+    source = np.zeros((1200, 720, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="source aspect ratio"):
+        module.normalize_game_frame(source)
+
+
+def test_touch_roi_coordinates_remain_relative_after_normalizing():
+    source = np.zeros((1600, 720, 3), dtype=np.uint8)
+    canvas = module.normalize_game_frame(source)
+    redaction = module.roi_redaction_mask(
+        canvas.shape[:2], (0.78, 0.82, 0.98, 0.98)
+    )
+    assert redaction[720, 315] == 255
+    assert redaction[80, 100] == 0

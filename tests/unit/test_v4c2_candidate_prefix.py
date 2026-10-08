@@ -199,3 +199,34 @@ def test_recorded_timer_with_no_candidate_pending_is_state_divergence():
     assert result["first_difference"]["candidate_due_ms"] is None
     assert result["first_difference"]["candidate_state_before_observation"] is False
     assert result["first_difference"]["recorded_state_before_observation"] is True
+
+
+
+def test_control_only_ablation_isolates_far_horizon_suppression():
+    obj = run(
+        step(0, [.01, .01, .01]),
+        step(100, [.001, .1, .9], reason="pending_armed", pending_due=162.5),
+        step(150, [.001, .1, .9], reason="pending_wait", pending_due=162.5),
+        step(180, [.99, .80, .01], reason="min_hold", pressed=True),
+        step(300, [.01, .01, .01], pressed=True),
+        deadlines=[{"timestamp_ms": 162.5, "action": "PRESS",
+                    "pressed": True}],
+    )
+    # History adapter suppresses only H300. In full mode the candidate never
+    # schedules the original PRESS; in H200-only mode H300 is copied from the
+    # *recorded* baseline, restoring parity as a diagnostic countercheck.
+    predict = predictor(obj, {
+        1: [.001, .1, .10],
+        2: [.001, .1, .10],
+    })
+    full = subject.compare_prefix(
+        obj, module, predict, candidate_threshold=0.60,
+        candidate_horizons="full",
+    )
+    ablated = subject.compare_prefix(
+        obj, module, predict, candidate_threshold=0.60,
+        candidate_horizons="control_only",
+    )
+    assert full["status"] == "state_divergence"
+    assert ablated["status"] == "no_executable_difference_observed"
+    assert ablated["candidate_horizons"] == "control_only"

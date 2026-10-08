@@ -148,20 +148,35 @@ def quantize_frame(
 
 
 def tile_preview(frame: np.ndarray, raw: np.ndarray, selected: np.ndarray,
-                 occupancy: np.ndarray, center: tuple[float, float]) -> np.ndarray:
-    size = (256, 256)
-    original = frame.copy()
-    cv2.circle(original, (int(center[0]), int(center[1])), 7,
-               (0, 0, 255), 2)
-    original = cv2.resize(original, size)
-    raw_vis = cv2.cvtColor(cv2.resize(raw, size), cv2.COLOR_GRAY2BGR)
-    selected_vis = cv2.cvtColor(cv2.resize(selected, size), cv2.COLOR_GRAY2BGR)
-    q = cv2.resize((occupancy * 255).astype(np.uint8), size,
-                   interpolation=cv2.INTER_NEAREST)
-    quant_vis = cv2.cvtColor(q, cv2.COLOR_GRAY2BGR)
-    panels = [original, raw_vis, selected_vis, quant_vis]
-    for name, panel in zip(("RGB", "HSV mask", "near-kart component", "32x32 local"),
-                           panels):
+                 planes: np.ndarray, center: tuple[float, float]) -> np.ndarray:
+    """Show the SAME kart-centered region in RGB, raw mask and selected mask."""
+    display = (256, 256)
+    w = h = 240
+    affine = np.float32([[1, 0, w / 2 - center[0]],
+                         [0, 1, h / 2 - center[1]]])
+    def crop(image, interpolation):
+        aligned = cv2.warpAffine(
+            image, affine, (w, h),
+            flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        return cv2.resize(aligned, display, interpolation=cv2.INTER_NEAREST)
+
+    original = crop(frame, cv2.INTER_LINEAR)
+    cv2.circle(original, (128, 128), 7, (0, 0, 255), 2)
+    raw_vis = cv2.cvtColor(crop(raw, cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+    selected_vis = cv2.cvtColor(crop(selected, cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+    def enlarge(grid):
+        img = cv2.resize(
+            (grid * 255).astype(np.uint8), display,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    local_vis = enlarge(planes[0])
+    wide_vis = enlarge(planes[2])
+    panels = [original, raw_vis, selected_vis, local_vis, wide_vis]
+    labels = ("RGB local", "HSV local", "Selected local",
+              "32x32 local", "32x32 wide")
+    for name, panel in zip(labels, panels):
         cv2.putText(panel, name, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                     .5, (255, 0, 200), 1, cv2.LINE_AA)
     return np.concatenate(panels, axis=1)
@@ -205,7 +220,7 @@ def inspect_video(video: Path, json_path: Path, *,
             masks.append(planes.astype(np.float16))
             if len(rows) <= 20 or len(rows) % 8 == 0:
                 preview = tile_preview(
-                    frame, road, images["selected_mask"], planes[0],
+                    frame, road, images["selected_mask"], planes,
                     xy if xy is not None else default_center,
                 )
                 p = output_dir / f"preview_{i:06d}.jpg"
@@ -253,7 +268,7 @@ def inspect_video(video: Path, json_path: Path, *,
     )
     # A compact overview, preserving the full-size per-frame diagnostic panels.
     if cards:
-        thumb_w, thumb_h = 512, 128
+        thumb_w, thumb_h = 640, 128
         columns = 2
         rows_count = (len(cards) + columns - 1) // columns
         sheet = np.zeros((rows_count * thumb_h, columns * thumb_w, 3),

@@ -126,7 +126,7 @@ def main() -> None:
     docs = [json.loads(path.read_text(encoding="utf-8")) for path in args.reports]
     result = analyze_reports(docs)
     for row in result["cases"]:
-        if row["first_pending_plan_change"] is None if "first_pending_plan_change" in row else False:
+        if "first_pending_plan_change" in row:
             print(json.dumps(row, ensure_ascii=False))
             continue
         gates = row["fixed_baseline_threshold_sensitivity"]

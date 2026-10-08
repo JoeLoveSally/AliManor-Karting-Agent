@@ -60,9 +60,6 @@ def test_valid_measurement_exports_explicitly_unknown_next_corner():
 
 
 def test_missing_pose_masks_derived_state():
-    result = make(100.0, kart={}, road=None)
-    # A malformed pose cannot silently be treated as valid. Use the physically
-    # missing case to test teacher coverage instead.
     result = subject.quantize_measurement(
         frame_index=1, timestamp_ms=100.0,
         timestamp_source="synthetic",

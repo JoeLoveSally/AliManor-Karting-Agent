@@ -122,14 +122,31 @@ def compare_prefix(
                 return result("blocked", "reference_callback_inconsistent",
                               index=index, t=t,
                               details={"logged_due_ms": due, "base_due_ms": base_due})
-            if cand_due is None or not close_float(
-                due, cand_due, timer_tolerance_ms
-            ):
-                return result("timer_uncertain", "candidate_deadline_differs_from_recorded_callback",
+            if cand_due is None or cand_due > t + 1e-6:
+                # Since no candidate primary switch occurred on the shared
+                # prefix, and the candidate pending deadline has not yet
+                # arrived (or is absent), it cannot have reached the recorded
+                # post-timer state by this observation. This is an observed-
+                # state divergence under the scheduler model, not a guess
+                # about when a callback thread might have run.
+                return result("state_divergence", "recorded_timer_transition_not_due_for_candidate",
                               index=index, t=t,
                               details={"recorded_due_ms": due,
                                        "candidate_due_ms": cand_due,
-                                       "original_action": logged["action"]})
+                                       "candidate_remaining_ms": (
+                                           None if cand_due is None else cand_due - t),
+                                       "recorded_action": logged["action"],
+                                       "recorded_state_before_observation": before,
+                                       "candidate_state_before_observation": state})
+            if not close_float(due, cand_due, timer_tolerance_ms):
+                # Candidate deadline is in the past, but a callback may have
+                # lost a race with the model observation. The original timer
+                # callback order cannot be copied across a changed deadline.
+                return result("timer_uncertain", "candidate_callback_order_unknown",
+                              index=index, t=t,
+                              details={"recorded_due_ms": due,
+                                       "candidate_due_ms": cand_due,
+                                       "recorded_action": logged["action"]})
             base_fired = baseline.execute_pending_if_due(
                 timestamp_ms=due, current_pressed=state
             )

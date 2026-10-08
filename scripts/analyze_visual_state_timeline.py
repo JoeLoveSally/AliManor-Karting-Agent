@@ -55,6 +55,46 @@ def events_from_run(run: dict) -> list[dict]:
     return events
 
 
+def suppress_axial_seam_rates(
+    rows: list[dict], *, max_axial_difference_deg: float = 15.0
+) -> tuple[list[dict], list[dict]]:
+    """Mask derivative pairs crossing the 0/180-degree representation seam.
+
+    A locally identical *axis* can use the opposite normal on either side
+    of the seam; its signed lateral value can flip with no kart motion.
+    This is only a diagnostic mask, NOT global sign stabilization.
+    """
+    result = [dict(r) for r in rows]
+    flagged = []
+    for i in range(1, len(result)):
+        previous = result[i - 1]
+        current = result[i]
+        if not (previous.get("state_valid") and current.get("state_valid")):
+            continue
+        left = previous.get("road_axis_axial_deg")
+        right = current.get("road_axis_axial_deg")
+        if left is None or right is None:
+            continue
+        old, new = float(left), float(right)
+        raw_change = abs(new - old)
+        axial_change = abs((new - old + 90.0) % 180.0 - 90.0)
+        if raw_change > 90.0 and axial_change <= max_axial_difference_deg:
+            flagged.append({
+                "frame_index": int(current["frame_index"]),
+                "previous_frame_index": int(previous["frame_index"]),
+                "road_axis_before_deg": old,
+                "road_axis_after_deg": new,
+                "lateral_before": previous.get("lateral_offset_norm"),
+                "lateral_after": current.get("lateral_offset_norm"),
+                "original_lateral_rate_per_s": current.get("lateral_rate_per_s"),
+                "original_heading_rate_deg_per_s": current.get("heading_rate_deg_per_s"),
+            })
+            current["lateral_rate_per_s"] = None
+            current["heading_rate_deg_per_s"] = None
+            current["axis_seam_rate_masked"] = True
+    return result, flagged
+
+
 def rate_stats(rows: list[dict]) -> dict:
     def fraction(key: str) -> float:
         return sum(bool(r.get(key)) for r in rows) / len(rows) if rows else 0.0
@@ -123,6 +163,8 @@ def analyze_timeline(rows: list[dict], *, control_start_ms: float | None = None,
     if window_ms <= 0 or top_k < 1:
         raise ValueError("window_ms must be positive and top_k >= 1")
     start = float(rows[0]["timestamp_ms"] if control_start_ms is None else control_start_ms)
+    raw_rate_statistics = rate_stats(rows)
+    rows, seam_warnings = suppress_axial_seam_rates(rows)
     events = sorted(events or [], key=lambda x: float(x["timestamp_ms"]))
     times = [float(e["timestamp_ms"]) for e in events]
     previews = previews or []
@@ -177,14 +219,16 @@ def analyze_timeline(rows: list[dict], *, control_start_ms: float | None = None,
     return {
         "control_start_ms": start,
         "clock": "same timestamp coordinate as measurement input",
+        "original_rate_statistics": raw_rate_statistics,
+        "axis_seam_suspicions": seam_warnings,
         "per_window": windows,
         "longest_invalid_runs": missing,
         "ranked_spikes": spikes,
         "warning": (
-            "No segmentation into normal, recoverable drift or failure state "
-            "was inferred. Derivative magnitude is NOT a physical speed or "
-            "proof of detector error. Inspect actual preview frames and "
-            "annotate gameplay phase before selecting a controller."
+            "No gameplay phase was inferred. Rates crossing the 0/180-degree "
+            "axis seam have been masked for reporting, but instantaneous signed "
+            "lateral states remain potentially ambiguous. Magnitude is NOT "
+            "physical speed or independent detector error. Inspect previews."
         ),
     }
 
@@ -231,6 +275,7 @@ def main():
                  "trend": round(window["valid_rate_pair_coverage"], 3)}
                 for window in values["per_window"]
             ],
+            "axis_seam_suspicions": len(values["axis_seam_suspicions"]),
             "longest_invalid": [
                 {"frames": [g["start_frame"], g["end_frame"]],
                  "count": g["count"]}

@@ -95,7 +95,7 @@ def polygon_labels(shape: tuple[int, int],
     return label
 
 
-def _annotate_one(image_path: Path, *, display_scale=1.0) -> bool:
+def _annotate_one(image_path: Path) -> bool:
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"cannot read image: {image_path}")
@@ -108,13 +108,13 @@ def _annotate_one(image_path: Path, *, display_scale=1.0) -> bool:
     current_label = 1
     h, w = image.shape[:2]
     win = "RoadBM polygon labeling"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, round(w * display_scale), round(h * display_scale))
+    # AUTOSIZE preserves a strict mouse-pixel == label-pixel mapping.
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
     def mouse(event, x, y, flags, userdata):
         if event == cv2.EVENT_LBUTTONDOWN:
-            points.append((max(0, min(w-1, int(x/display_scale))),
-                           max(0, min(h-1, int(y/display_scale)))))
+            points.append((max(0, min(w-1, int(x))),
+                           max(0, min(h-1, int(y)))))
 
     cv2.setMouseCallback(win, mouse)
     try:
@@ -140,8 +140,7 @@ def _annotate_one(image_path: Path, *, display_scale=1.0) -> bool:
                         (5,29), cv2.FONT_HERSHEY_SIMPLEX, .34, (255,255,255), 1)
             cv2.putText(preview, "Z back / U undo / C clear / S save / Q quit",
                         (5,42), cv2.FONT_HERSHEY_SIMPLEX, .34, (255,255,255), 1)
-            cv2.imshow(win, cv2.resize(preview, None, fx=display_scale,
-                                      fy=display_scale))
+            cv2.imshow(win, preview)
             key = cv2.waitKey(50) & 0xFF
             if key in (ord("r"),ord("i"),ord("b")):
                 current_label = {ord("r"):1,ord("i"):255,ord("b"):0}[key]
@@ -296,7 +295,6 @@ def main():
     ex.add_argument("--output-dir",type=Path,required=True)
     ann=sub.add_parser("annotate",help="OpenCV WSLg polygon annotation GUI")
     ann.add_argument("--image-dir",type=Path,required=True)
-    ann.add_argument("--scale",type=float,default=1.0)
     ann.add_argument("--max-images",type=int,default=None)
     ev=sub.add_parser("evaluate",help="compare GT with existing HSV teacher")
     ev.add_argument("--image-dir",type=Path,required=True)
@@ -310,11 +308,11 @@ def main():
         print(json.dumps([str(p) for p in export_frames(
             args.video,args.frames,args.output_dir)],indent=2))
     elif args.command=="annotate":
-        if args.scale<=0 or (args.max_images is not None and args.max_images<1):
-            ap.error("invalid display scale or image limit")
+        if args.max_images is not None and args.max_images < 1:
+            ap.error("max image count must be positive")
         images=sorted(args.image_dir.glob("roadbm_*_f??????.png"))
         for path in images[:args.max_images]:
-            if not _annotate_one(path,display_scale=args.scale):
+            if not _annotate_one(path):
                 break
     else:
         if args.output.exists(): raise FileExistsError(args.output)

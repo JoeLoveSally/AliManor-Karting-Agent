@@ -66,7 +66,7 @@ def close_float(left, right, tolerance_ms=0.10):
     )
 
 
-def audit(run: dict, module, *, max_errors: int = 5):
+def audit(run: dict, module, *, max_errors: int = 5, timer_policy: str = "nominal"):
     scheduler, ignored_default_options = make_scheduler(run, module)
     steps = run.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -88,34 +88,73 @@ def audit(run: dict, module, *, max_errors: int = 5):
             fail("observation_order", i, f"> {last_observation}", t)
             break
         last_observation = t
-        # Nominal timer callbacks occurring before this observation. An actual
-        # callback can be late; that uncertainty is exposed as a parity failure.
-        pending_at = scheduler.pending_due_ms
-        if pending_at is not None and float(pending_at) < t - 1e-6:
-            fired = scheduler.execute_pending_if_due(
-                timestamp_ms=float(pending_at), current_pressed=state)
-            if fired is None:
-                fail("timer_did_not_fire", i, pending_at, None)
-                break
-            state = not state
-            event = {"timestamp_ms": float(pending_at),
-                     "action": "PRESS" if state else "RELEASE", "pressed": state}
-            emitted.append(event)
-            if deadline_index >= len(deadlines):
-                fail("unexpected_timer_event", i, None, event)
-                break
-            recorded = deadlines[deadline_index]
-            deadline_index += 1
-            if (not close_float(recorded["timestamp_ms"], event["timestamp_ms"])
-                    or recorded["action"] != event["action"]
-                    or bool(recorded["pressed"]) != event["pressed"]):
-                fail("timer_event_mismatch", i, recorded, event)
-                break
-        if deadline_index < len(deadlines) and float(deadlines[deadline_index]["timestamp_ms"]) < t - 1e-6:
-            fail("missing_recorded_timer_event", i, deadlines[deadline_index], None)
-            break
         expected_before = (not bool(step["pressed"]) if step["action"] in ("PRESS", "RELEASE")
                            else bool(step["pressed"]))
+
+        if timer_policy == "nominal":
+            # Strict nominal replay: a pending deadline is assumed to win before
+            # any later observation. This intentionally exposes callback/frame
+            # races as parity failures.
+            pending_at = scheduler.pending_due_ms
+            if pending_at is not None and float(pending_at) < t - 1e-6:
+                fired = scheduler.execute_pending_if_due(
+                    timestamp_ms=float(pending_at), current_pressed=state)
+                if fired is None:
+                    fail("timer_did_not_fire", i, pending_at, None)
+                    break
+                state = not state
+                event = {"timestamp_ms": float(pending_at),
+                         "action": "PRESS" if state else "RELEASE", "pressed": state}
+                emitted.append(event)
+                if deadline_index >= len(deadlines):
+                    fail("unexpected_timer_event", i, None, event)
+                    break
+                recorded = deadlines[deadline_index]
+                deadline_index += 1
+                if (not close_float(recorded["timestamp_ms"], event["timestamp_ms"])
+                        or recorded["action"] != event["action"]
+                        or bool(recorded["pressed"]) != event["pressed"]):
+                    fail("timer_event_mismatch", i, recorded, event)
+                    break
+            if (deadline_index < len(deadlines)
+                    and float(deadlines[deadline_index]["timestamp_ms"]) < t - 1e-6):
+                fail("missing_recorded_timer_event", i, deadlines[deadline_index], None)
+                break
+        else:
+            # Historical-parity replay: use the recorded pre-step state only to
+            # resolve whether a logged timer callback won the race against this
+            # observation. Never synthesize an unlogged callback. This mode is a
+            # baseline source/version check, not a counterfactual timer model.
+            while state != expected_before:
+                if deadline_index >= len(deadlines):
+                    fail("pre_state_mismatch", i, int(expected_before), int(state))
+                    break
+                recorded = deadlines[deadline_index]
+                due = float(recorded["timestamp_ms"])
+                if due > t + 1e-6:
+                    fail("pre_state_mismatch", i, int(expected_before), int(state))
+                    break
+                pending_at = scheduler.pending_due_ms
+                if pending_at is None or not close_float(pending_at, due):
+                    fail("recorded_timer_not_pending", i, recorded, pending_at)
+                    break
+                fired = scheduler.execute_pending_if_due(
+                    timestamp_ms=due, current_pressed=state)
+                if fired is None:
+                    fail("timer_did_not_fire", i, recorded, None)
+                    break
+                state = not state
+                event = {"timestamp_ms": due,
+                         "action": "PRESS" if state else "RELEASE", "pressed": state}
+                emitted.append(event)
+                deadline_index += 1
+                if (recorded["action"] != event["action"]
+                        or bool(recorded["pressed"]) != event["pressed"]):
+                    fail("timer_event_mismatch", i, recorded, event)
+                    break
+            if errors:
+                break
+
         if state != expected_before:
             fail("pre_state_mismatch", i, int(expected_before), int(state))
             break

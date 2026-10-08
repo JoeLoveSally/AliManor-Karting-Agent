@@ -152,3 +152,50 @@ def test_h200_baseline_fidelity_failure_blocks_candidate():
     )
     assert result["status"] == "blocked_model_fidelity"
     assert result["first_difference"]["kind"] == "h200_replay_mismatch"
+
+
+
+def test_recorded_timer_with_candidate_deadline_after_observation_is_state_divergence():
+    obj = run(
+        step(0, [.01, .01, .01]),
+        step(100, [.001, .1, .9], reason="pending_armed", pending_due=162.5),
+        step(150, [.001, .1, .9], reason="pending_wait", pending_due=162.5),
+        step(180, [.99, .80, .01], reason="min_hold", pressed=True),
+        step(300, [.01, .01, .01], pressed=True),
+        deadlines=[{"timestamp_ms": 162.5, "action": "PRESS",
+                    "pressed": True}],
+    )
+    # The candidate's pending deadline moves to roughly 185.5ms.
+    # At the recorded 180ms observation, a candidate callback cannot
+    # already have executed.
+    result = subject.compare_prefix(
+        obj, module, predictor(obj, {1: [.001, .01, .7]}),
+        candidate_threshold=0.60,
+    )
+    assert result["status"] == "state_divergence"
+    assert result["first_difference"]["step"] == 3
+    assert result["first_difference"]["kind"] == (
+        "recorded_timer_transition_not_due_for_candidate"
+    )
+    assert result["first_difference"]["candidate_remaining_ms"] > 0
+
+
+def test_recorded_timer_with_no_candidate_pending_is_state_divergence():
+    obj = run(
+        step(0, [.01, .01, .01]),
+        step(100, [.001, .1, .9], reason="pending_armed", pending_due=162.5),
+        step(150, [.001, .1, .9], reason="pending_wait", pending_due=162.5),
+        step(180, [.99, .80, .01], reason="min_hold", pressed=True),
+        deadlines=[{"timestamp_ms": 162.5, "action": "PRESS",
+                    "pressed": True}],
+    )
+    result = subject.compare_prefix(
+        obj, module, predictor(obj, {
+            1: [.001, .01, .10],
+            2: [.001, .01, .10],
+        }), candidate_threshold=0.60,
+    )
+    assert result["status"] == "state_divergence"
+    assert result["first_difference"]["candidate_due_ms"] is None
+    assert result["first_difference"]["candidate_state_before_observation"] is False
+    assert result["first_difference"]["recorded_state_before_observation"] is True

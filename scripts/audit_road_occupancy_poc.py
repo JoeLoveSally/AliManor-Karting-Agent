@@ -110,6 +110,22 @@ def enclosed_mask_unknown(
     }
 
 
+def roi_redaction_mask(
+    shape: tuple[int, int], roi: tuple[float, float, float, float],
+) -> np.ndarray:
+    """Return 255 where action-label UI must not be observed by the model."""
+    x0, y0, x1, y1 = map(float, roi)
+    if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+        raise ValueError("normalized touch ROI must satisfy 0<=min<max<=1")
+    h, w = shape
+    rect = np.zeros((h, w), dtype=np.uint8)
+    import math
+    left, top = math.floor(x0 * w), math.floor(y0 * h)
+    right, bottom = math.ceil(x1 * w), math.ceil(y1 * h)
+    rect[top:bottom, left:right] = 255
+    return rect
+
+
 def crop_and_downsample(
     image: np.ndarray, center_xy: tuple[float, float], *,
     patch_width: int, patch_height: int, out_size: int = 32,
@@ -157,6 +173,7 @@ def quantize_frame(
     wide_size: tuple[int, int] = (360, 480),
     grid_size: int = 32,
     seed_radius: int = 28,
+    redaction_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Four planes: local road, local known, wide road, wide known.
 
@@ -164,12 +181,22 @@ def quantize_frame(
     marks the sample as INVALID. Zero occupancy alone must never be treated as
     confidently observed off-road or used for policy training.
     """
+    if redaction_mask is not None and (
+        redaction_mask.shape != raw_mask.shape or
+        redaction_mask.dtype != np.uint8
+    ):
+        raise ValueError("redaction_mask must match road mask shape/dtype")
+    safe_road_mask = raw_mask.copy()
+    if redaction_mask is not None:
+        safe_road_mask[redaction_mask > 0] = 0
     selected, info = select_kart_local_component(
-        raw_mask, kart_xy, radius_px=seed_radius
+        safe_road_mask, kart_xy, radius_px=seed_radius
     )
     # A fully enclosed dark island is ambiguous (kart/smoke/HSV miss):
     # do not hallucinate a road or a real gap under an occluder.
     unknown, hole_stats = enclosed_mask_unknown(selected)
+    if redaction_mask is not None:
+        unknown = np.maximum(unknown, redaction_mask)
     observed = np.where(unknown > 0, 0, 255).astype(np.uint8)
     center = kart_xy if kart_xy is not None else nominal_center
     cropped, local_road, local_known = crop_and_downsample(
@@ -186,6 +213,11 @@ def quantize_frame(
     info = dict(info)
     info.update(hole_stats)
     info.update({
+        "label_ui_redaction_enabled": redaction_mask is not None,
+        "label_ui_redaction_fraction": (
+            float(np.count_nonzero(redaction_mask) / redaction_mask.size)
+            if redaction_mask is not None else 0.0
+        ),
         "kart_detected": kart_xy is not None,
         "anchor_x_px": float(center[0]), "anchor_y_px": float(center[1]),
         "quantizer_valid_unreviewed": kart_xy is not None and info["seed_found"],
@@ -236,17 +268,23 @@ def tile_preview(frame: np.ndarray, raw: np.ndarray, selected: np.ndarray,
     return np.concatenate(panels, axis=1)
 
 
-def inspect_video(video: Path, json_path: Path, *,
+def inspect_video(video: Path, json_path: Path | None, *,
                   output_root: Path, start: int, end: int | None,
                   stride: int, max_samples: int,
-                  road_cfg, kart_cfg, grid_size: int = 32) -> dict:
+                  road_cfg, kart_cfg, grid_size: int = 32,
+                  touch_roi: tuple[float, float, float, float] | None = None) -> dict:
     output_dir = output_root / video.stem
     output_dir.mkdir(parents=True, exist_ok=False)
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {video}")
-    timestamps = load_run_timestamps(json_path, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-    assert timestamps is not None
+    timestamps = (
+        load_run_timestamps(json_path, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        if json_path is not None else None
+    )
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if timestamps is None and (not np.isfinite(fps) or fps <= 0):
+        raise ValueError("raw expert video requires positive nominal FPS")
     rows = []
     masks = []
     cards = []
@@ -265,12 +303,28 @@ def inspect_video(video: Path, json_path: Path, *,
             pose, _ = estimate_kart_pose(frame, kart_cfg)
             xy = (pose.center_x, pose.center_y) if pose else None
             default_center = (frame.shape[1] * .55, frame.shape[0] * .50)
+            redaction = (
+                roi_redaction_mask(road.shape, touch_roi)
+                if touch_roi is not None else None
+            )
             planes, audit, images = quantize_frame(
                 frame, road, xy, nominal_center=default_center,
-                grid_size=grid_size,
+                grid_size=grid_size, redaction_mask=redaction,
             )
-            t = timestamps[i]
-            rows.append({"frame_index": i, "timestamp_ms": t, **audit})
+            if timestamps is not None:
+                if i >= len(timestamps):
+                    raise ValueError("decoded source frame index out of timestamp bounds")
+                t = timestamps[i]
+                timestamp_source = "adb_json_host_decoded_timestamp"
+            else:
+                # Expert MP4s have no host-decoder JSON timeline.
+                # Nominal FPS is for qualitative inspection, not latency claims.
+                t = i * 1000.0 / fps
+                timestamp_source = "video_nominal_fps_approx"
+            rows.append({
+                "frame_index": i, "timestamp_ms": t,
+                "timestamp_source": timestamp_source, **audit
+            })
             masks.append(planes.astype(np.float16))
             if len(rows) <= 20 or len(rows) % 8 == 0:
                 preview = tile_preview(
@@ -303,6 +357,8 @@ def inspect_video(video: Path, json_path: Path, *,
             stream.write(json.dumps(r, ensure_ascii=False) + "\n")
     summary = {
         "video": str(video), "samples": len(rows),
+        "timestamp_source": rows[0]["timestamp_source"],
+        "touch_marker_redaction_roi": list(touch_roi) if touch_roi is not None else None,
         "candidate_valid_rate_unreviewed": sum(
             r["quantizer_valid_unreviewed"] for r in rows
         ) / len(rows),
@@ -348,7 +404,14 @@ def inspect_video(video: Path, json_path: Path, *,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video", type=Path)
-    parser.add_argument("--run-json", type=Path, required=True)
+    parser.add_argument("--run-json", type=Path, default=None,
+                        help="Optional ADB JSON for real source-frame timestamps; "
+                             "without it use nominal FPS for expert videos")
+    parser.add_argument(
+        "--touch-roi", type=float, nargs=4, metavar=("X0", "Y0", "X1", "Y1"),
+        default=None, help="Normalized action-label UI exclusion rectangle; "
+                           "recommended for expert videos: 0.78 0.82 0.98 0.98",
+    )
     parser.add_argument("--geometry-config", type=Path,
                         default=ROOT / "configs/geometry_pseudo_labels.yaml")
     parser.add_argument("--output-root", type=Path, required=True)
@@ -367,6 +430,7 @@ def main():
         start=args.frame_start, end=args.frame_end,
         stride=args.sample_every_frames, max_samples=args.max_samples,
         road_cfg=road_cfg, kart_cfg=kart_cfg,
+        touch_roi=(tuple(args.touch_roi) if args.touch_roi is not None else None),
     )
     print(json.dumps(report, ensure_ascii=False))
 

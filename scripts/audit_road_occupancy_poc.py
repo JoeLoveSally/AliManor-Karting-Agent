@@ -76,13 +76,55 @@ def select_kart_local_component(
     }
 
 
+def enclosed_mask_unknown(
+    selected: np.ndarray, *, max_hole_area_fraction: float = 0.01,
+) -> tuple[np.ndarray, dict]:
+    """Find *small fully enclosed* unsegmented regions inside a road candidate.
+
+    A hole can represent the kart, a smoke puff, a skid mark, or an HSV miss.
+    It is not safe to label such pixels as either traversable or obstructed.
+    This conservative heuristic never touches road boundaries or connected
+    background and does not infer the actual occluding object.
+    """
+    if selected.ndim != 2 or selected.dtype != np.uint8:
+        raise ValueError("selected must be uint8 HxW")
+    if not 0 < max_hole_area_fraction < 1:
+        raise ValueError("max_hole_area_fraction must be in (0, 1)")
+    inverse = (selected == 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(inverse, 8)
+    border_labels = set(
+        np.unique(np.concatenate((
+            labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]
+        ))).tolist()
+    )
+    max_area = max(1, int(round(selected.size * max_hole_area_fraction)))
+    interior = [
+        label for label in range(1, count)
+        if (label not in border_labels
+            and int(stats[label, cv2.CC_STAT_AREA]) <= max_area)
+    ]
+    unknown = np.where(np.isin(labels, interior), 255, 0).astype(np.uint8)
+    return unknown, {
+        "enclosed_unknown_regions": len(interior),
+        "enclosed_unknown_fraction": float(np.count_nonzero(unknown) / selected.size),
+    }
+
+
 def crop_and_downsample(
     image: np.ndarray, center_xy: tuple[float, float], *,
     patch_width: int, patch_height: int, out_size: int = 32,
+    observed_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return pixel-centered crop and area-averaged occupancy/known fractions."""
+    """Return kart-centered crop and fractional occupancy/visibility.
+
+    observed_mask=0 marks potentially occluded regions as unknown. A pixel
+    outside the source image is also unknown, not confidently offroad.
+    """
     if image.ndim != 2 or image.dtype != np.uint8:
         raise ValueError("image must be uint8 HxW")
+    if (observed_mask is not None and
+            (observed_mask.shape != image.shape or observed_mask.dtype != np.uint8)):
+        raise ValueError("observed_mask must match image shape and uint8 dtype")
     if patch_width <= 0 or patch_height <= 0 or out_size <= 0:
         raise ValueError("invalid patch or output size")
     cx, cy = center_xy
@@ -93,7 +135,8 @@ def crop_and_downsample(
         flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
     in_bounds = cv2.warpAffine(
-        np.ones(image.shape, dtype=np.uint8) * 255,
+        (np.full(image.shape, 255, dtype=np.uint8)
+         if observed_mask is None else observed_mask),
         shift, (patch_width, patch_height),
         flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
@@ -124,17 +167,24 @@ def quantize_frame(
     selected, info = select_kart_local_component(
         raw_mask, kart_xy, radius_px=seed_radius
     )
+    # A fully enclosed dark island is ambiguous (kart/smoke/HSV miss):
+    # do not hallucinate a road or a real gap under an occluder.
+    unknown, hole_stats = enclosed_mask_unknown(selected)
+    observed = np.where(unknown > 0, 0, 255).astype(np.uint8)
     center = kart_xy if kart_xy is not None else nominal_center
     cropped, local_road, local_known = crop_and_downsample(
         selected, center, patch_width=local_size[0],
         patch_height=local_size[1], out_size=grid_size,
+        observed_mask=observed,
     )
     _, wide_road, wide_known = crop_and_downsample(
         selected, center, patch_width=wide_size[0],
         patch_height=wide_size[1], out_size=grid_size,
+        observed_mask=observed,
     )
     planes = np.stack((local_road, local_known, wide_road, wide_known)).astype(np.float32)
     info = dict(info)
+    info.update(hole_stats)
     info.update({
         "kart_detected": kart_xy is not None,
         "anchor_x_px": float(center[0]), "anchor_y_px": float(center[1]),
@@ -144,7 +194,9 @@ def quantize_frame(
         "local_observed_coverage": float(local_known.mean()),
         "wide_observed_coverage": float(wide_known.mean()),
     })
-    return planes, info, {"selected_mask": selected, "local_crop": cropped}
+    return planes, info, {
+        "selected_mask": selected, "unknown_mask": unknown, "local_crop": cropped,
+    }
 
 
 def tile_preview(frame: np.ndarray, raw: np.ndarray, selected: np.ndarray,
@@ -255,11 +307,19 @@ def inspect_video(video: Path, json_path: Path, *,
         "grid_shape": [4, grid_size, grid_size],
         "channel_order": ["local_road", "local_known", "wide_road", "wide_known"],
         "grid_dtype": "float16",
+        "known_channel_semantics": (
+            "In-bounds and not a small fully enclosed unsegmented island; "
+            "neither segmentation accuracy nor drivable ground truth."
+        ),
+        "mean_enclosed_unknown_fraction": float(np.mean([
+            x["enclosed_unknown_fraction"] for x in rows
+        ])),
         "mask_quality_verified": False,
         "warning": (
-            "This candidate inherits HSV segmentation limitations; near-kart "
-            "component association can still select background or a wrong road. "
-            "Do not use for real control before visual validation."
+            "The HSV mask remains unverified. Small enclosed black islands "
+            "are marked unknown, not filled as road or confirmed as obstacles. "
+            "Background-connected edge occlusions remain unresolved. "
+            "Do not train/control with this candidate before visual validation."
         ),
     }
     (output_dir / "summary.json").write_text(

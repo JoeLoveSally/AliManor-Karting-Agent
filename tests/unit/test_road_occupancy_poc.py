@@ -100,3 +100,56 @@ def test_model_input_planes_do_not_include_action_labels():
         frame, mask, (180.0, 240.0), nominal_center=(180, 240)
     )
     assert not any(key in audit for key in ("pressed", "action", "switch"))
+
+
+def test_enclosed_hole_is_unknown_not_confirmed_obstacle_or_road():
+    selected = np.zeros((96, 96), dtype=np.uint8)
+    selected[8:88, 8:88] = 255
+    selected[40:48, 44:52] = 0
+    unknown, meta = module.enclosed_mask_unknown(selected)
+    assert meta["enclosed_unknown_regions"] == 1
+    assert unknown[44, 48] == 255
+    assert unknown[0, 0] == 0
+
+    observed = np.where(unknown > 0, 0, 255).astype(np.uint8)
+    _, road, known = module.crop_and_downsample(
+        selected, (48, 48), patch_width=96, patch_height=96,
+        observed_mask=observed, out_size=32,
+    )
+    assert road[15, 16] == 0.0
+    assert known[15, 16] == 0.0
+    assert known[0, 0] == 1.0
+
+
+def test_background_connected_gap_remains_known_offroad():
+    selected = np.zeros((64, 64), dtype=np.uint8)
+    selected[16:48, 16:48] = 255
+    selected[16:35, 31:34] = 0  # reaches the exterior at road top edge
+    unknown, meta = module.enclosed_mask_unknown(selected)
+    assert np.count_nonzero(unknown) == 0
+    assert meta["enclosed_unknown_regions"] == 0
+
+
+def test_large_internal_gap_not_silently_hallucinated_as_occlusion():
+    selected = np.full((100, 100), 255, dtype=np.uint8)
+    selected[25:75, 25:75] = 0
+    unknown, meta = module.enclosed_mask_unknown(
+        selected, max_hole_area_fraction=0.01,
+    )
+    assert meta["enclosed_unknown_regions"] == 0
+    assert unknown[50, 50] == 0
+
+
+def test_quantize_exposes_occlusion_in_existing_known_planes():
+    frame = np.zeros((240, 240, 3), dtype=np.uint8)
+    road_mask = np.zeros((240, 240), dtype=np.uint8)
+    road_mask[15:225, 15:225] = 255
+    road_mask[115:125, 115:125] = 0
+    planes, meta, images = module.quantize_frame(
+        frame, road_mask, (120, 120), nominal_center=(120, 120),
+    )
+    assert planes.shape == (4, 32, 32)
+    assert meta["enclosed_unknown_regions"] == 1
+    assert images["unknown_mask"][120, 120] == 255
+    assert planes[1, 16, 16] < 1.0
+    assert planes[3, 16, 16] < 1.0

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Audit recorded V4-C2 scheduler decisions without model inference or ADB.
 
-This is a deterministic, nominal-deadline replay. It does NOT reproduce wall-clock
-inference latency or guarantee timer-thread ordering near an observation. A
-mismatch blocks downstream counterfactual scheduler claims; no recorded action
-may be silently replaced with a simulated action.
+Two strictly read-only modes: nominal-deadline ordering and historical recorded-
+callback ordering. Neither reproduces wall-clock inference latency. A mismatch
+blocks downstream counterfactual scheduler claims; no recorded action is silently
+replaced with a simulated action.
 """
 from __future__ import annotations
 
@@ -67,6 +67,8 @@ def close_float(left, right, tolerance_ms=0.10):
 
 
 def audit(run: dict, module, *, max_errors: int = 5, timer_policy: str = "nominal"):
+    if timer_policy not in {"nominal", "recorded"}:
+        raise ValueError("timer_policy must be nominal or recorded")
     scheduler, ignored_default_options = make_scheduler(run, module)
     steps = run.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -186,9 +188,12 @@ def audit(run: dict, module, *, max_errors: int = 5, timer_policy: str = "nomina
         "steps_total": len(steps), "steps_checked": step_checked,
         "logged_deadlines": len(deadlines), "replayed_deadlines": len(emitted),
         "recorded_optional_defaults_not_in_source": ignored_default_options,
+        "timer_policy": timer_policy,
         "parity_passed": not errors and step_checked == len(steps),
         "first_errors": errors[:max_errors],
-        "warning": "Nominal timer replay only; source revision and callback timing must match original. No candidate model was evaluated.",
+        "warning": ("Nominal-deadline replay assumes callbacks always win before later observations; no candidate evaluated."
+                    if timer_policy == "nominal" else
+                    "Recorded-order baseline audit uses logged pre-step state to resolve callback/frame order; NOT a counterfactual timer replay."),
     }
 
 
@@ -196,6 +201,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", nargs="+", type=Path)
     parser.add_argument("--scheduler-source", type=Path, default=DEFAULT_SCHEDULER)
+    parser.add_argument("--timer-policy", choices=("nominal", "recorded"), default="nominal")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/analysis/v4c2_scheduler_parity.json")
     args = parser.parse_args()
     source = args.scheduler_source.resolve(strict=True)
@@ -206,7 +212,7 @@ def main():
     for path in args.runs:
         run = json.loads(path.read_text(encoding="utf-8"))
         try:
-            result = audit(run, module)
+            result = audit(run, module, timer_policy=args.timer_policy)
         except (ValueError, KeyError, TypeError) as exc:
             result = {"parity_passed": False, "blocked": str(exc)}
         report["runs"][path.stem] = result

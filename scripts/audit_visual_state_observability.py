@@ -169,8 +169,9 @@ def load_run_timestamps(run_json: Path | None, frame_count_hint: int):
         raise ValueError("ADB recording lacks validated source-frame mapping")
     if int(recording["frame_count"]) != len(run["capture"]["decoded_frame_timestamps_ms"]):
         raise ValueError("run JSON decoded timestamps do not match recorded frame count")
-    if (frame_count_hint > 0 and int(recording["frame_count"]) != frame_count_hint):
-        raise ValueError("MP4 frame_count metadata differs from run JSON")
+    # Fragmented MP4s can report an unreliable CAP_PROP_FRAME_COUNT. Do not
+    # reject on the container hint; validate sampled indices and, when decoded
+    # to EOF, compare actual decoded frame count against the JSON timeline.
     timestamps = list(map(float, run["capture"]["decoded_frame_timestamps_ms"]))
     if any(not math.isfinite(t) for t in timestamps):
         raise ValueError("non-finite logged timestamps")

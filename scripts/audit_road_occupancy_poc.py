@@ -225,9 +225,11 @@ def tile_preview(frame: np.ndarray, raw: np.ndarray, selected: np.ndarray,
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     local_vis = enlarge(planes[0])
     wide_vis = enlarge(planes[2])
-    panels = [original, raw_vis, selected_vis, local_vis, wide_vis]
+    local_known_vis = enlarge(planes[1])
+    panels = [original, raw_vis, selected_vis, local_vis, wide_vis,
+              local_known_vis]
     labels = ("RGB local", "HSV local", "Selected local",
-              "32x32 local", "32x32 wide")
+              "32x32 local", "32x32 wide", "32x32 known")
     for name, panel in zip(labels, panels):
         cv2.putText(panel, name, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                     .5, (255, 0, 200), 1, cv2.LINE_AA)

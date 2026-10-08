@@ -65,6 +65,8 @@ def rate_stats(rows: list[dict]) -> dict:
         pos = frac * (len(vals) - 1)
         lo = math.floor(pos)
         hi = math.ceil(pos)
+        if lo == hi:
+            return vals[lo]
         return vals[lo] * (hi - pos) + vals[hi] * (pos - lo)
     lat = [abs(float(r["lateral_rate_per_s"])) for r in rows
            if r.get("lateral_rate_per_s") is not None]

@@ -153,3 +153,52 @@ def test_quantize_exposes_occlusion_in_existing_known_planes():
     assert images["unknown_mask"][120, 120] == 255
     assert planes[1, 16, 16] < 1.0
     assert planes[3, 16, 16] < 1.0
+
+
+def test_touch_marker_roi_is_unknown_and_excluded_from_road_features():
+    frame = np.zeros((240, 240, 3), dtype=np.uint8)
+    road_mask = np.ones((240, 240), dtype=np.uint8) * 255
+    # Deliberately cover a road portion with the action-label exclusion ROI.
+    redaction = module.roi_redaction_mask(
+        road_mask.shape, (0.70, 0.70, 0.90, 0.90)
+    )
+    planes, meta, images = module.quantize_frame(
+        frame, road_mask, (120, 120), nominal_center=(120, 120),
+        local_size=(240, 240), wide_size=(240, 240),
+        redaction_mask=redaction,
+    )
+    assert meta["label_ui_redaction_enabled"] is True
+    assert images["selected_mask"][190, 190] == 0
+    assert images["unknown_mask"][190, 190] == 255
+    # Redacted input must be zero occupancy AND zero known, not a confident
+    # negative feature from the original touch-marker action label.
+    assert planes[0, 25, 25] == 0
+    assert planes[1, 25, 25] == 0
+    assert planes[2, 25, 25] == 0
+    assert planes[3, 25, 25] == 0
+    assert planes[0, 12, 12] > .99
+    assert planes[1, 12, 12] > .99
+
+
+def test_normalized_touch_roi_validation():
+    import pytest
+    with pytest.raises(ValueError, match="normalized touch ROI"):
+        module.roi_redaction_mask((100, 100), (0.9, 0.8, 0.4, 0.95))
+    result = module.roi_redaction_mask(
+        (100, 100), (0.78, 0.82, 0.98, 0.98)
+    )
+    assert result.shape == (100, 100)
+    assert result.dtype == np.uint8
+    assert result[90, 85] == 255
+    assert result[30, 30] == 0
+
+
+def test_existing_adb_mode_remains_unredacted_by_default():
+    frame = np.zeros((240, 240, 3), dtype=np.uint8)
+    road_mask = np.ones((240, 240), dtype=np.uint8) * 255
+    _, meta, images = module.quantize_frame(
+        frame, road_mask, (120, 120), nominal_center=(120, 120)
+    )
+    assert meta["label_ui_redaction_enabled"] is False
+    assert meta["label_ui_redaction_fraction"] == 0.0
+    assert images["unknown_mask"].shape == (240, 240)

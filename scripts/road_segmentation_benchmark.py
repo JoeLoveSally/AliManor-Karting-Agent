@@ -95,7 +95,31 @@ def polygon_labels(shape: tuple[int, int],
     return label
 
 
-def _annotate_one(image_path: Path) -> bool:
+def annotation_view_size(
+    source_width: int, source_height: int, max_height: int = 640,
+) -> tuple[int, int]:
+    """Choose a fixed display bitmap small enough for common WSLg desktops."""
+    if source_width < 1 or source_height < 1 or max_height < 1:
+        raise ValueError("annotation view dimensions must be positive")
+    height = min(source_height, max_height)
+    width = max(1, round(source_width * height / source_height))
+    return width, height
+
+
+def annotation_source_point(
+    x: int, y: int, *, source_width: int, source_height: int,
+    view_width: int, view_height: int,
+) -> tuple[int, int]:
+    """Map an OpenCV pixel in the fixed display bitmap to source-image pixels."""
+    if min(source_width, source_height, view_width, view_height) < 1:
+        raise ValueError("annotation view dimensions must be positive")
+    return (
+        max(0, min(source_width - 1, int(x * source_width / view_width))),
+        max(0, min(source_height - 1, int(y * source_height / view_height))),
+    )
+
+
+def _annotate_one(image_path: Path, *, display_height: int = 640) -> bool:
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"cannot read image: {image_path}")
@@ -107,54 +131,76 @@ def _annotate_one(image_path: Path) -> bool:
     points: list[tuple[int, int]] = []
     current_label = 1
     h, w = image.shape[:2]
+    dw, dh = annotation_view_size(w, h, display_height)
     win = "RoadBM polygon labeling"
-    # AUTOSIZE preserves a strict mouse-pixel == label-pixel mapping.
+    # Always display the SAME small fixed-size bitmap. WSLg can repeatedly
+    # clamp an 800px-high autosize window; do not fight the window manager.
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    dirty = True
 
     def mouse(event, x, y, flags, userdata):
+        nonlocal dirty
         if event == cv2.EVENT_LBUTTONDOWN:
-            points.append((max(0, min(w-1, int(x))),
-                           max(0, min(h-1, int(y)))))
+            points.append(annotation_source_point(
+                x, y, source_width=w, source_height=h,
+                view_width=dw, view_height=dh,
+            ))
+            dirty = True
 
     cv2.setMouseCallback(win, mouse)
     try:
         while True:
-            preview = image.copy()
-            label = polygon_labels((h,w), polygons)
-            tint = np.zeros_like(preview)
-            tint[label == 1] = (50, 185, 40)
-            tint[label == 255] = (110, 110, 110)
-            marked = label != 0
-            preview[marked] = cv2.addWeighted(
-                preview[marked], .48, tint[marked], .52, 0
-            )
-            if points:
-                poly = np.asarray(points, dtype=np.int32)
-                cv2.polylines(preview, [poly], False, (0, 215, 255), 2)
-                for px, py in points:
-                    cv2.circle(preview, (px,py), 3, (0, 215, 255), -1)
-            cv2.rectangle(preview, (0,0), (w,45), (0,0,0), -1)
-            cv2.putText(preview, image_path.name[-31:], (5,15),
-                        cv2.FONT_HERSHEY_SIMPLEX, .38, (255,255,255), 1)
-            cv2.putText(preview, "R road / I ignore / B bg / Enter close",
-                        (5,29), cv2.FONT_HERSHEY_SIMPLEX, .34, (255,255,255), 1)
-            cv2.putText(preview, "Z back / U undo / C clear / S save / Q quit",
-                        (5,42), cv2.FONT_HERSHEY_SIMPLEX, .34, (255,255,255), 1)
-            cv2.imshow(win, preview)
+            if dirty:
+                preview = image.copy()
+                label = polygon_labels((h, w), polygons)
+                tint = np.zeros_like(preview)
+                tint[label == 1] = (50, 185, 40)
+                tint[label == 255] = (110, 110, 110)
+                marked = label != 0
+                preview[marked] = cv2.addWeighted(
+                    preview[marked], .48, tint[marked], .52, 0
+                )
+                if points:
+                    poly = np.asarray(points, dtype=np.int32)
+                    cv2.polylines(preview, [poly], False, (0, 215, 255), 2)
+                    for px, py in points:
+                        cv2.circle(preview, (px, py), 3, (0, 215, 255), -1)
+                cv2.rectangle(preview, (0, 0), (w, 45), (0, 0, 0), -1)
+                cv2.putText(preview, image_path.name[-31:], (5, 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, .38, (255,255,255), 1)
+                cv2.putText(preview, "R road / I ignore / B bg / Enter close",
+                            (5, 29), cv2.FONT_HERSHEY_SIMPLEX, .34,
+                            (255,255,255), 1)
+                cv2.putText(preview, "Z back / U undo / C clear / S save / Q quit",
+                            (5, 42), cv2.FONT_HERSHEY_SIMPLEX, .34,
+                            (255,255,255), 1)
+                # WINDOW_AUTOSIZE remains stable because bitmap dimensions are
+                # fixed and comfortably smaller than the physical source frame.
+                display = cv2.resize(preview, (dw, dh), interpolation=cv2.INTER_AREA)
+                cv2.imshow(win, display)
+                dirty = False
             key = cv2.waitKey(50) & 0xFF
-            if key in (ord("r"),ord("i"),ord("b")):
-                current_label = {ord("r"):1,ord("i"):255,ord("b"):0}[key]
-            elif key in (10,13):
+            if key in (ord("r"), ord("i"), ord("b")):
+                current_label = {ord("r"): 1, ord("i"): 255, ord("b"): 0}[key]
+                dirty = True
+            elif key in (10, 13):
                 if len(points) >= 3:
                     polygons.append((current_label, list(points)))
                     points.clear()
+                    dirty = True
             elif key == ord("z") and points:
                 points.pop()
+                dirty = True
             elif key == ord("u"):
-                if points: points.clear()
-                elif polygons: polygons.pop()
+                if points:
+                    points.clear()
+                    dirty = True
+                elif polygons:
+                    polygons.pop()
+                    dirty = True
             elif key == ord("c"):
                 points.clear()
+                dirty = True
             elif key == ord("s"):
                 if points:
                     print("Close current polygon with Enter before saving")
@@ -162,7 +208,7 @@ def _annotate_one(image_path: Path) -> bool:
                 if not any(value == 1 for value, _ in polygons):
                     print("At least one ROAD polygon is required")
                     continue
-                mask = polygon_labels((h,w), polygons)
+                mask = polygon_labels((h, w), polygons)
                 if not cv2.imwrite(str(target), mask):
                     raise RuntimeError(f"could not write ground truth: {target}")
                 print(f"Saved: {target}")
@@ -296,6 +342,8 @@ def main():
     ann=sub.add_parser("annotate",help="OpenCV WSLg polygon annotation GUI")
     ann.add_argument("--image-dir",type=Path,required=True)
     ann.add_argument("--max-images",type=int,default=None)
+    ann.add_argument("--display-height",type=int,default=640,
+                     help="fixed window image height in pixels (default 640)")
     ev=sub.add_parser("evaluate",help="compare GT with existing HSV teacher")
     ev.add_argument("--image-dir",type=Path,required=True)
     ev.add_argument("--train-config",type=Path,default=ROOT/"configs/train_v4c2_temporal_v2.yaml")
@@ -308,11 +356,11 @@ def main():
         print(json.dumps([str(p) for p in export_frames(
             args.video,args.frames,args.output_dir)],indent=2))
     elif args.command=="annotate":
-        if args.max_images is not None and args.max_images < 1:
-            ap.error("max image count must be positive")
+        if (args.max_images is not None and args.max_images < 1) or args.display_height < 1:
+            ap.error("max image count and display height must be positive")
         images=sorted(args.image_dir.glob("roadbm_*_f??????.png"))
         for path in images[:args.max_images]:
-            if not _annotate_one(path):
+            if not _annotate_one(path,display_height=args.display_height):
                 break
     else:
         if args.output.exists(): raise FileExistsError(args.output)

@@ -297,8 +297,6 @@ def inspect_video(video: Path, json_path: Path | None, *,
             if i < start or (i - start) % stride:
                 i += 1
                 continue
-            if i >= len(timestamps):
-                raise ValueError("decoded source frame index out of timestamp bounds")
             road = extract_road_mask(frame, road_cfg)
             pose, _ = estimate_kart_pose(frame, kart_cfg)
             xy = (pose.center_x, pose.center_y) if pose else None

@@ -65,8 +65,15 @@ def test_different_recorded_action_blocks_parity():
     assert report["first_errors"][0]["kind"] == "step_mismatch"
 
 
-def test_new_opt_in_source_option_cannot_be_silently_dropped():
+def test_unknown_active_source_option_cannot_be_silently_dropped():
     run = example_run()
-    run["runtime"]["multi_horizon_scheduler"]["execute_short_horizon_overdue"] = True
+    run["runtime"]["multi_horizon_scheduler"]["future_unimplemented_flag"] = True
     with pytest.raises(ValueError, match="scheduler source lacks recorded options"):
         audit_module.audit(run, scheduler_module)
+
+
+def test_recorded_timer_policy_replays_logged_callback_order():
+    report = audit_module.audit(example_run(), scheduler_module, timer_policy="recorded")
+    assert report["parity_passed"] is True
+    assert report["timer_policy"] == "recorded"
+    assert report["replayed_deadlines"] == 1

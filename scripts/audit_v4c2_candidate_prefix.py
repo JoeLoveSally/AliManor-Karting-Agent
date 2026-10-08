@@ -47,6 +47,7 @@ def compare_prefix(
     candidate_threshold: float,
     timer_tolerance_ms: float = 0.10,
     max_replay_h200_error: float = 0.05,
+    candidate_horizons: str = "full",
 ) -> dict:
     """Compare recorded baseline and candidate until the first unsafe prefix.
 
@@ -56,6 +57,8 @@ def compare_prefix(
     """
     if not 0 < candidate_threshold < 1:
         raise ValueError("candidate threshold must be in (0, 1)")
+    if candidate_horizons not in {"full", "control_only"}:
+        raise ValueError("candidate_horizons must be full or control_only")
     if timer_tolerance_ms < 0 or max_replay_h200_error < 0:
         raise ValueError("tolerances must be non-negative")
 
@@ -89,6 +92,7 @@ def compare_prefix(
             "common_prefix_steps": checked,
             "recorded_deadlines_consumed": consumed_deadlines,
             "candidate_threshold_all_horizons": candidate_threshold,
+            "candidate_horizons": candidate_horizons,
             "baseline_threshold_all_horizons": float(original_cfg.threshold),
             "warning": (
                 "This compares a factual original-policy prefix, not a new "
@@ -187,6 +191,14 @@ def compare_prefix(
         replayed_all, candidate_all = predict(index, step, before)
         replayed_all = _as_probabilities(replayed_all, len(horizons))
         candidate_all = _as_probabilities(candidate_all, len(horizons))
+        if candidate_horizons == "control_only":
+            # Diagnostic ablation: keep the recorded baseline H100/H300
+            # *exactly* and substitute only residual H200. This is not a
+            # deployment configuration or separate per-horizon threshold.
+            candidate_all = tuple(
+                candidate_all[j] if j == control_index else logged_all[j]
+                for j in range(len(horizons))
+            )
         replay_err = abs(replayed_all[control_index] - logged_all[control_index])
         if replay_err > max_replay_h200_error:
             return result("blocked_model_fidelity", "h200_replay_mismatch",
@@ -300,6 +312,8 @@ def main() -> None:
     parser.add_argument("--scheduler-source", type=Path, required=True)
     parser.add_argument("--candidate-thresholds", type=float, nargs="+",
                         default=[0.60, 0.76])
+    parser.add_argument("--candidate-horizons", nargs="+",
+                        choices=("full", "control_only"), default=["full", "control_only"])
     parser.add_argument("--base-model", type=Path, default=base / "model.pt")
     parser.add_argument("--base-metadata", type=Path, default=base / "metadata_h200.json")
     parser.add_argument("--adapter", type=Path, default=adapter / "history_adapter.pt")
@@ -332,17 +346,21 @@ def main() -> None:
         run = json.loads(path.read_text(encoding="utf-8"))
         predictor = _model_predictor(run, path, runner)
         per_threshold = {}
-        for threshold in args.candidate_thresholds:
-            per_threshold[str(threshold)] = compare_prefix(
-                run, module, predictor, candidate_threshold=threshold
-            )
-            r = per_threshold[str(threshold)]
-            print(json.dumps({
-                "run": path.stem, "threshold": threshold, "status": r["status"],
-                "prefix_steps": r.get("common_prefix_steps"),
-                "first_difference": r.get("first_difference"),
-                "first_pending_plan_change": r.get("first_pending_plan_change"),
-            }, ensure_ascii=False), flush=True)
+        for horizon_variant in args.candidate_horizons:
+            for threshold in args.candidate_thresholds:
+                key = f"{horizon_variant}:{threshold:g}"
+                per_threshold[key] = compare_prefix(
+                    run, module, predictor, candidate_threshold=threshold,
+                    candidate_horizons=horizon_variant,
+                )
+                r = per_threshold[key]
+                print(json.dumps({
+                    "run": path.stem, "variant": horizon_variant,
+                    "threshold": threshold, "status": r["status"],
+                    "prefix_steps": r.get("common_prefix_steps"),
+                    "first_difference": r.get("first_difference"),
+                    "first_pending_plan_change": r.get("first_pending_plan_change"),
+                }, ensure_ascii=False), flush=True)
         report["runs"][path.stem] = per_threshold
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", encoding="utf-8") as stream:

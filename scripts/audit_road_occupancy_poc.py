@@ -27,6 +27,35 @@ from karting_agent.train.geometry_pseudo_labels import extract_road_mask  # noqa
 from karting_agent.train.kart_pose_pseudo_labels import estimate_kart_pose  # noqa: E402
 
 
+def normalize_game_frame(
+    frame: np.ndarray, *, target_size: tuple[int, int] = (360, 800),
+    aspect_tolerance: float = 0.015,
+) -> np.ndarray:
+    """Normalize source pixels before fixed-pixel kart/road quantization.
+
+    Width and height are 360x800 by default, matching the recorded ADB
+    viewport. No crop, mask, geometry or action is inferred here. Fail loudly
+    if the source viewport has a different aspect ratio instead of squeezing
+    game geometry without disclosure.
+    """
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("frame must be HxWx3")
+    width, height = target_size
+    if width < 1 or height < 1 or aspect_tolerance < 0:
+        raise ValueError("invalid canonical frame size/tolerance")
+    source_h, source_w = frame.shape[:2]
+    aspect_error = abs((source_w / source_h) / (width / height) - 1.0)
+    if aspect_error > aspect_tolerance:
+        raise ValueError(
+            f"source aspect ratio {source_w}x{source_h} differs from "
+            f"canonical viewport {width}x{height}"
+        )
+    if (source_w, source_h) == target_size:
+        return frame
+    interpolation = cv2.INTER_AREA if source_w > width else cv2.INTER_LINEAR
+    return cv2.resize(frame, target_size, interpolation=interpolation)
+
+
 def select_kart_local_component(
     mask: np.ndarray, center_xy: tuple[float, float] | None,
     *, radius_px: int = 28, min_seed_pixels: int = 5,
@@ -272,12 +301,15 @@ def inspect_video(video: Path, json_path: Path | None, *,
                   output_root: Path, start: int, end: int | None,
                   stride: int, max_samples: int,
                   road_cfg, kart_cfg, grid_size: int = 32,
-                  touch_roi: tuple[float, float, float, float] | None = None) -> dict:
+                  touch_roi: tuple[float, float, float, float] | None = None,
+                  canonical_size: tuple[int, int] = (360, 800)) -> dict:
     output_dir = output_root / video.stem
     output_dir.mkdir(parents=True, exist_ok=False)
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {video}")
+    source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     timestamps = (
         load_run_timestamps(json_path, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
         if json_path is not None else None
@@ -297,6 +329,7 @@ def inspect_video(video: Path, json_path: Path | None, *,
             if i < start or (i - start) % stride:
                 i += 1
                 continue
+            frame = normalize_game_frame(frame, target_size=canonical_size)
             road = extract_road_mask(frame, road_cfg)
             pose, _ = estimate_kart_pose(frame, kart_cfg)
             xy = (pose.center_x, pose.center_y) if pose else None
@@ -353,8 +386,23 @@ def inspect_video(video: Path, json_path: Path | None, *,
     with (output_dir / "metadata.jsonl").open("x", encoding="utf-8") as stream:
         for r in rows:
             stream.write(json.dumps(r, ensure_ascii=False) + "\n")
+    grid_stack = np.asarray(masks, dtype=np.float32)
+    local_road, local_known = grid_stack[:, 0], grid_stack[:, 1]
+    wide_road, wide_known = grid_stack[:, 2], grid_stack[:, 3]
+    def conditional_road_coverage(road: np.ndarray, known: np.ndarray) -> float:
+        observed = known >= 0.8
+        return float(np.mean(road[observed] >= 0.8)) if observed.any() else 0.0
+
     summary = {
         "video": str(video), "samples": len(rows),
+        "source_video_width_height": [source_width, source_height],
+        "canonical_width_height": list(canonical_size),
+        "road_coverage_among_known_local": conditional_road_coverage(
+            local_road, local_known,
+        ),
+        "road_coverage_among_known_wide": conditional_road_coverage(
+            wide_road, wide_known,
+        ),
         "timestamp_source": rows[0]["timestamp_source"],
         "touch_marker_redaction_roi": list(touch_roi) if touch_roi is not None else None,
         "candidate_valid_rate_unreviewed": sum(
@@ -375,7 +423,8 @@ def inspect_video(video: Path, json_path: Path | None, *,
             "The HSV mask remains unverified. Small enclosed black islands "
             "are marked unknown, not filled as road or confirmed as obstacles. "
             "Background-connected edge occlusions remain unresolved. "
-            "Do not train/control with this candidate before visual validation."
+            "High road coverage among known cells may signal a trivial/all-white "
+            "mask, not valid drivable area. Do not train/control before review."
         ),
     }
     (output_dir / "summary.json").write_text(
@@ -413,14 +462,17 @@ def main():
     parser.add_argument("--geometry-config", type=Path,
                         default=ROOT / "configs/geometry_pseudo_labels.yaml")
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--canonical-width", type=int, default=360)
+    parser.add_argument("--canonical-height", type=int, default=800)
     parser.add_argument("--frame-start", type=int, required=True)
     parser.add_argument("--frame-end", type=int, default=None)
     parser.add_argument("--sample-every-frames", type=int, default=9)
     parser.add_argument("--max-samples", type=int, default=120)
     args = parser.parse_args()
     if (args.frame_start < 0 or args.sample_every_frames < 1 or args.max_samples < 1
+            or args.canonical_width < 1 or args.canonical_height < 1
             or (args.frame_end is not None and args.frame_end < args.frame_start)):
-        parser.error("invalid frame range/sampling")
+        parser.error("invalid frame range/sampling/canonical size")
     road_cfg, _, _ = load_road_config(args.geometry_config)
     kart_cfg, _ = load_kart_configs(args.geometry_config)
     report = inspect_video(
@@ -429,6 +481,7 @@ def main():
         stride=args.sample_every_frames, max_samples=args.max_samples,
         road_cfg=road_cfg, kart_cfg=kart_cfg,
         touch_roi=(tuple(args.touch_roi) if args.touch_roi is not None else None),
+        canonical_size=(args.canonical_width, args.canonical_height),
     )
     print(json.dumps(report, ensure_ascii=False))
 

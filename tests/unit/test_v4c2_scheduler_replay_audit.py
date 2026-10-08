@@ -77,3 +77,31 @@ def test_recorded_timer_policy_replays_logged_callback_order():
     assert report["parity_passed"] is True
     assert report["timer_policy"] == "recorded"
     assert report["replayed_deadlines"] == 1
+
+
+def test_recorded_mode_can_observe_cancellation_after_nominal_due_without_callback():
+    # A frame can acquire the scheduler lock before a late timer callback;
+    # that frame may cancel the pending transition. A nominal-clock simulator
+    # must not invent the unlogged callback in recorded-order parity mode.
+    run = example_run()
+    run["deadline_events"] = []
+    run["steps"][3] = {
+        "observation_timestamp_ms": 180.0,
+        "probabilities": [.001, .001, .001],
+        "action": "HOLD", "pressed": False,
+        "scheduler_reason": "pending_cancelled", "pending_due_ms": 162.5,
+    }
+    run["steps"][4] = {
+        "observation_timestamp_ms": 300.0,
+        "probabilities": [.001, .001, .001],
+        "action": "HOLD", "pressed": False,
+        "scheduler_reason": "hold", "pending_due_ms": None,
+    }
+
+    strict = audit_module.audit(run, scheduler_module, timer_policy="nominal")
+    assert strict["parity_passed"] is False
+    assert strict["first_errors"][0]["kind"] == "unexpected_timer_event"
+
+    recorded = audit_module.audit(run, scheduler_module, timer_policy="recorded")
+    assert recorded["parity_passed"] is True
+    assert recorded["replayed_deadlines"] == 0

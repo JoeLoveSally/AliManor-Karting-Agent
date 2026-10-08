@@ -48,8 +48,17 @@ Run using a local Python environment that has `cv2`, `numpy`, `yaml`:
 
 ```bash
 python scripts/road_segmentation_benchmark.py annotate \
-  --image-dir /home/jianqiao/downloads
+  --image-dir /home/jianqiao/downloads \
+  --display-height 640
 ```
+
+The OpenCV window displays a fixed **288×640** bitmap by default instead
+of repeatedly requesting an **360×800** window from WSLg; all mouse clicks
+are mapped back to original 360×800 pixels before writing the GT mask.
+If it is still taller than your desktop's usable window area, use
+`--display-height 480` (which displays 216×480). Do not drag the
+OpenCV autosize window edges; adjust the option and restart the annotator.
+Existing `*_gt.png` files are preserved and skipped.
 
 Mouse/keyboard: press **R** then left-click vertices around visible drivable
 ROAD. Press **Enter** to complete each polygon. Press **I** for occluded/unclear

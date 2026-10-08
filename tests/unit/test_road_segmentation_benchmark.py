@@ -112,3 +112,35 @@ def test_evaluation_skips_unlabeled_and_explicit_test_split(tmp_path):
         splits=("train","validation"),
     )
     assert result["sample_count"]==0
+
+
+def test_annotation_fixed_bitmap_is_smaller_than_source():
+    assert benchmark.annotation_view_size(360, 800) == (288, 640)
+    assert benchmark.annotation_view_size(360, 800, 720) == (324, 720)
+    assert benchmark.annotation_view_size(360, 800, 1200) == (360, 800)
+
+
+def test_annotation_click_coordinates_remain_in_source_image():
+    convert = benchmark.annotation_source_point
+    assert convert(
+        144, 320, source_width=360, source_height=800,
+        view_width=288, view_height=640,
+    ) == (180, 400)
+    assert convert(
+        287, 639, source_width=360, source_height=800,
+        view_width=288, view_height=640,
+    ) == (358, 798)
+    assert convert(
+        300, -10, source_width=360, source_height=800,
+        view_width=288, view_height=640,
+    ) == (359, 0)
+
+
+def test_annotation_view_rejects_invalid_dimensions():
+    with pytest.raises(ValueError, match="dimensions must be positive"):
+        benchmark.annotation_view_size(360, 800, 0)
+    with pytest.raises(ValueError, match="dimensions must be positive"):
+        benchmark.annotation_source_point(
+            1, 1, source_width=360, source_height=800,
+            view_width=0, view_height=640,
+        )

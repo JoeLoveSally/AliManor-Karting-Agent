@@ -82,7 +82,7 @@ def test_empty_action_list_and_absent_preview_are_explicitly_null():
     )
     assert report["ranked_spikes"][0]["nearest_action"] is None
     assert report["ranked_spikes"][0]["nearest_existing_preview"] is None
-    assert "No segmentation" in report["warning"]
+    assert "No gameplay phase" in report["warning"]
 
 
 def test_events_from_run_preserves_nominal_deadline_provenance():
@@ -109,3 +109,45 @@ def test_nonmonotonic_source_rows_are_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="non-monotonic"):
         subject.load_measurements(path)
+
+
+def test_axial_seam_rate_spike_masked_without_hiding_raw_measurement():
+    first = row(1, 100, valid=True, lateral_rate=None, heading_rate=None)
+    first["road_axis_axial_deg"] = 179.0
+    first["lateral_offset_norm"] = 0.7
+    second = row(2, 150, valid=True, lateral_rate=-28, heading_rate=8)
+    second["road_axis_axial_deg"] = 1.0
+    second["lateral_offset_norm"] = -0.7
+
+    clean, warnings = subject.suppress_axial_seam_rates([first, second])
+    assert len(warnings) == 1
+    assert warnings[0]["road_axis_before_deg"] == 179.0
+    assert warnings[0]["road_axis_after_deg"] == 1.0
+    assert clean[1]["lateral_rate_per_s"] is None
+    assert clean[1]["heading_rate_deg_per_s"] is None
+    assert second["lateral_rate_per_s"] == -28
+
+    report = subject.analyze_timeline([first, second], control_start_ms=100)
+    assert len(report["axis_seam_suspicions"]) == 1
+    assert report["original_rate_statistics"]["valid_rate_pair_coverage"] == 0.5
+    assert report["per_window"][0]["valid_rate_pair_coverage"] == 0.0
+
+
+def test_large_true_axis_rotation_not_marked_as_representation_seam():
+    first = row(1, 100)
+    second = row(2, 150, lateral_rate=6)
+    first["road_axis_axial_deg"] = 125.0
+    second["road_axis_axial_deg"] = 15.0
+    output, flagged = subject.suppress_axial_seam_rates([first, second])
+    assert not flagged
+    assert output[1]["lateral_rate_per_s"] == 6
+
+
+def test_small_axis_change_inside_chart_is_not_masked():
+    first = row(1, 100)
+    second = row(2, 150, lateral_rate=3)
+    first["road_axis_axial_deg"] = 40.0
+    second["road_axis_axial_deg"] = 42.0
+    output, flagged = subject.suppress_axial_seam_rates([first, second])
+    assert not flagged
+    assert output[1]["lateral_rate_per_s"] == 3

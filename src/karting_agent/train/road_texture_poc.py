@@ -70,7 +70,9 @@ def line_geometry_evidence(
         for x1, y1, x2, y2 in found.reshape(-1, 4):
             midpoint = ((int(x1) + int(x2)) * .5, (int(y1) + int(y2)) * .5)
             d = math.hypot(midpoint[0] - xy[0], midpoint[1] - xy[1])
-            if d > vicinity_px:
+            # The kart itself has strong straight edges. Do not learn line
+            # directions from the chassis/wheels immediately at the anchor.
+            if d > vicinity_px or d < 55.0:
                 continue
             length = math.hypot(int(x2) - int(x1), int(y2) - int(y1))
             if length < 16:
@@ -144,7 +146,9 @@ def anchored_soft_candidate(
     close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
     evidence = cv2.morphologyEx(evidence, cv2.MORPH_CLOSE, close)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(evidence, 8)
-    ring = _disk(score.shape, xy, 90.0) & ~_disk(score.shape, xy, 22.0)
+    # Exclude the sprite and its immediate texture halo when seeding road.
+    # A large gap is safer than choosing a bright kart as a "road" component.
+    ring = _disk(score.shape, xy, 135.0) & ~_disk(score.shape, xy, 65.0)
     counts = np.bincount(labels[ring & (labels > 0)], minlength=count)
     if counts.size <= 1:
         return invalid, {"candidate_valid_unreviewed": False,
@@ -191,7 +195,7 @@ def quantify_texture_frame(
 
     unknown = np.zeros((h, w), dtype=np.uint8)
     if kart_xy is not None:
-        unknown[_disk((h, w), kart_xy, 25.0)] = 255
+        unknown[_disk((h, w), kart_xy, 55.0)] = 255
     if redaction_mask is not None:
         # Bleed from filters around action UI is conservatively excluded.
         guard = cv2.dilate(

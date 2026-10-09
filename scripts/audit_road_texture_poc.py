@@ -49,19 +49,21 @@ def prepare_feature_grids(
     observed = np.where(mask > 0, 0, 255).astype(np.uint8)
     grids = []
     for size in (local_size, wide_size):
+        known = None
         for key in ("candidate", "texture", "geometry"):
             image = (np.clip(evidence[key], 0, 1) * 255).astype(np.uint8)
-            _, plane, _ = crop_and_downsample(
+            _, plane, visibility = crop_and_downsample(
                 image, anchor_xy,
                 patch_width=size[0], patch_height=size[1],
                 out_size=grid_size, observed_mask=observed,
             )
             grids.append(plane)
-        _, _, known = crop_and_downsample(
-            observed, anchor_xy,
-            patch_width=size[0], patch_height=size[1],
-            out_size=grid_size,
-        )
+            # Visibility is the third result only when observed_mask is passed.
+            # Reuse it directly for this scale; re-cropping 'observed' without
+            # observed_mask would instead return the all-in-bounds mask.
+            if known is None:
+                known = visibility
+        assert known is not None
         grids.append(known)
     return np.stack(grids).astype(np.float32)
 

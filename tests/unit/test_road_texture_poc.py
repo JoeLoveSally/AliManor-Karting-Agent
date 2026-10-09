@@ -85,7 +85,7 @@ def test_local_texture_seed_is_present_for_checker_track():
 def test_geometry_does_not_require_two_line_families():
     image = np.zeros((400, 240, 3), np.uint8)
     cv2.line(image, (30, 140), (215, 140), (255, 255, 255), 3)
-    geometry, meta = subject.line_geometry_evidence(image, (100., 140.))
+    geometry, meta = subject.line_geometry_evidence(image, (100., 210.))
     assert geometry.shape == image.shape[:2]
     assert 0 <= geometry.min() <= geometry.max() <= 1
     assert meta["line_count_near_kart"] > 0
@@ -145,3 +145,15 @@ def test_invalid_shapes_raise_clear_errors():
             np.zeros((100, 100, 3), np.uint8), (50., 50.),
             redaction_mask=np.ones((20, 20), np.uint8),
         )
+
+
+
+def test_kart_sprite_does_not_count_as_a_road_texture_seed():
+    frame = np.full((800, 360, 3), (130, 180, 210), np.uint8)
+    cv2.rectangle(frame, (155, 375), (205, 425), (15, 35, 200), -1)
+    cv2.rectangle(frame, (168, 385), (192, 415), (190, 235, 255), -1)
+    cv2.circle(frame, (180, 400), 10, (20, 50, 70), -1)
+    maps, report = subject.quantify_texture_frame(frame, (180., 400.))
+    assert not report["candidate_valid_unreviewed"]
+    assert np.count_nonzero(maps["candidate"]) == 0
+    assert np.all(maps["unknown"] == 255)

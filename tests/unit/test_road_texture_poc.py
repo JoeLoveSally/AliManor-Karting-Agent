@@ -157,3 +157,51 @@ def test_kart_sprite_does_not_count_as_a_road_texture_seed():
     assert not report["candidate_valid_unreviewed"]
     assert np.count_nonzero(maps["candidate"]) == 0
     assert np.all(maps["unknown"] == 255)
+
+
+
+def test_known_planes_are_zero_for_a_fully_unknown_frame():
+    height, width = 800, 360
+    evidence = {
+        "candidate": np.zeros((height, width), dtype=np.float32),
+        "texture": np.zeros((height, width), dtype=np.float32),
+        "geometry": np.zeros((height, width), dtype=np.float32),
+        "unknown": np.full((height, width), 255, dtype=np.uint8),
+    }
+    grids = audit.prepare_feature_grids(evidence, (180.0, 400.0))
+    assert grids.shape == (8, 32, 32)
+    assert np.count_nonzero(grids[3]) == 0
+    assert np.count_nonzero(grids[7]) == 0
+
+
+def test_known_planes_track_occlusion_but_not_unrelated_in_bounds():
+    height, width = 800, 360
+    evidence = {
+        "candidate": np.ones((height, width), dtype=np.float32),
+        "texture": np.ones((height, width), dtype=np.float32),
+        "geometry": np.ones((height, width), dtype=np.float32),
+        "unknown": np.zeros((height, width), dtype=np.uint8),
+    }
+    evidence["unknown"][352:448, 132:228] = 255
+    grids = audit.prepare_feature_grids(evidence, (180.0, 400.0))
+    # The occluded center must be unknown for BOTH scales.
+    assert grids[3, 16, 16] == 0.0
+    assert grids[7, 16, 16] == 0.0
+    # A known, in-bounds road region remains observed.
+    assert grids[3, 4, 4] == 1.0
+    assert grids[7, 4, 4] == 1.0
+
+
+def test_out_of_source_region_is_unknown_without_occluders():
+    height, width = 800, 360
+    evidence = {
+        "candidate": np.ones((height, width), dtype=np.float32),
+        "texture": np.zeros((height, width), dtype=np.float32),
+        "geometry": np.zeros((height, width), dtype=np.float32),
+        "unknown": np.zeros((height, width), dtype=np.uint8),
+    }
+    grids = audit.prepare_feature_grids(evidence, (20.0, 20.0))
+    assert grids[3, 0, 0] == 0.0
+    assert grids[7, 0, 0] == 0.0
+    assert grids[3, 16, 16] > .9
+    assert grids[7, 16, 16] > .9

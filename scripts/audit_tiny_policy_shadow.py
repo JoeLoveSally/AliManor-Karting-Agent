@@ -29,6 +29,7 @@ from experiment_tiny_temporal_policy import (  # noqa: E402
 from inspect_geometry_pseudo_labels import load_config as load_road_config  # noqa: E402
 from karting_agent.model.tiny_temporal_policy import TinyTemporalPolicy  # noqa: E402
 from karting_agent.train.heldout_guard import require_frozen_checkpoint  # noqa: E402
+from karting_agent.train.gpu_budget import select_training_device  # noqa: E402
 from karting_agent.train.sequence_evaluator import (  # noqa: E402
     SequencePoint, Transition, ReleaseSegment, evaluate_sequence, combine_evaluations,
 )
@@ -121,6 +122,8 @@ def main():
     parser.add_argument('--checkpoint-dir',type=Path,required=True)
     parser.add_argument('--output-dir',type=Path,required=True)
     parser.add_argument('--simulated-latency-ms',type=float,default=0.0)
+    parser.add_argument('--cuda-memory-fraction',type=float,default=0.03)
+    parser.add_argument('--min-cuda-free-mib',type=int,default=2048)
     parser.add_argument('--cpu-threads',type=int,default=4)
     args=parser.parse_args()
     if args.cpu_threads < 1 or args.simulated_latency_ms < 0:
@@ -166,9 +169,22 @@ def main():
         validate_sample(sample,native[sample.video])
     print(f'Validation-only fixed-video replay: {len(dataset)} samples, '
           f'{len(split.validation)} source videos; no Test/Armed',flush=True)
+    # The saved Validation reference was computed on CUDA. CPU inference
+    # changed one p=0.5 decision (76 vs 78 predicted switches); do NOT use
+    # CPU, silently fall back to it or weaken the frozen parity requirement.
+    # Check limited GPU availability before decoding expensive source videos.
+    device, device_budget = select_training_device(
+        'cuda', cuda_memory_fraction=args.cuda_memory_fraction,
+        min_cuda_free_mib=args.min_cuda_free_mib,
+        allow_cpu_fallback=False,
+    )
+    if device.type != 'cuda':
+        raise RuntimeError('frozen shadow Validation requires CUDA')
+    torch.set_num_threads(args.cpu_threads)
+    print(f'Frozen backend CUDA selected: {device}; budget={json.dumps(device_budget)}',
+          flush=True)
     prep=preprocess_config_from_mapping(config)
     road_cfg,_,_=load_road_config(ROOT/'configs/geometry_pseudo_labels.yaml')
-    torch.set_num_threads(args.cpu_threads)
     frames=cache_required_frames(dataset,preprocess=prep,road_config=road_cfg)
     samples_by_video={video:sorted(
         (s for s in dataset if s.video==video),
@@ -189,6 +205,8 @@ def main():
         'threshold':.5,
         'event_matching_tolerance_ms':100.,
         'simulated_compute_latency_ms':args.simulated_latency_ms,
+        'inference_device':str(device),
+        'device_budget':device_budget,
         'execution_timing':'max(observation+100ms, observation+simulated_latency)',
         'initial_control':'expert state at t=0 only; all future actions simulated',
         'models':{},
@@ -199,7 +217,7 @@ def main():
         model=TinyTemporalPolicy(image_channels=4 if mode=='rgb_hsv' else 3)
         state=torch.load(item['weight_path'],map_location='cpu',weights_only=True)
         model.load_state_dict(state,strict=True)
-        model.eval()
+        model = model.to(device).eval()
         # Reproduce the EXACT DataLoader ordering/batch boundaries used at
         # model selection, across the entire Validation split. Doing teacher
         # inference in one paired expert/self-fed batch of 2 per step does
@@ -209,7 +227,7 @@ def main():
             raise ValueError(f'{mode}: missing trained reference batch size')
         reference_ds = TemporalExpertDataset(dataset,frames,native,mode=mode)
         reference = canonical_teacher_probabilities(
-            model, reference_ds, batch_size=batch_size
+            model, reference_ds, batch_size=batch_size, device=device
         )
         if len(reference) != len(dataset):
             raise ValueError(f'{mode}: incomplete frozen Validation reference')
@@ -227,6 +245,7 @@ def main():
                 expert_events=native[video],expert_features=observed_state_features,
                 latency_ms=args.simulated_latency_ms,
                 teacher_probabilities=reference,
+                device=device,
             )
             evaluations=sequence_reports(replay['rows'],native[video],video)
             for label,score in evaluations.items():
@@ -253,6 +272,7 @@ def main():
               f"simulated-executed F1={summary['simulated_executed']['transition']['all']['f1']:.4f}",
               flush=True)
         del model
+        torch.cuda.empty_cache()
     # All parity checks and all inference finish BEFORE writing any file.
     for mode in MODES:
         for video in split.validation:

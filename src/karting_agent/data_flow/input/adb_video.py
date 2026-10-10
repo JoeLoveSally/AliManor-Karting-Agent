@@ -110,6 +110,16 @@ class AdbVideoInput:
     def started(self) -> bool:
         return self._reader is not None
 
+    def monotonic_now_ms(self) -> float:
+        """Host monotonic milliseconds in the SAME base as Frame.timestamp_ms.
+
+        This measures decode-to-consumption latency only, not Android capture
+        or H.264 encode delay. The stream must have been started by read().
+        """
+        if self._origin is None:
+            raise RuntimeError("ADB video stream has not started")
+        return (time.perf_counter() - self._origin) * 1000.0
+
     @property
     def recording_frame_mapping_valid(self) -> bool:
         if self.record_path is None:

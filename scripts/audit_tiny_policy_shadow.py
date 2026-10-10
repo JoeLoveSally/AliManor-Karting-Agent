@@ -23,7 +23,7 @@ for folder in (ROOT / 'src', ROOT / 'scripts'):
         sys.path.insert(0, str(folder))
 
 from experiment_tiny_temporal_policy import (  # noqa: E402
-    cache_required_frames, label_events, observed_state_features,
+    TemporalExpertDataset, cache_required_frames, label_events, observed_state_features,
     validate_sample,
 )
 from inspect_geometry_pseudo_labels import load_config as load_road_config  # noqa: E402
@@ -33,6 +33,7 @@ from karting_agent.train.sequence_evaluator import (  # noqa: E402
     SequencePoint, Transition, ReleaseSegment, evaluate_sequence, combine_evaluations,
 )
 from karting_agent.train.shadow_replay import replay_fixed_video  # noqa: E402
+from karting_agent.train.shadow_teacher import canonical_teacher_probabilities  # noqa: E402
 from karting_agent.train.state_conditioned_dataset import load_v3_samples  # noqa: E402
 from karting_agent.train.trainer import load_video_split, partition_samples  # noqa: E402
 from karting_agent.train.visual_ablation import make_mode_images  # noqa: E402
@@ -80,7 +81,13 @@ def compare_frozen_validation(reference, combined_teacher, *, mode):
     for direction in ('all','press','release'):
         for key in ('ground_truth','predicted','matched','false_positive','false_negative'):
             if got['transition'][direction][key]!=expected['transition'][direction][key]:
-                raise ValueError(f'{mode}: teacher replay diverged from frozen validation {direction}.{key}')
+                raise ValueError(
+                    f'{mode}: teacher replay diverged from frozen validation '
+                    f'{direction}.{key}: expected={expected["transition"][direction][key]}, '
+                    f'got={got["transition"][direction][key]}; '
+                    'reference now uses original full-Validation batch size. '
+                    'If this persists, investigate CPU-vs-training-GPU numerical differences.'
+                )
     for group in ('short_100_300ms','100_200ms','200_300ms'):
         for key in ('segments','detected'):
             if (got['release_segment_recall'][group][key] !=
@@ -193,6 +200,21 @@ def main():
         state=torch.load(item['weight_path'],map_location='cpu',weights_only=True)
         model.load_state_dict(state,strict=True)
         model.eval()
+        # Reproduce the EXACT DataLoader ordering/batch boundaries used at
+        # model selection, across the entire Validation split. Doing teacher
+        # inference in one paired expert/self-fed batch of 2 per step does
+        # not numerically reproduce the original batch=16 evaluation.
+        batch_size = item['training_metadata'].get('batch_size')
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError(f'{mode}: missing trained reference batch size')
+        reference_ds = TemporalExpertDataset(dataset,frames,native,mode=mode)
+        reference = canonical_teacher_probabilities(
+            model, reference_ds, batch_size=batch_size
+        )
+        if len(reference) != len(dataset):
+            raise ValueError(f'{mode}: incomplete frozen Validation reference')
+        print(f'{mode}: canonical teacher baseline computed over full '
+              f'Validation in unshuffled batches of {batch_size}',flush=True)
         video_data={}
         aggregates={'teacher_forced':[],'self_fed_desired':[],'simulated_executed':[]}
         for video in split.validation:
@@ -204,6 +226,7 @@ def main():
                 model,rows,frames_for_sample=get_images,
                 expert_events=native[video],expert_features=observed_state_features,
                 latency_ms=args.simulated_latency_ms,
+                teacher_probabilities=reference,
             )
             evaluations=sequence_reports(replay['rows'],native[video],video)
             for label,score in evaluations.items():
@@ -219,6 +242,8 @@ def main():
             'checkpoint_sha256':item['checkpoint_sha256'],
             'training_metadata_sha256':item['metadata_sha256'],
             'teacher_validation_parity_verified':True,
+            'canonical_teacher_batch_size':batch_size,
+            'canonical_teacher_order':'full Validation manifest, shuffle=False',
             'aggregate_events':{label:ev.summary() for label,ev in combined.items()},
             'per_video':video_data,
         }

@@ -124,12 +124,14 @@ class TinyLiveShadow:
             self.skipped_history += 1
             return {"kind": "missing_history", "frame_index": frame.frame_index,
                     "observation_ms": t}
+        processing_started = time.perf_counter()
         for chosen in selected:
             if chosen.frame_index not in self.features:
                 img = self.builder(chosen.image)
                 if img.dtype != np.uint8 or img.shape != (4, 96, 96):
                     raise ValueError("training feature builder must return uint8 [4,96,96]")
                 self.features[chosen.frame_index] = img
+        preprocessing_ms = (time.perf_counter() - processing_started) * 1000.0
         timestamps = tuple(x.timestamp_ms for x in selected)
         images = np.stack([self.features[x.frame_index] for x in selected])
         results = {}
@@ -168,10 +170,16 @@ class TinyLiveShadow:
                     "late": proposal.execute_ms > proposal.target_ms + 1e-6,
                     "inference_ms": inference_ms,
                 }
+        total_processing_ms = (time.perf_counter() - processing_started) * 1000.0
+        complete_decode_lag_ms = (max(0.0, float(self.clock_ms()) - t)
+                                  if self.clock_ms is not None else None)
         self.decisions += 1
         return {
             "kind": "prediction", "frame_index": frame.frame_index,
             "observation_ms": t, "decoded_to_read_ms": decode_lag_ms,
+            "decoded_to_completion_ms": complete_decode_lag_ms,
+            "feature_preprocess_ms": preprocessing_ms,
+            "total_dual_model_processing_ms": total_processing_ms,
             "input_indices": [x.frame_index for x in selected],
             "input_timestamp_ms": list(timestamps),
             "models": results,

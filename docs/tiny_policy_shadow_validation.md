@@ -50,8 +50,22 @@ to save any output. Checkpoint metadata is validated for source split,
 training selection and touch masking; model weights are loaded read-only.
 The evaluator always uses threshold `0.5` and tolerance `±100ms`.
 
-This model inference runs on CPU and records **measured CPU wall-clock
-forward time** separately from the `--simulated-latency-ms` value.
+This frozen-model inference now runs on **CUDA:0**, the original Validation
+backend, to reproduce the exact fixed p=0.5 transition counts. CPU and
+CUDA differ at just one near-threshold sample (5933.333ms of video 173545):
+CPU p=0.4999734, CUDA p=0.5002075, producing 76 versus 78
+predicted transitions. The read-only CPU/CUDA diagnostic verified the
+CUDA event counts **exactly** match the stored frozen Validation.
+
+A strict CUDA preflight happens before video decoding. PyTorch's
+`--cuda-memory-fraction 0.03` is an allocator cap, **not a GPU memory
+reservation**; keep vLLM running and fail fast if CUDA cannot be initialized.
+There is no CPU fallback, because CPU replay breaks the strict
+reference-validation check. No Test video is used.
+
+Inference records **measured synchronized CUDA wall-clock forward time**
+(including input transfer and output transfer/synchronization), separately
+from the `--simulated-latency-ms` value.
 The default simulated latency is 0ms (idealized), NOT a claim of zero
 inference cost. A later latency experiment can use measured deployment
 latency, but per-frame CPU benchmark time is not a substitute for
@@ -102,6 +116,8 @@ python scripts/audit_tiny_policy_shadow.py \
   --checkpoint-dir /tmp/tiny_policy_export \
   --output-dir /tmp/tiny_policy_export \
   --simulated-latency-ms 0 \
+  --cuda-memory-fraction 0.03 \
+  --min-cuda-free-mib 2048 \
   --cpu-threads 4
 ```
 
@@ -222,3 +238,29 @@ The previous failed attempt did not create results, so it should not require
 deleting any original artifact. If a new parity exception persists, share
 the **expected/got values** before running any other experiment.
 
+
+## CUDA parity correction after the second replay failure
+
+The second Spark replay with the original Validation batch=16 reported
+`rgb all.predicted expected=78, got=76` when run on CPU. A separate
+read-only CPU-vs-CUDA diagnostic on exactly 2,528 Validation samples
+confirmed GPU=78 predicted, CPU=76; matching/FP/FN on CUDA agreed with
+the frozen report. The only binary-disagreeing sample was near p=0.5.
+
+The revised Shadow runner therefore uses `select_training_device('cuda',
+..., allow_cpu_fallback=False)` **before decoding**, then moves each
+model to CUDA and passes the device to both
+`canonical_teacher_probabilities` (full original batch size) and
+`replay_fixed_video` (causal self-fed batch=1).
+
+To synchronize the fix in WSL:
+```bash
+rspark \
+  ./src/karting_agent/train/shadow_replay.py \
+  ./scripts/audit_tiny_policy_shadow.py \
+  ./tests/unit/test_shadow_cuda_backend.py
+```
+The existing `shadow_teacher.py` with optional device support must
+already be synced from the previous commit. If uncertain, transfer it too.
+Run Spark tests including `tests/unit/test_shadow_cuda_backend.py`
+before the full replay. No original checkpoints are overwritten.

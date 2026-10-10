@@ -30,6 +30,7 @@ for folder in (ROOT / "src", ROOT / "scripts"):
 from inspect_geometry_pseudo_labels import load_config as load_road_config  # noqa: E402
 from audit_road_occupancy_poc import normalize_game_frame  # noqa: E402
 from karting_agent.model.tiny_temporal_policy import TinyTemporalPolicy  # noqa: E402
+from karting_agent.train.gpu_budget import select_training_device  # noqa: E402
 from karting_agent.train.geometry_pseudo_labels import extract_road_mask  # noqa: E402
 from karting_agent.train.labels.touch_marker import ActionEvent  # noqa: E402
 from karting_agent.train.sequence_evaluator import (  # noqa: E402
@@ -328,15 +329,24 @@ def main():
     ap.add_argument("--modes", nargs="+", choices=("rgb","rgb_hsv"),
                     default=("rgb","rgb_hsv"))
     ap.add_argument("--epochs", type=int, default=8)
-    ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--device", choices=("cpu","cuda"), default=None)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--device", choices=("cpu","cuda","auto"), default="auto")
+    ap.add_argument("--cuda-memory-fraction", type=float, default=0.03,
+                    help="maximum fraction of GPU memory for PyTorch caching allocator")
+    ap.add_argument("--min-cuda-free-mib", type=int, default=2048,
+                    help="skip CUDA when nvidia-smi reports less available memory")
+    ap.add_argument("--allow-cpu-fallback", action="store_true",
+                    help="allow explicit --device cuda to fall back to CPU if busy")
+    ap.add_argument("--cpu-threads", type=int, default=4)
     ap.add_argument("--smoke", action="store_true",
                     help="short functional test; metrics NOT comparative")
     ap.add_argument("--preflight-only", action="store_true",
                     help="validate sources, split, causal labels and outputs; no decoding/GPU")
     args = ap.parse_args()
-    if args.epochs < 1 or args.batch_size < 1:
-        ap.error("epochs and batch-size must be >=1")
+    if args.epochs < 1 or args.batch_size < 1 or args.cpu_threads < 1:
+        ap.error("epochs, batch-size and cpu-threads must be >=1")
+    if not 0.0 < args.cuda_memory_fraction <= 1.0 or args.min_cuda_free_mib < 0:
+        ap.error("invalid CUDA budget")
     if len(set(args.modes)) != len(args.modes):
         ap.error("duplicate modes")
     if not args.output_dir.is_dir():
@@ -382,9 +392,16 @@ def main():
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    # Establish a CUDA budget/context BEFORE decoding 13 expert videos.
+    # The CUDA caching allocator limit is not a guarantee of free GPU memory.
+    device, device_budget = select_training_device(
+        args.device, cuda_memory_fraction=args.cuda_memory_fraction,
+        min_cuda_free_mib=args.min_cuda_free_mib,
+        allow_cpu_fallback=args.allow_cpu_fallback,
+    )
+    if device.type == "cpu":
+        torch.set_num_threads(args.cpu_threads)
+    print(f"training device={device}; budget={json.dumps(device_budget)}", flush=True)
     cache = cache_required_frames(
         selected, preprocess=preprocess, road_config=road_cfg
     )
@@ -393,7 +410,33 @@ def main():
         # Equal initial seeds and the same cached RGB for a paired comparison.
         torch.manual_seed(42)
         channels = 3 if mode=="rgb" else 4
-        model = TinyTemporalPolicy(image_channels=channels).to(device)
+        model = TinyTemporalPolicy(image_channels=channels)
+        try:
+            model = model.to(device)
+        except RuntimeError as exc:
+            # Co-resident vLLM may allocate more memory after the early check.
+            # Only allocation failures can trigger opt-in CPU fallback.
+            oom = any(token in str(exc).lower() for token in (
+                "out of memory", "cudaerrormemoryallocation",
+                "cuda_error_out_of_memory",
+            ))
+            if (device.type != "cuda" or not oom or
+                    not (args.device == "auto" or args.allow_cpu_fallback)):
+                raise
+            print(f"CUDA became unavailable after decoding ({exc}); "
+                  "continuing this experiment on CPU.", flush=True)
+            del model
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
+            device = torch.device("cpu")
+            device_budget = {
+                **device_budget, "reason": "cuda_model_allocation_failed_cpu_fallback",
+            }
+            torch.set_num_threads(args.cpu_threads)
+            torch.manual_seed(42)
+            model = TinyTemporalPolicy(image_channels=channels).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=0.001, weight_decay=0.0001
         )
@@ -446,6 +489,10 @@ def main():
             "model":"tiny_cnn_gru", "mode":mode,
             "model_not_deployable":True, "expert_teacher_forced":True,
             "smoke_unrepresentative":args.smoke,
+            "training_device":str(device),
+            "device_budget":dict(device_budget),
+            "batch_size":args.batch_size,
+            "cpu_threads_if_cpu":args.cpu_threads,
             "split":split.name, "train_videos":list(split.train),
             "validation_videos":list(split.validation),
             "test_videos_not_evaluated":list(split.test),

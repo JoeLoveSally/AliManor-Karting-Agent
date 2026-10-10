@@ -30,7 +30,7 @@ def test_no_armed_or_android_touch_path_is_imported_or_exposed():
     assert "--x" not in parser_flags
     assert "--y" not in parser_flags
     assert "AdbExecutor(" not in source
-    assert "motionevent" not in source
+    assert "client.run(\"shell\", \"input\"" not in source
 
 
 def test_existing_h264_decoder_and_frozen_preprocessor_reused():

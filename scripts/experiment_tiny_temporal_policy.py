@@ -244,14 +244,16 @@ def points_from_predictions(samples, probabilities, *, persistence=False):
     )
     if not paired:
         raise ValueError("empty prediction sequence")
+    video = paired[0][0].video
+    # Validate the video identity before timestamps: multiple videos may
+    # legitimately share the same time values, but must be evaluated separately.
+    if any(sample.video != video for sample, _ in paired):
+        raise ValueError("mixed video predictions")
     if any(
         left[0].target_timestamp_ms >= right[0].target_timestamp_ms
-        for left,right in zip(paired, paired[1:])
+        for left, right in zip(paired, paired[1:])
     ):
         raise ValueError("duplicate or unordered target timestamps")
-    video = paired[0][0].video
-    if any(sample.video != video for sample,_ in paired):
-        raise ValueError("mixed video predictions")
     return [
         SequencePoint(
             video, float(sample.target_timestamp_ms),

@@ -24,6 +24,7 @@ def replay_fixed_video(
     expert_features: Callable,
     latency_ms: float = 0.0,
     teacher_probabilities: Mapping[tuple[str, float], float] | None = None,
+    device: torch.device | str = 'cpu',
 ) -> dict:
     """Collect paired frozen-policy predictions with no future control leakage.
 
@@ -41,6 +42,7 @@ def replay_fixed_video(
     video = ordered[0].video
     if any(row.video != video for row in ordered):
         raise ValueError("one video per replay, no cross-video state carryover")
+    device = torch.device(device)
     controller = ShadowController(initial_pressed=bool(expert_events[0].pressed),
                                   horizon_ms=100.0, latency_ms=latency_ms)
     model.eval()
@@ -77,9 +79,11 @@ def replay_fixed_video(
                 inputs = torch.from_numpy(images[None])
                 controls = torch.from_numpy(feedback[None])
             start = perf_counter()
-            logits = model(inputs,controls)
-            inference_ms.append(1000.0*(perf_counter()-start))
+            logits = model(inputs.to(device), controls.to(device))
+            # CUDA kernels are asynchronous: transferring output to CPU waits
+            # for completion, so timing must end AFTER this synchronization.
             probabilities = torch.sigmoid(logits).detach().cpu().numpy()
+            inference_ms.append(1000.0*(perf_counter()-start))
             required = (2,) if teacher_probabilities is None else (1,)
             if probabilities.shape != required or not np.all(np.isfinite(probabilities)):
                 raise ValueError("invalid model probability outputs")

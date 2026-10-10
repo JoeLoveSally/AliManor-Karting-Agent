@@ -339,8 +339,9 @@ def main():
         ap.error("duplicate modes")
     if not args.output_dir.is_dir():
         ap.error(f"--output-dir must already exist: {args.output_dir}")
+    prefix = "tiny_policy_smoke_" if args.smoke else "tiny_policy_"
     for mode in args.modes:
-        for name in (f"tiny_policy_{mode}.pt", f"tiny_policy_{mode}.json"):
+        for name in (f"{prefix}{mode}.pt", f"{prefix}{mode}.json"):
             if (args.output_dir/name).exists():
                 ap.error(f"refusing to overwrite: {args.output_dir/name}")
 
@@ -454,8 +455,8 @@ def main():
             "history":history,
             "validation_sequence":sequence,
         }
-        torch.save(best_state,args.output_dir/f"tiny_policy_{mode}.pt")
-        (args.output_dir/f"tiny_policy_{mode}.json").write_text(
+        torch.save(best_state,args.output_dir/f"{prefix}{mode}.pt")
+        (args.output_dir/f"{prefix}{mode}.json").write_text(
             json.dumps(result,ensure_ascii=False,indent=2)+"\n",
             encoding="utf-8",
         )

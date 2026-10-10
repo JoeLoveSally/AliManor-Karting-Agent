@@ -235,6 +235,32 @@ def run_epoch(model, loader, device, optimizer=None):
     return {"bce": loss_sum/count, "accuracy": correct/count, "samples": count}
 
 
+def points_from_predictions(samples, probabilities, *, persistence=False):
+    """Timestamp predictions at the *future target*, not the input time."""
+    if len(samples) != len(probabilities):
+        raise ValueError("prediction/sample count mismatch")
+    paired = sorted(
+        zip(samples, probabilities), key=lambda row: row[0].target_timestamp_ms
+    )
+    if not paired:
+        raise ValueError("empty prediction sequence")
+    if any(
+        left[0].target_timestamp_ms >= right[0].target_timestamp_ms
+        for left,right in zip(paired, paired[1:])
+    ):
+        raise ValueError("duplicate or unordered target timestamps")
+    video = paired[0][0].video
+    if any(sample.video != video for sample,_ in paired):
+        raise ValueError("mixed video predictions")
+    return [
+        SequencePoint(
+            video, float(sample.target_timestamp_ms),
+            float(sample.current_pressed) if persistence else float(probability),
+        )
+        for sample, probability in paired
+    ]
+
+
 def evaluate_sequences(model, dataset, *, batch_size: int, device,
                        event_map, split_videos) -> dict:
     model.eval()
@@ -268,13 +294,12 @@ def evaluate_sequences(model, dataset, *, batch_size: int, device,
         ]
         # Predictions represent action at t+100ms, so sequence points
         # MUST use the target timestamp, NOT the observation timestamp.
-        prediction_points = [
-            SequencePoint(video, s.target_timestamp_ms, p) for s,p in rows
-        ]
-        persistence_points = [
-            SequencePoint(video, s.target_timestamp_ms, float(s.current_pressed))
-            for s,_ in rows
-        ]
+        prediction_points = points_from_predictions(
+            [s for s,_ in rows], [p for _,p in rows],
+        )
+        persistence_points = points_from_predictions(
+            [s for s,_ in rows], [p for _,p in rows], persistence=True,
+        )
         evaluations.append(evaluate_sequence(
             prediction_points, transitions, releases,
             threshold=0.5, tolerance_ms=100.0,
@@ -305,6 +330,8 @@ def main():
     ap.add_argument("--device", choices=("cpu","cuda"), default=None)
     ap.add_argument("--smoke", action="store_true",
                     help="short functional test; metrics NOT comparative")
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="validate sources, split, causal labels and outputs; no decoding/GPU")
     args = ap.parse_args()
     if args.epochs < 1 or args.batch_size < 1:
         ap.error("epochs and batch-size must be >=1")
@@ -345,6 +372,9 @@ def main():
     print(f"preflight: train={len(partitions['train'])}, "
           f"val={len(partitions['validation'])}, videos={len(videos)}, "
           f"smoke={args.smoke}", flush=True)
+    if args.preflight_only:
+        print("Preflight passed: source labels, horizon and action history are consistent.")
+        return
 
     random.seed(42)
     np.random.seed(42)

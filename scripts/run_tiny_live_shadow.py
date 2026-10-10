@@ -7,6 +7,7 @@ input motionevent, training, checkpoint writes, or Test-set evaluation.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -114,6 +115,7 @@ def main():
         ap.error("refusing to overwrite an existing shadow run")
     started = time.perf_counter()
     errors, rows, shadow = None, 0, None
+    metrics = defaultdict(list)
     try:
         if args.video is None:
             adb = AdbClient(AdbConfig(serial=args.serial))
@@ -140,6 +142,16 @@ def main():
                 if record is not None:
                     stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                     rows += 1
+                    if record["kind"] == "prediction":
+                        for key in ("decoded_to_read_ms", "decoded_to_completion_ms",
+                                    "feature_preprocess_ms", "total_dual_model_processing_ms"):
+                            if record[key] is not None:
+                                metrics[key].append(record[key])
+                        for name in ("rgb", "rgb_hsv"):
+                            metrics[name + "_inference_ms"].append(
+                                record["models"][name]["inference_ms"])
+                            metrics[name + "_late"].append(
+                                int(record["models"][name]["late"]))
                     if record["kind"] == "prediction" and shadow.decisions % 30 == 0:
                         values = record["models"]
                         print(f"t={record['observation_ms']:.0f}ms "
@@ -171,6 +183,12 @@ def main():
                 "no_touch_or_armed": True,
                 "capture_timestamps": "host decoded BGR time, not Android capture/encode time",
                 "summary": shadow.summary(),
+                "live_timing": {
+                    key: {"p50": float(np.percentile(values, 50)),
+                          "p95": float(np.percentile(values, 95)),
+                          "max": float(np.max(values))}
+                    for key, values in metrics.items() if values
+                },
             }
             if isinstance(source, AdbVideoInput):
                 output["capture"] = {

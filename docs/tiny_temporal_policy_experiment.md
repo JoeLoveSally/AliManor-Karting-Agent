@@ -97,8 +97,27 @@ all pass. Smoke trains on only 128 train + 64 validation samples, saving
 **After successful smoke, Spark full experiment:**
 
     python scripts/experiment_tiny_temporal_policy.py \
-      --epochs 8 --batch-size 64 --device cuda \
+      --epochs 8 --batch-size 16 --device auto \
+      --cuda-memory-fraction 0.03 --min-cuda-free-mib 2048 \
+      --cpu-threads 4 \
       --output-dir /tmp/tiny_policy_export
+
+A co-resident vLLM-Omni process may leave insufficient CUDA memory even to
+create a new GPU context (the prior experiment failed on model.to(device),
+before its first batch). Device selection NOW happens before expert video
+decoding. Auto mode examines nvidia-smi without initializing CUDA; if fewer
+than 2048 MiB are free, CUDA is unavailable, or context setup fails, it
+falls back to CPU automatically. The actual device and budget reason are
+printed at startup and saved in each result JSON.
+
+--cuda-memory-fraction 0.03 limits PyTorch's caching allocator to 3% of
+the GPU-reported total memory; it does NOT reserve GPU space, prevent
+vLLM allocations, or cap all CUDA-driver overhead. On DGX Spark this can
+also compete with vLLM for unified CPU/GPU memory. Reduce batch size further
+if CUDA runs out of memory while training. Selecting --device cpu avoids
+allocating tensors on GPU entirely but still uses host/unified system RAM.
+Use --device cuda for a strict GPU-only attempt (fail fast if unavailable)
+or combine with --allow-cpu-fallback.
 
 This saves `tiny_policy_rgb.pt/json` and
 `tiny_policy_rgb_hsv.pt/json`. Feature frames are cached transiently in

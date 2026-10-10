@@ -12,7 +12,8 @@ import torch
 from torch.utils.data import DataLoader
 
 
-def canonical_teacher_probabilities(model, dataset, *, batch_size: int) -> dict[tuple[str, float], float]:
+def canonical_teacher_probabilities(model, dataset, *, batch_size: int,
+                                    device: str | torch.device = 'cpu') -> dict[tuple[str, float], float]:
     """Return p(PRESS at t+100ms) keyed by video and future target time."""
     if batch_size < 1 or not getattr(dataset, "samples", None):
         raise ValueError("invalid teacher dataset or reference batch size")
@@ -22,7 +23,7 @@ def canonical_teacher_probabilities(model, dataset, *, batch_size: int) -> dict[
                         shuffle=False, num_workers=0)
     with torch.inference_mode():
         for images, controls, _target in loader:
-            probs = torch.sigmoid(model(images, controls)).cpu().tolist()
+            probs = torch.sigmoid(model(images.to(device), controls.to(device))).cpu().tolist()
             if not isinstance(probs, list):
                 raise ValueError("teacher model must produce one logit per sample")
             predictions.extend(float(p) for p in probs)

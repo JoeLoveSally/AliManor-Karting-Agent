@@ -148,3 +148,56 @@ force the segmentation feature into the next model.
 If no variant recovers action-event timing, inspect whether the
 absolute-future-action target is sufficient before introducing a first-event
 hazard head. Do not tune scheduler/pending timer or try Armed yet.
+
+
+## Third experiment: controlled action-history-only ablation
+
+After completing the RGB and RGB+HSV validation experiments, run the
+**same CNN32+GRU64 architecture with constant-zero RGB frames** (the
+`action_only` mode). Observed expert PRESS state, time since last action
+transition, frame delta, sample targets, weights, split, optimizer, seed,
+epochs, BCE checkpoint selection, threshold and sequence evaluator are
+unchanged.
+
+Unlike the Persistence baseline, this control model can learn temporal
+patterns in the executed action history. It tests whether the high
+Transition F1 can be explained without ANY scene observations. It does
+not prove vision is sufficient for stable feedback control if visual
+models do better.
+
+The one-mode command bypasses video/HSV decoding entirely:
+
+    cd /home/grg/Workspace/AliManor-Karting-Agent
+    python -m pytest -q \
+      tests/unit/test_visual_ablation.py \
+      tests/unit/test_tiny_temporal_policy_experiment.py
+    python scripts/experiment_tiny_temporal_policy.py \
+      --modes action_only --epochs 8 --batch-size 16 \
+      --device auto --cuda-memory-fraction 0.03 \
+      --min-cuda-free-mib 2048 --cpu-threads 4 \
+      --output-dir /tmp/tiny_policy_export
+
+Only `tiny_policy_action_only.pt` and
+`tiny_policy_action_only.json` are added; RGB and RGB+HSV checkpoints
+are neither loaded nor overwritten.
+
+When comparing models, **use exactly the same validation videos, horizon,
+threshold and tolerance**. Preserve the two held-out test videos until
+the comparison question is resolved. The constant-image baseline is a
+matched-architecture ablation (not a smaller GRU-only network), so its
+parameters and optimizer remain comparable to RGB.
+
+## Current preliminary validation and interpretation
+
+In the initial eight-epoch runs, RGB and RGB+HSV achieved Transition
+F1 0.9067 and 0.9079 on 72 native-FPS expert transition events, with
+10/12 100-300ms short RELEASEs detected by both. HSV lowered BCE
+but did not meaningfully improve event F1. These are **teacher-forced
+expert-trajectory results**, not closed-loop driving scores.
+
+Action persistence gave F1 about 0.0417 largely because the copy-state
+prediction is delayed by the 100ms horizon, at the ±100ms matching
+boundary. The low Persistence score alone cannot show the benefit of
+images. Compare `action_only` before claiming that the RGB model
+has learned useful road geometry.
+

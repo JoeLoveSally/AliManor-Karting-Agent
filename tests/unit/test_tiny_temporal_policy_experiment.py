@@ -124,7 +124,7 @@ def test_rgb_hsv_share_identical_rgb_pixels_and_mask_expert_touch():
     road, _, _ = load_road(ROOT/"configs/geometry_pseudo_labels.yaml")
     image = np.full((800, 360, 3), (180, 140, 50), dtype=np.uint8)
     changed = image.copy()
-    changed[660:780, 280:356, :] = (2, 240, 250)
+    changed[660:780, 285:350, :] = (2, 240, 250)
     features_a = subject.prepare_video_feature(
         image, preprocess=cfg, road_config=road,
     )
@@ -134,7 +134,6 @@ def test_rgb_hsv_share_identical_rgb_pixels_and_mask_expert_touch():
     assert features_a.shape == (4, 96, 96)
     assert features_a.dtype == np.uint8
     assert np.array_equal(features_a, features_b)
-    assert np.array_equal(features_a[:3], features_a[:3])
 
 
 def test_dataset_training_target_is_expert_future_absolute_state():

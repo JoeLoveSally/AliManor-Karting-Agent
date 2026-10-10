@@ -30,6 +30,7 @@ for folder in (ROOT / "src", ROOT / "scripts"):
 from inspect_geometry_pseudo_labels import load_config as load_road_config  # noqa: E402
 from audit_road_occupancy_poc import normalize_game_frame  # noqa: E402
 from karting_agent.model.tiny_temporal_policy import TinyTemporalPolicy  # noqa: E402
+from karting_agent.train.visual_ablation import make_mode_images  # noqa: E402
 from karting_agent.train.gpu_budget import select_training_device  # noqa: E402
 from karting_agent.train.geometry_pseudo_labels import extract_road_mask  # noqa: E402
 from karting_agent.train.labels.touch_marker import ActionEvent  # noqa: E402
@@ -175,8 +176,8 @@ def cache_required_frames(samples, *, preprocess, road_config) -> dict[str, dict
 class TemporalExpertDataset(Dataset):
     def __init__(self, samples, features, event_map,
                  *, mode: str, horizon_ms: float = HORIZON_MS) -> None:
-        if mode not in ("rgb", "rgb_hsv"):
-            raise ValueError("mode must be rgb or rgb_hsv")
+        if mode not in ("rgb", "rgb_hsv", "action_only"):
+            raise ValueError("mode must be rgb, rgb_hsv or action_only")
         self.samples = list(samples)
         self.mode = mode
         self.features = features
@@ -196,11 +197,12 @@ class TemporalExpertDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        channels = 3 if self.mode == "rgb" else 4
-        images = np.stack([
-            self.features[sample.video][int(i)][:channels]
-            for i in sample.input_frame_indices
-        ], axis=0).astype(np.float32) / 255.0
+        images = make_mode_images(
+            sample.input_frame_indices,
+            self.features.get(sample.video),
+            mode=self.mode,
+            frame_size=SIZE,
+        )
         return (
             torch.from_numpy(images),
             torch.from_numpy(self.controls[index]),
@@ -326,7 +328,7 @@ def main():
     ap.add_argument("--labels-dir", type=Path,
                     default=ROOT/"data/processed/v3/labels")
     ap.add_argument("--output-dir", type=Path, required=True)
-    ap.add_argument("--modes", nargs="+", choices=("rgb","rgb_hsv"),
+    ap.add_argument("--modes", nargs="+", choices=("rgb","rgb_hsv","action_only"),
                     default=("rgb","rgb_hsv"))
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=16)
@@ -402,14 +404,22 @@ def main():
     if device.type == "cpu":
         torch.set_num_threads(args.cpu_threads)
     print(f"training device={device}; budget={json.dumps(device_budget)}", flush=True)
-    cache = cache_required_frames(
-        selected, preprocess=preprocess, road_config=road_cfg
+    # A pure action-only run must not decode video, compute HSV, or allocate
+    # an image cache. Existing RGB checkpoints can be compared unchanged.
+    needs_images = any(mode != "action_only" for mode in args.modes)
+    cache = (
+        cache_required_frames(
+            selected, preprocess=preprocess, road_config=road_cfg
+        )
+        if needs_images else {}
     )
+    if not needs_images:
+        print("Action-only ablation: video decoding bypassed", flush=True)
     reports = []
     for mode in args.modes:
         # Equal initial seeds and the same cached RGB for a paired comparison.
         torch.manual_seed(42)
-        channels = 3 if mode=="rgb" else 4
+        channels = 4 if mode == "rgb_hsv" else 3
         model = TinyTemporalPolicy(image_channels=channels)
         try:
             model = model.to(device)
@@ -487,6 +497,8 @@ def main():
         )
         result = {
             "model":"tiny_cnn_gru", "mode":mode,
+            "visual_ablation":mode == "action_only",
+            "image_channels_are_constant_zero":mode == "action_only",
             "model_not_deployable":True, "expert_teacher_forced":True,
             "smoke_unrepresentative":args.smoke,
             "training_device":str(device),
@@ -497,7 +509,11 @@ def main():
             "validation_videos":list(split.validation),
             "test_videos_not_evaluated":list(split.test),
             "target":"expert_PRESS_at_t_plus_100ms",
-            "input":"five frames with prior/executed action-state features",
+            "input":(
+                "five frames with prior/executed action-state features"
+                if mode != "action_only"
+                else "constant zero visual frames plus causal expert action-state features"
+            ),
             "visual_size":[SIZE,SIZE],
             "touch_masking":True,
             "selection":"lowest validation BCE at fixed 0.5 threshold",

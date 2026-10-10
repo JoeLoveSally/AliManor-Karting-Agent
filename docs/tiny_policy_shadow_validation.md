@@ -163,3 +163,62 @@ CPU batched forward/replay smoke. The six corresponding GitHub source
 and test files were verified to have the *same Git blob hashes* as the
 locally tested copies. Spark validation video end-to-end has not
 been executed here.
+
+## Frozen Validation parity fix (2026-10-10)
+
+The first Spark replay passed its **20 tests** and decoded both Validation
+videos, but stopped at `rgb: teacher replay diverged from frozen validation
+all.predicted`. **No result CSV or JSON was saved**. The original experiment
+evaluated the complete Validation DataLoader in unshuffled batches of **16**,
+whereas the initial shadow replay ran expert/self-fed pairs in batches of
+**2** per observation. Different inference batching can introduce numerical
+differences near the threshold (the original training validation also used
+CUDA, while shadow uses CPU). The specific magnitude of the first Spark
+mismatch has not yet been established.
+
+The correction:
+- `shadow_teacher.py` now recomputes the frozen teacher reference from
+  the **entire Validation dataset in original manifest order**, using the
+  original batch size read from each model's training report, retaining
+  batch boundaries even across the two videos.
+- This teacher prediction is mapped to `(video, target_timestamp_ms)`.
+  The causal self-fed shadow path performs single-sample inference and
+  never substitutes its own control inputs into the reference.
+- `compare_frozen_validation` is **still strict** for every PRESS/RELEASE
+  event count and short-release recall: it does not change threshold,
+  tolerance, predictions or checkpoints. If the original
+  CUDA-vs-CPU numerical difference still crosses the threshold, the
+  error now prints both expected and actual event counts. **Do not**
+  force a metric match by adjusting thresholds.
+- Two additional CPU test files cover canonical batch boundaries and
+  prove a deliberately batch-sensitive model cannot contaminate the
+  teacher reference.
+
+For WSL to sync the fix, after `git pull --ff-only` add these files to
+the existing `rspark` transfer:
+
+```bash
+rspark \
+  ./src/karting_agent/train/shadow_teacher.py \
+  ./src/karting_agent/train/shadow_replay.py \
+  ./scripts/audit_tiny_policy_shadow.py \
+  ./tests/unit/test_shadow_teacher.py \
+  ./tests/unit/test_shadow_teacher_replay.py
+```
+
+On Spark run the earlier 20 tests **plus** the new teacher tests:
+
+```bash
+python -m pytest -q \
+  tests/unit/test_shadow_control.py \
+  tests/unit/test_shadow_replay.py \
+  tests/unit/test_shadow_cli.py \
+  tests/unit/test_shadow_teacher.py \
+  tests/unit/test_shadow_teacher_replay.py
+```
+
+Then rerun the same `python scripts/audit_tiny_policy_shadow.py` command.
+The previous failed attempt did not create results, so it should not require
+deleting any original artifact. If a new parity exception persists, share
+the **expected/got values** before running any other experiment.
+

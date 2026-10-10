@@ -178,3 +178,22 @@ def test_source_dataset_reserves_test_video_split():
     assert len(split.validation) == 2
     assert len(split.test) == 2
     assert set(split.validation).isdisjoint(split.train)
+
+
+def test_action_only_expert_dataset_has_no_visual_cache_dependency():
+    from karting_agent.train.visual_ablation import make_mode_images
+
+    video = "data/raw/synthetic.mp4"
+    samples = [sample()]
+    expert = {video: actions()}
+    # The action-only ablation must train without decoding source video frames.
+    control = subject.TemporalExpertDataset(
+        samples, {}, expert, mode="action_only",
+    )
+    images, historical_state, target = control[0]
+    assert images.shape == (5, 3, 96, 96)
+    assert torch.count_nonzero(images).item() == 0
+    assert historical_state.shape == (5, 3)
+    assert historical_state[-1, 0].item() == 1.0
+    assert target.item() == 0.0
+    assert make_mode_images([0], None, mode="action_only").sum() == 0

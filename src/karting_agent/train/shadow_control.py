@@ -90,14 +90,16 @@ class ShadowController:
         return result
 
     def propose(self, *, observe_ms: float, target_ms: float,
-                probability: float) -> Proposal:
+                probability: float, ready_ms: float | None = None) -> Proposal:
         if (not math.isfinite(observe_ms) or
                 abs(observe_ms - self.now_ms) > 1e-4 or
                 not math.isfinite(target_ms) or
                 abs(target_ms - observe_ms - self.horizon_ms) > 1e-3 or
                 not math.isfinite(probability) or not 0.0 <= probability <= 1.0):
             raise ValueError("invalid, premature or inconsistent proposal")
-        ready = observe_ms + self.latency_ms
+        ready = observe_ms + self.latency_ms if ready_ms is None else float(ready_ms)
+        if not math.isfinite(ready) or ready < observe_ms - 1e-6:
+            raise ValueError("invalid actual inference-ready timestamp")
         due = max(target_ms, ready)
         proposal = Proposal(observe_ms, target_ms, ready, due,
                             bool(probability >= self.threshold), float(probability))

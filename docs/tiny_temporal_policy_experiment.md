@@ -201,3 +201,62 @@ boundary. The low Persistence score alone cannot show the benefit of
 images. Compare `action_only` before claiming that the RGB model
 has learned useful road geometry.
 
+
+## Frozen held-out Test (run once after validation ablation)
+
+Validation evidence after the action-only ablation:
+
+| Mode | Validation Transition F1 | Matched / 72 | Short RELEASE |
+| --- | ---: | ---: | ---: |
+| Action-only | 0.0417 | 3 | 0/12 |
+| RGB | 0.9067 | 68 | 10/12 |
+| RGB+HSV | 0.9079 | 69 | 10/12 |
+
+This supports a meaningful visual contribution under expert teacher-forced
+conditions, without proving closed-loop control. We now freeze the models and
+**do not select an epoch, tune a threshold or alter the model after Test**.
+
+The independent evaluator reads the existing **three** `tiny_policy_*.pt`
+weights plus their corresponding `tiny_policy_*.json` training reports. It
+rejects smoke checkpoints, a different video split, unmasked touch inputs and
+checkpoint metadata suggesting the Test videos were used earlier. These are
+provenance sanity checks, not cryptographic evidence of a clean history.
+The checkpoint weights are only loaded, never modified. Test videos are
+read from the original V4-C2 config and no train/validation video is decoded.
+
+**WSL repository -> Spark (existing rspark helper):**
+
+    cd /home/jianqiao/workspace/AliManor-Karting-Agent-v4c2-history
+    git pull --ff-only origin exp/v4c2-action-history-residual
+    rspark \
+      ./src/karting_agent/train/heldout_guard.py \
+      ./scripts/evaluate_tiny_temporal_policy.py \
+      ./tests/unit/test_heldout_tiny_policy.py
+
+**Spark, test before running (CPU does not need vLLM GPU memory):**
+
+    cd /home/grg/Workspace/AliManor-Karting-Agent
+    python -m pytest -q \
+      tests/unit/test_heldout_tiny_policy.py \
+      tests/unit/test_visual_ablation.py \
+      tests/unit/test_tiny_temporal_policy_experiment.py
+
+    set -o pipefail
+    python scripts/evaluate_tiny_temporal_policy.py \
+      --checkpoint-dir /tmp/tiny_policy_export \
+      --output-dir /tmp/tiny_policy_export \
+      --device cpu --batch-size 16 --cpu-threads 4 \
+      2>&1 | tee /tmp/tiny_policy_heldout_test.log
+
+The one-shot result is `tiny_policy_heldout_test.json` with per-video and
+aggregate Accuracy/BCE, Transition P/R/F1, direction-specific timing, short
+100–300ms RELEASE recall, action persistence, device metadata and SHA-256 of
+each frozen checkpoint. The script refuses to overwrite this result. If a
+Test result is disappointing, **do not tune using Test**; investigate the
+protocol or collect new independent test videos for future iterations.
+
+**WSL transfer into existing downloads directory (no new output folder):**
+
+    rsync -av \
+      grg@10.1.48.26:/tmp/tiny_policy_export/ \
+      /home/jianqiao/downloads/

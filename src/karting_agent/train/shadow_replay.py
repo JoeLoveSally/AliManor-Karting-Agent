@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from time import perf_counter
-from typing import Callable
+from typing import Callable, Mapping
 
 import numpy as np
 import torch
@@ -23,11 +23,14 @@ def replay_fixed_video(
     expert_events: tuple,
     expert_features: Callable,
     latency_ms: float = 0.0,
+    teacher_probabilities: Mapping[tuple[str, float], float] | None = None,
 ) -> dict:
     """Collect paired frozen-policy predictions with no future control leakage.
 
     samples must be ordered at ~30 Hz; visual frames are the same expert video
     for both paths. Future targets are only used for labelling after inference.
+    Optional teacher_probabilities come from the full-validation original
+    DataLoader with its original batch size, not from per-frame paired batches.
     Inference does NOT execute game controls; scheduling is simulated.
     """
     if not samples or not expert_events:
@@ -55,20 +58,38 @@ def replay_fixed_video(
             previous_observation = observation
             controller.advance_to(observation)
             feedback = controller.control_features(stamps)
-            oracle_features = expert_features(stamps, expert_events)
-            # Same pixels for both inputs: only historical executed actions vary.
+            # Same pixels for both paths: only past *executed* control varies.
             images = np.asarray(frames_for_sample(sample),dtype=np.float32)
             if images.ndim != 4 or images.shape[0] != len(stamps):
                 raise ValueError("visual feature shape mismatch")
-            inputs = torch.from_numpy(np.stack([images,images]))
-            controls = torch.from_numpy(np.stack([oracle_features,feedback]))
+            if teacher_probabilities is None:
+                oracle_features = expert_features(stamps, expert_events)
+                inputs = torch.from_numpy(np.stack([images,images]))
+                controls = torch.from_numpy(np.stack([oracle_features,feedback]))
+            else:
+                # Full Validation teacher reference was precomputed with
+                # the ORIGINAL unshuffled batch=16 DataLoader (possibly
+                # spanning video boundaries). Running a paired batch=2 here
+                # changes numerical kernels and can flip threshold crossings.
+                key = (video, target)
+                if key not in teacher_probabilities:
+                    raise ValueError(f"missing canonical teacher sample: {key}")
+                inputs = torch.from_numpy(images[None])
+                controls = torch.from_numpy(feedback[None])
             start = perf_counter()
             logits = model(inputs,controls)
             inference_ms.append(1000.0*(perf_counter()-start))
             probabilities = torch.sigmoid(logits).detach().cpu().numpy()
-            if probabilities.shape != (2,) or not np.all(np.isfinite(probabilities)):
+            required = (2,) if teacher_probabilities is None else (1,)
+            if probabilities.shape != required or not np.all(np.isfinite(probabilities)):
                 raise ValueError("invalid model probability outputs")
-            expert_probability, shadow_probability = map(float,probabilities)
+            if teacher_probabilities is None:
+                expert_probability, shadow_probability = map(float,probabilities)
+            else:
+                expert_probability = float(teacher_probabilities[(video,target)])
+                shadow_probability = float(probabilities[0])
+                if not 0.0 <= expert_probability <= 1.0 or not math.isfinite(expert_probability):
+                    raise ValueError("invalid canonical teacher probability")
             proposal = controller.propose(observe_ms=observation,target_ms=target,
                                            probability=shadow_probability)
             rows.append({

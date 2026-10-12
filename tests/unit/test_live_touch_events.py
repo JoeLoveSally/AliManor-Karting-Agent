@@ -88,3 +88,54 @@ def test_frame_index_mapping_uses_real_host_timestamps():
     assert [r["host_decoded_perf_counter_ms"] for r in rows] == [101800.0, 101816.1, 101836.7]
     with pytest.raises(ValueError, match="strictly increase"):
         list(decoded_frame_rows([0.0, 0.0], 1))
+
+
+def test_getevent_single_device_output_requires_explicit_device_context():
+    # Actual vivo_ts /dev/input/event6 output, without a device prefix.
+    line = "[  268465.539282] EV_ABS       ABS_MT_TRACKING_ID   0000a559"
+    assert parse_kernel_event(line) is None
+    result = parse_kernel_event(line, default_device="/dev/input/event6")
+    assert result is not None
+    assert result.device == "/dev/input/event6"
+    assert result.code == "ABS_MT_TRACKING_ID"
+    assert result.device_timestamp_ms == pytest.approx(268465539.282)
+
+    prefixed = "[  268465.539282] /dev/input/event9: EV_ABS ABS_MT_TRACKING_ID 0000a559"
+    result = parse_kernel_event(prefixed, default_device="/dev/input/event6")
+    assert result is not None and result.device == "/dev/input/event9"
+
+
+def test_real_vivo_short_and_long_touch_trace_not_split():
+    # Abridged genuine vivo_ts -lt output: four 58-67ms taps plus 1.38s hold.
+    base = 268465.0
+    spans = [
+        (268465.539282, 268465.596803),
+        (268465.655552, 268465.722747),
+        (268466.343360, 268466.401708),
+        (268466.468821, 268466.527600),
+        (268467.232311, 268468.608807),
+    ]
+    parser = TouchTransitionParser()
+    changes = []
+    for start, end in spans:
+        for stamp, value in ((start, "0000a559"), (end, "ffffffff")):
+            for code, field in (
+                ("EV_ABS", f"ABS_MT_TRACKING_ID   {value}"),
+                ("EV_SYN", "SYN_REPORT           00000000"),
+            ):
+                line = f"[  {stamp:.6f}] {code} {field}"
+                parsed = parse_kernel_event(
+                    line, default_device="/dev/input/event6"
+                )
+                assert parsed is not None
+                state = parser.ingest(parsed)
+                if state is not None:
+                    changes.append((parsed.device_timestamp_ms, state))
+    assert len(changes) == 10
+    assert [state for _, state in changes] == [True, False] * 5
+    actual_ms = [
+        changes[i+1][0] - changes[i][0] for i in range(0, 10, 2)
+    ]
+    assert actual_ms == pytest.approx(
+        [57.521, 67.195, 58.348, 58.779, 1376.496], abs=0.002,
+    )

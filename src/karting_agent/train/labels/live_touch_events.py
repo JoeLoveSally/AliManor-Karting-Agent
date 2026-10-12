@@ -20,7 +20,9 @@ from karting_agent.data_flow.adb import AdbClient
 
 
 _EVENT = re.compile(
-    r"^\[\s*(\d+(?:\.\d+)?)\]\s+(/dev/input/event\d+):\s+"
+    # Explicit 'getevent -lt /dev/input/eventN' omits the device prefix.
+    # 'getevent -lt' across multiple devices retains it.
+    r"^\[\s*(\d+(?:\.\d+)?)\]\s+(?:(/dev/input/event\d+):\s+)?"
     r"(EV_[A-Z]+)\s+([A-Z0-9_]+)\s+([0-9a-fA-F]+|DOWN|UP)\b"
 )
 _DEVICE = re.compile(r"(?m)^add device \d+: (/dev/input/event\d+)\s*$")
@@ -53,11 +55,21 @@ class KernelEvent:
     value: str
 
 
-def parse_kernel_event(line: str) -> KernelEvent | None:
+def parse_kernel_event(
+    line: str, *, default_device: str | None = None,
+) -> KernelEvent | None:
+    """Decode getevent -lt with or without the explicit event-device prefix.
+
+    Never infer the device for an unprefixed line unless the caller supplied
+    the device used to start the single-device getevent process.
+    """
     match = _EVENT.match(line.strip())
     if not match:
         return None
-    timestamp, device, kind, code, value = match.groups()
+    timestamp, reported_device, kind, code, value = match.groups()
+    device = reported_device or default_device
+    if device is None:
+        return None
     return KernelEvent(float(timestamp) * 1000.0, device, kind, code, value)
 
 
@@ -163,7 +175,10 @@ class LiveTouchRecorder:
             with self.path.open("x", encoding="utf-8") as out:
                 for line in self._process.stdout:
                     received_ms = time.perf_counter() * 1000.0
-                    event = parse_kernel_event(line.decode("utf-8", errors="replace"))
+                    event = parse_kernel_event(
+                        line.decode("utf-8", errors="replace"),
+                        default_device=self.device,
+                    )
                     if event is None or event.device != self.device:
                         continue
                     out.write(json.dumps({
@@ -213,6 +228,12 @@ class LiveTouchRecorder:
         return {
             "path": str(self.path), "device": self.device,
             "kernel_events": self.events, "transitions": self.transitions,
+            "event_stream_status": (
+                "error" if self.error else
+                "no_recognized_events" if self.events == 0 else
+                "events_without_transitions" if self.transitions == 0 else
+                "transitions_recorded"
+            ),
             "recording_error": self.error,
             "timing_note": "kernel device clock vs host stdout arrival clock; not yet video-aligned",
         }

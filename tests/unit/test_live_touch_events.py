@@ -107,7 +107,6 @@ def test_getevent_single_device_output_requires_explicit_device_context():
 
 def test_real_vivo_short_and_long_touch_trace_not_split():
     # Abridged genuine vivo_ts -lt output: four 58-67ms taps plus 1.38s hold.
-    base = 268465.0
     spans = [
         (268465.539282, 268465.596803),
         (268465.655552, 268465.722747),

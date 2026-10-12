@@ -34,7 +34,7 @@ def test_full_probability_yields_coherent_causal_hold_without_changing_dt():
     assert torch.equal(original[:, :, 2], out[:, :, 2])
     assert torch.equal(original[:, :, 0], history()[:, :, 0])
     for row in out:
-        assert torch.all(row[:, 1:, 0] == row[:, :-1, 0])
+        assert torch.all(row[1:, 0] == row[:-1, 0])
         assert torch.all(row[1:, 1] >= row[:-1, 1])
         assert torch.all((row[:, 1] >= 0) & (row[:, 1] <= 1))
         assert torch.all((row[:, 0] == 0) | (row[:, 0] == 1))

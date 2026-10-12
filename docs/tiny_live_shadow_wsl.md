@@ -297,3 +297,40 @@ These shifts are sensitivity tests; changing evaluation timestamps does not
 rerun teacher-forced model inference with changed action histories.
 Do NOT use these metrics as proof of absolute input latency or train on the
 gray-circle marker labels without additional validation.
+
+## Training-only causal action-history robustness experiment
+
+The frozen RGB and RGB+HSV Shadow checkpoints are left untouched.
+The existing Tiny CNN+GRU training script now accepts the optional
+`--history-corruption-prob` argument, defaulting to **0** (old behavior).
+When enabled, each selected *training* sample receives a coherent
+constant-held PRESS/RELEASE history with a causal switch-age trajectory.
+The visual input, frame deltas, target labels, source samples, sampler,
+optimizer, validation histories, architecture, and split are unchanged.
+
+For a controlled RGB experiment, use **separate empty directories**,
+and keep the original frozen weights intact:
+
+```bash
+mkdir -p /home/jianqiao/downloads/ahr_p25
+python scripts/experiment_tiny_temporal_policy.py \
+  --output-dir /home/jianqiao/downloads/ahr_p25 \
+  --modes rgb --epochs 8 --batch-size 16 --cpu-threads 4 \
+  --device cpu --history-corruption-prob 0.25
+```
+
+For a stronger perturbation use another directory and probability 0.50.
+Model files stay `tiny_policy_rgb.pt` and `tiny_policy_rgb.json` inside
+their **own** directories; the original `/home/jianqiao/downloads`
+checkpoints are not touched. Only the video-held-out validation split
+selects the best checkpoint by clean BCE; test videos are not used.
+
+**Warning:** validation teacher forcing is not deployment performance. This
+augmentation supplies counterfactual feedback, not true closed-loop trajectories;
+it may reduce all visual performance if the action history is informative.
+The historical training touch-circle labels might still be biased long, and
+this experiment does not correct their timestamps. The existing
+`evaluate_tiny_live_recording.py` strictly checks checkpoint hashes against
+the recorded Shadow models and intentionally rejects new candidate checkpoints.
+Do not bypass this guard; a separate counterfactual replay/evaluation is required
+before claiming improved RELEASE behavior.

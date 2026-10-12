@@ -34,6 +34,9 @@ from karting_agent.train.visual_ablation import make_mode_images  # noqa: E402
 from karting_agent.train.gpu_budget import select_training_device  # noqa: E402
 from karting_agent.train.geometry_pseudo_labels import extract_road_mask  # noqa: E402
 from karting_agent.train.labels.touch_marker import ActionEvent  # noqa: E402
+from karting_agent.train.history_robustness import (  # noqa: E402
+    HistoryCorruptor, HistoryCorruptionConfig,
+)
 from karting_agent.train.sequence_evaluator import (  # noqa: E402
     SequencePoint, Transition, ReleaseSegment, combine_evaluations,
     evaluate_sequence,
@@ -210,8 +213,10 @@ class TemporalExpertDataset(Dataset):
         )
 
 
-def run_epoch(model, loader, device, optimizer=None):
+def run_epoch(model, loader, device, optimizer=None, *, history_corruptor=None):
     training = optimizer is not None
+    if not training and history_corruptor is not None:
+        raise ValueError("history corruption must never affect validation")
     model.train(training)
     loss_sum = 0.0
     count = 0
@@ -219,6 +224,10 @@ def run_epoch(model, loader, device, optimizer=None):
     context = torch.enable_grad() if training else torch.inference_mode()
     with context:
         for images, control, target in loader:
+            if history_corruptor is not None:
+                # CPU-side generator is deterministic across device placement.
+                # Never replace images, future labels, or the validation data.
+                control = history_corruptor(control)
             images,control,target = (
                 images.to(device), control.to(device), target.to(device)
             )
@@ -340,11 +349,16 @@ def main():
     ap.add_argument("--allow-cpu-fallback", action="store_true",
                     help="allow explicit --device cuda to fall back to CPU if busy")
     ap.add_argument("--cpu-threads", type=int, default=4)
+    ap.add_argument("--history-corruption-prob", type=float, default=0.0,
+                    help="Training-only causal held-state replacement probability; "
+                         "0 preserves original baseline behavior")
     ap.add_argument("--smoke", action="store_true",
                     help="short functional test; metrics NOT comparative")
     ap.add_argument("--preflight-only", action="store_true",
                     help="validate sources, split, causal labels and outputs; no decoding/GPU")
     args = ap.parse_args()
+    if not 0.0 <= args.history_corruption_prob <= 1.0:
+        ap.error("history-corruption-prob must be in [0,1]")
     if args.epochs < 1 or args.batch_size < 1 or args.cpu_threads < 1:
         ap.error("epochs, batch-size and cpu-threads must be >=1")
     if not 0.0 < args.cuda_memory_fraction <= 1.0 or args.min_cuda_free_mib < 0:
@@ -416,6 +430,8 @@ def main():
     if not needs_images:
         print("Action-only ablation: video decoding bypassed", flush=True)
     reports = []
+    robustness = HistoryCorruptionConfig(probability=args.history_corruption_prob)
+    robustness.validate()
     for mode in args.modes:
         # Equal initial seeds and the same cached RGB for a paired comparison.
         torch.manual_seed(42)
@@ -450,6 +466,10 @@ def main():
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=0.001, weight_decay=0.0001
         )
+        corruption = (
+            HistoryCorruptor(robustness, seed=9242)
+            if robustness.probability > 0 else None
+        )
         train_ds = TemporalExpertDataset(
             partitions["train"],cache,events,mode=mode
         )
@@ -473,7 +493,10 @@ def main():
         best_state = None
         history = []
         for epoch in range(1, 2 if args.smoke else args.epochs+1):
-            train = run_epoch(model,train_loader,device,optimizer)
+            train = run_epoch(
+                model, train_loader, device, optimizer,
+                history_corruptor=corruption,
+            )
             validation = run_epoch(model,val_loader,device)
             history.append({"epoch":epoch,"train":train,"validation":validation})
             print(f"{mode} epoch={epoch} train_bce={train['bce']:.4f} "
@@ -516,6 +539,16 @@ def main():
             ),
             "visual_size":[SIZE,SIZE],
             "touch_masking":True,
+            "history_robustness": {
+                "method": "training_only_causal_constant_hold_replacement",
+                "probability": robustness.probability,
+                "seed": 9242 if corruption is not None else None,
+                "input_channels_perturbed": [0, 1],
+                "time_delta_preserved": True,
+                "expert_future_targets_unchanged": True,
+                "validation_history_untouched": True,
+                "independent_counterfactual_input_not_true_closed_loop": True,
+            },
             "selection":"lowest validation BCE at fixed 0.5 threshold",
             "history":history,
             "validation_sequence":sequence,
@@ -528,6 +561,7 @@ def main():
         reports.append(result)
         print(json.dumps({
             "mode":mode, "best_val_bce":best_loss,
+            "history_corruption_prob": robustness.probability,
             "transition_f1":sequence["candidate"]["transition"]["all"]["f1"],
             "persistence_transition_f1":sequence["persistence"]["transition"]["all"]["f1"],
             "short_release_recall":sequence["candidate"]["release_segment_recall"]["short_100_300ms"]["recall"],

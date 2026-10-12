@@ -29,7 +29,7 @@ def test_recording_reuses_same_stream_and_has_no_second_encoder():
     assert "record_path=recording_path" in SOURCE
     assert "args.output_dir / f\"{name}.mp4\" if args.record_debug else None" in SOURCE
     assert "if any(path.exists() for path in (log_path, summary_path, recording_path)" in SOURCE
-    assert "screenrecord" not in SOURCE.split("source = AdbVideoInput(", 1)[1]
+    assert SOURCE.count("source = AdbVideoInput(") == 1
     assert '"format": "fragmented_mp4_h264_stream_copy"' in SOURCE
 
 

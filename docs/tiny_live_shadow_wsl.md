@@ -112,13 +112,50 @@ The MP4 must be present in the local WSL clone, otherwise skip this step.
 
 ## Live-only, read-only run
 
+For an **entire manually driven race** rather than the original 20-second
+Home-screen performance smoke, use a longer cap and explicit debug MP4
+recording. Start capture on the pre-race screen (before the countdown),
+then drive normally and press Ctrl+C **once** when the result screen
+appears. Wait for the printed `Shadow records` and `Summary` paths,
+because FFmpeg needs time to finalize its fragmented MP4.
+
 ```bash
 python scripts/run_tiny_live_shadow.py \
   --checkpoint-dir /home/jianqiao/downloads \
   --output-dir /home/jianqiao/downloads \
-  --duration 20 \
-  --cpu-threads 4
+  --duration 180 \
+  --cpu-threads 4 \
+  --record-debug
 ```
+
+`--duration 180` is a **safety maximum** of 180 seconds, not a
+requirement to keep recording after the finish. If a full race lasts
+longer, raise the cap within the supported 3600s limit before starting.
+`--record-debug` is accepted only in live ADB mode; MP4 offline
+replay has no additional recording. The script cannot know when the
+Android race starts or finishes, so it is important to start before
+countdown and end on the results screen.
+
+Three files with the exact same UTC timestamp stem are created flat
+under `/home/jianqiao/downloads`:
+
+- `tiny_live_shadow_<utc>.mp4`: stream-copy of the already decoded ADB
+  H.264 source, including the pre-race countdown and finished screen.
+- `tiny_live_shadow_<utc>.jsonl`: model samples at ~30Hz, with
+  `frame_index` pointing to the matching input decoder frame.
+- `tiny_live_shadow_<utc>_summary.json`: inference/capture statistics,
+  recording finalization error and whether the decoder-to-MP4
+  frame-index mapping appears valid.
+
+**Sync limitation:** the MP4 uses synthetic 60fps H.264 time stamps
+to keep the raw screenrecord stream playable. The JSONL's monotonic
+host timestamps are independent. Align by decoded frame *index*,
+provided `recording.frame_mapping_valid` is true; do not align by
+equating MP4 seconds to JSONL `observation_ms` seconds. Inspect
+`recording_error` and playback/ffprobe after capture—internal metadata
+alone cannot guarantee MP4 decodes properly. Sending just JSONL/summary
+is insufficient for visual decision analysis.
+
 
 No `--arm`, no click coordinates, no `AdbExecutor`.
 Optionally pass `--serial DEVICE_ID` to select the USB device.
@@ -127,14 +164,10 @@ open for human viewing if the device supports both encoders simultaneously.
 If concurrent use causes device-side screenrecord errors, stop scrcpy
 temporarily to isolate the capture source, rather than rewriting the model.
 
-Every execution uses a unique UTC-based flat filename and exclusive
-file creation in existing `/home/jianqiao/downloads`:
-- `tiny_live_shadow_<utc>.jsonl`: every 30Hz prediction or skipped tick,
-  frame timestamps, RGB/HSV probability, virtual scheduled event time,
-  and per-stage timing.
-- `tiny_live_shadow_<utc>_summary.json`: model SHA-256, frame counts,
-  decoder drop count, decode FPS interval P95, and P50/P95/MAX for
-  decode-to-read, preprocessing, model forwards, and full CPU cycle.
+Outputs retain their common UTC name and exclusive file creation. Model
+probabilities, virtual scheduled events, source frame indices and processing
+times are in JSONL; SHA-256, dropped frames and timing P50/P95/MAX are in
+the summary. The optional MP4 shares that UTC stem.
 
 Interpret `decoded_to_read_ms` as **host-only** stream backlog, not the
 full capture-to-model latency. The virtual controls are not human actions;

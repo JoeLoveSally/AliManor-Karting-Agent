@@ -261,3 +261,39 @@ reference shift is **uncalibrated**. Inspect `shift_sensitivity` and optionally
 specify `--touch-shift-ms` for what-if analyses. Never interpret signed
 transition lag or event F1 as calibrated end-to-end latency, and do not apply
 a hard-coded action timing compensation on the basis of this single race.
+
+## RELEASE timing and overlay diagnostics
+
+On an already-recorded complete race, use:
+
+
+```bash
+python -m pytest -q tests/unit/test_diagnose_release_timing.py
+
+python scripts/diagnose_release_timing.py \
+  --run-stem /home/jianqiao/downloads/tiny_live_shadow_20261012T041903848106Z \
+  --offline-predictions /home/jianqiao/downloads/tiny_live_shadow_20261012T041903848106Z_offline_eval_predictions.jsonl \
+  --output-dir /home/jianqiao/downloads \
+  --race-start-ms 5000 --race-end-ms 56800
+
+```
+
+Creates *_release_timing_diagnostics.json. This is entirely offline,
+does not load checkpoints, does not access ADB, and never changes original files.
+
+The script detects the gray Android touch-circle in the recorded MP4, pairs
+only long isolated physical holds with observed visual overlay episodes,
+and reports separate press-appearance, release-disappearance and hold-duration
+differences using the *host-received event clock*. Results are diagnostic
+observations of two different pipelines, NOT calibrated physical input latency.
+The visual detector is a heuristic for the 360x800 race; visually audit on
+other themes and devices before using its statistics.
+
+It also reports per-kernel-event host-vs-device clock offset variation
+(only the arrival excess relative to the fastest sample has a useful magnitude;
+the base offset includes unknown transport delay) and conditional future-100ms
+PRESS / RELEASE accuracy at reference shifts of -150 through +150ms.
+These shifts are sensitivity tests; changing evaluation timestamps does not
+rerun teacher-forced model inference with changed action histories.
+Do NOT use these metrics as proof of absolute input latency or train on the
+gray-circle marker labels without additional validation.

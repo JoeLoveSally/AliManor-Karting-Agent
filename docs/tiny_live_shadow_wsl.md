@@ -216,11 +216,11 @@ overlay can be retained as an independent calibration signal.
 
 ## Offline paired-race assessment (read-only)
 
-After recording a complete race with \`--record-debug --record-touch-events\`,
-use \`scripts/evaluate_tiny_live_recording.py\`. The run stem is the common
+After recording a complete race with `--record-debug --record-touch-events`,
+use `scripts/evaluate_tiny_live_recording.py`. The run stem is the common
 path prefix of the five paired MP4/JSONL/Summary files.
 
-\`\`\`bash
+```bash
 python -m pytest -q tests/unit/test_evaluate_tiny_live_recording.py
 
 python scripts/evaluate_tiny_live_recording.py \
@@ -229,35 +229,35 @@ python scripts/evaluate_tiny_live_recording.py \
   --output-dir /home/jianqiao/downloads \
   --race-start-ms 5000 --race-end-ms 56800 \
   --batch-size 48 --cpu-threads 4
-\`\`\`
+```
 
-Remove \`--checkpoint-dir\` for a fast stored-log diagnosis without re-running
+Remove `--checkpoint-dir` for a fast stored-log diagnosis without re-running
 the frozen models. The script never accesses ADB and never writes game control.
 
 Checkpoint replay compares:
 1. RGB / RGB+HSV models with expert kernel-touch history vs recorded virtual
    history, each kept causal at every selected frame;
 2. the *frozen training* touch mask vs expanded
-   \`[0.68, 0.76, 1.0, 1.0]\` mask, on **identical recorded source frames**;
+   `[0.68, 0.76, 1.0, 1.0]` mask, on **identical recorded source frames**;
 3. PRESS and RELEASE events, state accuracy at observation+100ms, and
    kernel-clock hold duration differences.
 
-Outputs: \`*_offline_eval_summary.json\` and, when replay is enabled,
-\`*_offline_eval_predictions.jsonl\`. Files are not overwritten.
+Outputs: `*_offline_eval_summary.json` and, when replay is enabled,
+`*_offline_eval_predictions.jsonl`. Files are not overwritten.
 
 **Interpretation safeguards:** input video uses synthetic container FPS; frame
-indices and \`*_frames.jsonl\` are authoritative. A frame-count check alone
+indices and `*_frames.jsonl` are authoritative. A frame-count check alone
 does not prove decoded frame content matches the original live pixels. The
 recorded-virtual/original-mask re-evaluation must reproduce live probabilities:
-see \`recorded_live_probability_replay_parity\`, and do not interpret ablations
-if its \`passes_0p03_p95\` is false. The FFmpeg code 255 on Ctrl+C is retained as
+see `recorded_live_probability_replay_parity`, and do not interpret ablations
+if its `passes_0p03_p95` is false. The FFmpeg code 255 on Ctrl+C is retained as
 a warning. Changes to the touch mask are OOD perturbations, not causal proof
 of label leakage. Expert state persistence is an oracle-input reference, not
 a deployable policy.
 
-The getevent \`host_received_perf_counter_ms\` and decoder availability time
+The getevent `host_received_perf_counter_ms` and decoder availability time
 share a host clock but have distinct/unknown upstream delays. The default
-reference shift is **uncalibrated**. Inspect \`shift_sensitivity\` and optionally
-specify \`--touch-shift-ms\` for what-if analyses. Never interpret signed
+reference shift is **uncalibrated**. Inspect `shift_sensitivity` and optionally
+specify `--touch-shift-ms` for what-if analyses. Never interpret signed
 transition lag or event F1 as calibrated end-to-end latency, and do not apply
 a hard-coded action timing compensation on the basis of this single race.

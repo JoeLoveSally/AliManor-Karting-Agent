@@ -66,3 +66,10 @@ def test_live_metrics_track_both_models_and_full_preprocessing():
         assert key in runner
         assert key in runtime
     assert "rgb_hsv" in runtime and "rgb" in runtime
+
+
+def test_read_only_kernel_touch_capture_is_opt_in():
+    source = RUNNER.read_text(encoding="utf-8")
+    assert '"--record-touch-events"' in source
+    assert 'LiveTouchRecorder(' in source
+    assert '"--arm"' not in source

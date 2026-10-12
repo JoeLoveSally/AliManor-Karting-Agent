@@ -121,6 +121,13 @@ class AdbVideoInput:
         return (time.perf_counter() - self._origin) * 1000.0
 
     @property
+    def origin_perf_counter_ms(self) -> float:
+        """Host perf_counter() origin used for every decoded Frame timestamp."""
+        if self._origin is None:
+            raise RuntimeError("ADB video stream has not started")
+        return self._origin * 1000.0
+
+    @property
     def recording_frame_mapping_valid(self) -> bool:
         if self.record_path is None:
             return False

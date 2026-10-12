@@ -32,6 +32,9 @@ from karting_agent.data_flow.input.video import VideoInput  # noqa: E402
 from karting_agent.model.tiny_temporal_policy import TinyTemporalPolicy  # noqa: E402
 from karting_agent.runtime.tiny_live_shadow import TinyLiveShadow, LiveShadowConfig  # noqa: E402
 from karting_agent.train.heldout_guard import require_frozen_checkpoint  # noqa: E402
+from karting_agent.train.labels.live_touch_events import (  # noqa: E402
+    LiveTouchRecorder, choose_touch_device, decoded_frame_rows,
+)
 from karting_agent.train.trainer import load_video_split  # noqa: E402
 from karting_agent.vision.preprocess import preprocess_config_from_mapping  # noqa: E402
 
@@ -81,6 +84,10 @@ def main():
     ap.add_argument("--serial", type=str, default=None)
     ap.add_argument("--record-debug", action="store_true",
                     help="Save the SAME live ADB H.264 stream as a paired MP4; no second encoder")
+    ap.add_argument("--record-touch-events", action="store_true",
+                    help="Passive Android getevent diagnostics; requires --record-debug")
+    ap.add_argument("--touch-device", type=str, default=None,
+                    help="Explicit /dev/input/eventN; autodetect only when unambiguous")
     ap.add_argument("--video", type=Path, default=None,
                     help="Offline MP4 smoke; omit for live read-only ADB")
     args = ap.parse_args()
@@ -90,6 +97,10 @@ def main():
         ap.error("output-dir and checkpoint-dir must already exist")
     if args.record_debug and args.video is not None:
         ap.error("--record-debug is available only for live ADB video input")
+    if args.record_touch_events and (args.video is not None or not args.record_debug):
+        ap.error("--record-touch-events requires live ADB and --record-debug")
+    if args.touch_device is not None and not args.record_touch_events:
+        ap.error("--touch-device requires --record-touch-events")
     torch.set_num_threads(args.cpu_threads)
     raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     if (not raw["preprocess"]["mask_touch_area"] or
@@ -116,11 +127,17 @@ def main():
     log_path = args.output_dir / f"{name}.jsonl"
     summary_path = args.output_dir / f"{name}_summary.json"
     recording_path = args.output_dir / f"{name}.mp4" if args.record_debug else None
-    if any(path.exists() for path in (log_path, summary_path, recording_path)
+    frame_times_path = args.output_dir / f"{name}_frames.jsonl" if args.record_debug else None
+    touch_log_path = args.output_dir / f"{name}_touch.jsonl" if args.record_touch_events else None
+    if any(path.exists() for path in (
+        log_path, summary_path, recording_path, frame_times_path, touch_log_path,
+    )
            if path is not None):
         ap.error("refusing to overwrite an existing shadow run")
     started = time.perf_counter()
     errors, rows, shadow = None, 0, None
+    touch_recorder = None
+    frame_times_written = False
     metrics = defaultdict(list)
     try:
         if args.video is None:
@@ -132,6 +149,16 @@ def main():
                 record_path=recording_path)
             clock = source.monotonic_now_ms
             mode = "adb_screenrecord_read_only"
+            if args.record_touch_events:
+                device = args.touch_device
+                if device is None:
+                    listing = adb.run("shell", "getevent", "-lp").decode(
+                        "utf-8", errors="replace"
+                    )
+                    device = choose_touch_device(listing)
+                touch_recorder = LiveTouchRecorder(adb, touch_log_path, device=device)
+                touch_recorder.start()
+                print(f"Passive touch events: {device} -> {touch_log_path}", flush=True)
         else:
             source = VideoInput(args.video)
             clock = None
@@ -175,8 +202,20 @@ def main():
         errors = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        if touch_recorder is not None:
+            touch_recorder.close()
         if source is not None:
             source.close()
+        if isinstance(source, AdbVideoInput) and frame_times_path is not None and source.started:
+            # Frame-index sidecar records real host decoder availability,
+            # not the synthetic 60fps MP4 container time base.
+            with frame_times_path.open("x", encoding="utf-8") as out:
+                for row in decoded_frame_rows(
+                    source.decoded_frame_timestamps_ms, source.origin_perf_counter_ms
+                ):
+                    out.write(json.dumps(row) + "\n")
+            frame_times_written = True
+            print(f"Decoder frame timestamps: {frame_times_path}", flush=True)
         if shadow is not None:
             output = {
                 "kind": "tiny_live_shadow_read_only",
@@ -191,6 +230,7 @@ def main():
                 "virtual_not_human_control": True,
                 "no_touch_or_armed": True,
                 "capture_timestamps": "host decoded BGR time, not Android capture/encode time",
+                "touch_events": touch_recorder.summary() if touch_recorder is not None else None,
                 "summary": shadow.summary(),
                 "live_timing": {
                     key: {"p50": float(np.percentile(values, 50)),
@@ -211,6 +251,9 @@ def main():
                         "recording_dropped_frames": source.recording_dropped_frames,
                         "frame_mapping_valid": source.recording_frame_mapping_valid,
                         "recording_error": source.recording_error,
+                        "frame_timestamps_path": str(frame_times_path)
+                        if frame_times_written else None,
+                        "frame_timestamps_kind": "host_BGR_decoder_availability_perf_counter",
                     }
                     if recording_path is not None else None
                 )

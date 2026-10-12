@@ -181,3 +181,35 @@ ready-time scheduling, skip-on-stale, missing-history, monotonicity and
 no incorrect feature shape. The full **actual WSL USB/ADB integration
 and CPU performance remain to be tested by the user**, including
 whether both models fit 30Hz when preprocessing HSV on a real game screen.
+
+## Optional read-only kernel touch capture
+
+The Hough touch-circle detector used in historical training is deliberately
+unchanged. Static round app icons can cause false detections, and overlay
+disappearance can split a long physical hold. The next live test can capture
+kernel touch data as a separate, read-only signal.
+
+Run `adb shell getevent -lp` to inspect the available input devices, then
+run the existing Shadow command with both `--record-debug` and
+`--record-touch-events`. For ambiguous device discovery, add
+`--touch-device /dev/input/eventN` using the actual touchscreen entry.
+The app must be showing a stable *in-game* screen; disable double-tap-to-lock
+temporarily if it interferes.
+
+Additional files use the same timestamp stem:
+- `*_frames.jsonl` contains *every* decoded frame's source index and host
+  decoder arrival time in both stream-relative and absolute perf_counter ms.
+  It includes frames discarded by the one-frame latest-frame queue.
+- `*_touch.jsonl` contains raw passive `getevent -lt` records and transitions
+  reconstructed from multitouch tracking-ID or BTN_TOUCH input.
+  Movement during one hold does not produce repeated PRESS.
+- `*_summary.json` records kernel event counts and any recording errors.
+
+**Timing limitation:** Device kernel timestamps and host stdout arrival times
+have different clock bases. The arrival time includes ADB transport/buffering,
+and decoder availability excludes Android capture/encode latency. Collecting
+these timestamps does not yet establish their precise synchronization.
+Do not calculate action Transition F1 against video frames until alignment is
+calibrated. If `getevent` access is denied or reports zero events while
+touching, the event log is not valid ground truth. The system touch-circle
+overlay can be retained as an independent calibration signal.

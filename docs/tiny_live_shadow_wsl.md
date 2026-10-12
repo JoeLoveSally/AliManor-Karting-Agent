@@ -334,3 +334,32 @@ this experiment does not correct their timestamps. The existing
 the recorded Shadow models and intentionally rejects new candidate checkpoints.
 Do not bypass this guard; a separate counterfactual replay/evaluation is required
 before claiming improved RELEASE behavior.
+
+## Comparing a trained action-history robustness candidate
+
+The normal \`evaluate_tiny_live_recording.py\` refuses unknown checkpoint
+hashes by design. Use the **separate** candidate evaluator, which validates
+candidate split/holdout provenance, decodes exactly the original race frames,
+and simulates the candidate's own causal action feedback without touching
+Android. It computes both clean teacher history and candidate virtual-rollout
+predictions. This is still a fixed-video shadow, **not closed-loop driving**.
+
+
+```bash
+python -m pytest -q \
+  tests/unit/test_history_robustness.py \
+  tests/unit/test_evaluate_history_candidate.py
+
+python scripts/evaluate_history_candidate.py \
+  --run-stem /home/jianqiao/downloads/tiny_live_shadow_20261012T041903848106Z \
+  --candidate-dir /home/jianqiao/downloads/ahr_p25 \
+  --output-dir /home/jianqiao/downloads/ahr_p25 \
+  --race-start-ms 5000 --race-end-ms 56800 --cpu-threads 4
+
+```
+
+Compare the resulting \`*_ahr_0p25_evaluation.json\` to the
+recorded frozen RGB baseline. The candidate's validation BCE alone is NOT
+sufficient for advancement. Respect the uncalibrated touch clock and
+review RELEASE/false-PRESS behavior across multiple shift assumptions.
+Keep the held-out test videos untouched throughout the experiment.

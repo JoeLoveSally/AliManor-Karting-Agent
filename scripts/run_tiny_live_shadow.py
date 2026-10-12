@@ -79,6 +79,8 @@ def main():
     ap.add_argument("--duration", type=float, default=20.0)
     ap.add_argument("--cpu-threads", type=int, default=4)
     ap.add_argument("--serial", type=str, default=None)
+    ap.add_argument("--record-debug", action="store_true",
+                    help="Save the SAME live ADB H.264 stream as a paired MP4; no second encoder")
     ap.add_argument("--video", type=Path, default=None,
                     help="Offline MP4 smoke; omit for live read-only ADB")
     args = ap.parse_args()
@@ -86,6 +88,8 @@ def main():
         ap.error("duration must be 0..3600 sec, threads >= 1")
     if not args.output_dir.is_dir() or not args.checkpoint_dir.is_dir():
         ap.error("output-dir and checkpoint-dir must already exist")
+    if args.record_debug and args.video is not None:
+        ap.error("--record-debug is available only for live ADB video input")
     torch.set_num_threads(args.cpu_threads)
     raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     if (not raw["preprocess"]["mask_touch_area"] or
@@ -111,7 +115,9 @@ def main():
     name = f"tiny_live_shadow_{run_stamp}"
     log_path = args.output_dir / f"{name}.jsonl"
     summary_path = args.output_dir / f"{name}_summary.json"
-    if log_path.exists() or summary_path.exists():
+    recording_path = args.output_dir / f"{name}.mp4" if args.record_debug else None
+    if any(path.exists() for path in (log_path, summary_path, recording_path)
+           if path is not None):
         ap.error("refusing to overwrite an existing shadow run")
     started = time.perf_counter()
     errors, rows, shadow = None, 0, None
@@ -122,7 +128,8 @@ def main():
             adb.require_device()
             source = AdbVideoInput(
                 adb, screen_size=adb.screen_size(),
-                config=AdbVideoConfig(decode_width=360))
+                config=AdbVideoConfig(decode_width=360),
+                record_path=recording_path)
             clock = source.monotonic_now_ms
             mode = "adb_screenrecord_read_only"
         else:
@@ -133,6 +140,8 @@ def main():
                                 config=LiveShadowConfig())
         print(f"Shadow {mode}; CPU threads={args.cpu_threads}; "
               "no ADB touch, no Armed; Ctrl+C to stop", flush=True)
+        if recording_path is not None:
+            print(f"Recording same H.264 stream to: {recording_path}", flush=True)
         with log_path.open("x", encoding="utf-8") as stream:
             while time.perf_counter() - started < args.duration:
                 frame = source.read()
@@ -191,6 +200,20 @@ def main():
                 },
             }
             if isinstance(source, AdbVideoInput):
+                output["recording"] = (
+                    {
+                        "path": str(recording_path),
+                        "format": "fragmented_mp4_h264_stream_copy",
+                        "starts_at_decoder_frame_index": 0,
+                        "timeline_join": "JSONL frame_index joins MP4 decoded-frame index",
+                        "mp4_time_base": "synthetic_60fps_not_host_wall_clock",
+                        "recorded_frames": source.recorded_frames,
+                        "recording_dropped_frames": source.recording_dropped_frames,
+                        "frame_mapping_valid": source.recording_frame_mapping_valid,
+                        "recording_error": source.recording_error,
+                    }
+                    if recording_path is not None else None
+                )
                 output["capture"] = {
                     "decoded_frames": source.decoded_frames,
                     "dropped_frames": source.dropped_frames,

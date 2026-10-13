@@ -186,7 +186,7 @@ def train_variant(variant, *, partitions, features, events, split, device, budge
         stream.write("\n")
     metrics = sequence["candidate"]["transition"]["all"]
     short = sequence["candidate"]["release_segment_recall"]["short_100_300ms"]
-    print(f"{variant}: validation_f1={metrics['f1']:.4f} "
+    print(f"{variant}: validation_f1={metrics['f1']} "
           f"matched={metrics['matched']}/{metrics['ground_truth']} "
           f"short_release={short['detected']}/{short['segments']} "
           f"checkpoint={checkpoint_path}", flush=True)

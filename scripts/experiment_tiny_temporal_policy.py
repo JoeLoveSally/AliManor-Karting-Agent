@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""Expert-only, offline RGB vs RGB+HSV tiny temporal policy experiment.
+
+Uses the existing V4-C2 sample manifest, native-fps expert action timeline
+and video-level split. Never sends game controls, runs ADB or edits Armed.
+All output paths must be explicitly supplied and already exist as directories.
+"""
+from __future__ import annotations
+
+import argparse
+from bisect import bisect_right
+from collections import defaultdict
+import json
+from pathlib import Path
+import random
+import sys
+
+import cv2
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+for folder in (ROOT / "src", ROOT / "scripts"):
+    if str(folder) not in sys.path:
+        sys.path.insert(0, str(folder))
+
+from inspect_geometry_pseudo_labels import load_config as load_road_config  # noqa: E402
+from audit_road_occupancy_poc import normalize_game_frame  # noqa: E402
+from karting_agent.model.tiny_temporal_policy import TinyTemporalPolicy  # noqa: E402
+from karting_agent.train.visual_ablation import make_mode_images  # noqa: E402
+from karting_agent.train.gpu_budget import select_training_device  # noqa: E402
+from karting_agent.train.geometry_pseudo_labels import extract_road_mask  # noqa: E402
+from karting_agent.train.labels.touch_marker import ActionEvent  # noqa: E402
+from karting_agent.train.history_robustness import (  # noqa: E402
+    HistoryCorruptor, HistoryCorruptionConfig,
+)
+from karting_agent.train.sequence_evaluator import (  # noqa: E402
+    SequencePoint, Transition, ReleaseSegment, combine_evaluations,
+    evaluate_sequence,
+)
+from karting_agent.train.state_conditioned_dataset import load_v3_samples  # noqa: E402
+from karting_agent.train.trainer import (  # noqa: E402
+    load_video_split, load_sampling_config, build_sample_weights,
+    partition_samples,
+)
+from karting_agent.vision.preprocess import (  # noqa: E402
+    mask_area, preprocess_config_from_mapping,
+)
+
+SIZE = 96
+HORIZON_MS = 100.0
+
+
+def label_events(labels_dir: Path, video: str) -> tuple[ActionEvent, ...]:
+    path = labels_dir / f"{Path(video).stem}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    events = tuple(
+        ActionEvent(
+            frame_index=int(v["frame_index"]),
+            timestamp_ms=float(v["timestamp_ms"]),
+            pressed=bool(v["pressed"]),
+        )
+        for v in raw["events"]
+    )
+    if not events or abs(events[0].timestamp_ms) > 1e-4:
+        raise ValueError(f"missing initial action event at t=0: {path}")
+    if any(a.timestamp_ms >= b.timestamp_ms for a,b in zip(events, events[1:])):
+        raise ValueError(f"nonmonotonic action events in {path}")
+    return events
+
+
+def observed_state_features(
+    input_timestamps_ms, events: tuple[ActionEvent, ...],
+) -> np.ndarray:
+    """Per-frame [actual_pressed, last_action_age, dt]; all causal at t."""
+    if not events:
+        raise ValueError("missing actual expert control history")
+    event_times = [event.timestamp_ms for event in events]
+    stamps = tuple(float(t) for t in input_timestamps_ms)
+    if not stamps or any(t < 0 for t in stamps):
+        raise ValueError("invalid input timestamps")
+    if any(b < a for a, b in zip(stamps, stamps[1:])):
+        raise ValueError("input timestamps must not go backwards")
+    result = np.zeros((len(stamps), 3), dtype=np.float32)
+    for i, t in enumerate(stamps):
+        idx = bisect_right(event_times, t + 1e-7) - 1
+        if idx < 0:
+            raise ValueError("input precedes first expert action event")
+        result[i, 0] = float(events[idx].pressed)
+        result[i, 1] = min(max(t - events[idx].timestamp_ms, 0.0), 500.0) / 500.0
+        result[i, 2] = min(max(t - stamps[i-1], 0.0), 200.0) / 200.0 if i else 0.0
+    return result
+
+
+def validate_sample(sample, events: tuple[ActionEvent, ...],
+                    *, horizon_ms: float = HORIZON_MS) -> bool:
+    """Verify no future video or control metadata sneaks into model input."""
+    stamps = tuple(float(t) for t in sample.input_timestamps_ms)
+    frames = tuple(int(i) for i in sample.input_frame_indices)
+    if len(stamps) != 5 or len(frames) != 5 or stamps[-1] < 0:
+        raise ValueError("expected five input frames at nonnegative times")
+    future_times = tuple(float(t) for t in sample.target_timestamps_ms)
+    future_states = tuple(bool(x) for x in sample.target_pressed_by_horizon)
+    if not future_times or len(future_times) != len(future_states):
+        raise ValueError("missing native multi-horizon future action labels")
+    if (abs(future_times[0] - sample.target_timestamp_ms) > 1e-3
+            or abs(future_times[0] - stamps[-1] - horizon_ms) > 1e-3):
+        raise ValueError("inconsistent observation/target horizon")
+    if future_times[0] <= stamps[-1]:
+        raise ValueError("future target must follow final observed frame")
+    if future_states[0] != bool(sample.target_pressed):
+        raise ValueError("future target disagreement")
+    state = bool(observed_state_features((stamps[-1],), events)[0, 0])
+    if state != bool(sample.current_pressed):
+        raise ValueError("actual expert action state disagrees with manifest")
+    return future_states[0]
+
+
+def prepare_video_feature(frame: np.ndarray, *,
+                          preprocess, road_config,
+                          size: int = SIZE) -> np.ndarray:
+    """Shared four-channel UINT8 cache, both variants reuse identical RGB."""
+    canonical = normalize_game_frame(frame, target_size=(360, 800))
+    safe = canonical
+    if preprocess.mask_touch_area:
+        safe = mask_area(safe, preprocess.touch_roi)
+    for roi in preprocess.mask_rois:
+        safe = mask_area(safe, roi)
+    rgb = cv2.cvtColor(
+        cv2.resize(safe, (size, size), interpolation=cv2.INTER_AREA),
+        cv2.COLOR_BGR2RGB,
+    )
+    hsv = cv2.resize(
+        extract_road_mask(safe, road_config), (size, size),
+        interpolation=cv2.INTER_AREA,
+    )
+    return np.concatenate((rgb.transpose(2, 0, 1), hsv[None]), axis=0)
+
+
+def cache_required_frames(samples, *, preprocess, road_config) -> dict[str, dict[int, np.ndarray]]:
+    """Decode only requested source-frame indices; one sequential pass/video."""
+    requested: dict[str, set[int]] = defaultdict(set)
+    for sample in samples:
+        requested[sample.video].update(map(int, sample.input_frame_indices))
+    features: dict[str, dict[int, np.ndarray]] = {}
+    for video, indices in sorted(requested.items()):
+        path = ROOT / video
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            raise FileNotFoundError(f"cannot open expert video: {path}")
+        wanted = set(indices)
+        if min(wanted) < 0:
+            raise ValueError(f"negative requested frame index: {video}")
+        result: dict[int, np.ndarray] = {}
+        index = 0
+        try:
+            while len(result) < len(wanted) and index <= max(wanted):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if index in wanted:
+                    result[index] = prepare_video_feature(
+                        frame, preprocess=preprocess, road_config=road_config,
+                    )
+                index += 1
+        finally:
+            capture.release()
+        if len(result) != len(wanted):
+            missing = wanted - set(result)
+            raise RuntimeError(f"incomplete video decode {video}: {sorted(missing)[:10]}")
+        features[video] = result
+        print(f"cached {video}: {len(result)} input frames", flush=True)
+    return features
+
+
+class TemporalExpertDataset(Dataset):
+    def __init__(self, samples, features, event_map,
+                 *, mode: str, horizon_ms: float = HORIZON_MS) -> None:
+        if mode not in ("rgb", "rgb_hsv", "action_only"):
+            raise ValueError("mode must be rgb, rgb_hsv or action_only")
+        self.samples = list(samples)
+        self.mode = mode
+        self.features = features
+        self.event_map = event_map
+        self.horizon_ms = horizon_ms
+        self.labels = [
+            float(validate_sample(s, event_map[s.video], horizon_ms=horizon_ms))
+            for s in self.samples
+        ]
+        self.controls = [
+            observed_state_features(s.input_timestamps_ms, event_map[s.video])
+            for s in self.samples
+        ]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        images = make_mode_images(
+            sample.input_frame_indices,
+            self.features.get(sample.video),
+            mode=self.mode,
+            frame_size=SIZE,
+        )
+        return (
+            torch.from_numpy(images),
+            torch.from_numpy(self.controls[index]),
+            torch.tensor(self.labels[index], dtype=torch.float32),
+        )
+
+
+def run_epoch(model, loader, device, optimizer=None, *, history_corruptor=None):
+    training = optimizer is not None
+    if not training and history_corruptor is not None:
+        raise ValueError("history corruption must never affect validation")
+    model.train(training)
+    loss_sum = 0.0
+    count = 0
+    correct = 0
+    context = torch.enable_grad() if training else torch.inference_mode()
+    with context:
+        for images, control, target in loader:
+            if history_corruptor is not None:
+                # CPU-side generator is deterministic across device placement.
+                # Never replace images, future labels, or the validation data.
+                control = history_corruptor(control)
+            images,control,target = (
+                images.to(device), control.to(device), target.to(device)
+            )
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            logits = model(images, control)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, target)
+            if training:
+                loss.backward()
+                optimizer.step()
+            batch_count = int(target.numel())
+            count += batch_count
+            loss_sum += float(loss.item()) * batch_count
+            correct += int(((logits >= 0.0) == (target >= 0.5)).sum().item())
+    if count == 0:
+        raise ValueError("no dataset samples")
+    return {"bce": loss_sum/count, "accuracy": correct/count, "samples": count}
+
+
+def points_from_predictions(samples, probabilities, *, persistence=False):
+    """Timestamp predictions at the *future target*, not the input time."""
+    if len(samples) != len(probabilities):
+        raise ValueError("prediction/sample count mismatch")
+    paired = sorted(
+        zip(samples, probabilities), key=lambda row: row[0].target_timestamp_ms
+    )
+    if not paired:
+        raise ValueError("empty prediction sequence")
+    video = paired[0][0].video
+    # Validate the video identity before timestamps: multiple videos may
+    # legitimately share the same time values, but must be evaluated separately.
+    if any(sample.video != video for sample, _ in paired):
+        raise ValueError("mixed video predictions")
+    if any(
+        left[0].target_timestamp_ms >= right[0].target_timestamp_ms
+        for left, right in zip(paired, paired[1:])
+    ):
+        raise ValueError("duplicate or unordered target timestamps")
+    return [
+        SequencePoint(
+            video, float(sample.target_timestamp_ms),
+            float(sample.current_pressed) if persistence else float(probability),
+        )
+        for sample, probability in paired
+    ]
+
+
+def evaluate_sequences(model, dataset, *, batch_size: int, device,
+                       event_map, split_videos) -> dict:
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        num_workers=0)
+    values = []
+    with torch.inference_mode():
+        for images, control, target in loader:
+            probs = torch.sigmoid(model(
+                images.to(device), control.to(device)
+            )).cpu().numpy()
+            values.extend(map(float, probs))
+    by_video: dict[str, list[tuple[object,float]]] = defaultdict(list)
+    for sample, prob in zip(dataset.samples, values):
+        by_video[sample.video].append((sample, prob))
+    evaluations = []
+    baseline_evals = []
+    for video in split_videos:
+        rows = sorted(by_video.get(video, []), key=lambda x:x[0].target_timestamp_ms)
+        if not rows:
+            raise ValueError(f"evaluation video without sample: {video}")
+        actual = event_map[video]
+        transitions = [
+            Transition(video, event.timestamp_ms, event.pressed)
+            for event in actual[1:]
+        ]
+        releases = [
+            ReleaseSegment(video, a.timestamp_ms, b.timestamp_ms)
+            for a, b in zip(actual, actual[1:])
+            if not a.pressed and b.pressed
+        ]
+        # Predictions represent action at t+100ms, so sequence points
+        # MUST use the target timestamp, NOT the observation timestamp.
+        prediction_points = points_from_predictions(
+            [s for s,_ in rows], [p for _,p in rows],
+        )
+        persistence_points = points_from_predictions(
+            [s for s,_ in rows], [p for _,p in rows], persistence=True,
+        )
+        evaluations.append(evaluate_sequence(
+            prediction_points, transitions, releases,
+            threshold=0.5, tolerance_ms=100.0,
+        ))
+        baseline_evals.append(evaluate_sequence(
+            persistence_points, transitions, releases,
+            threshold=0.5, tolerance_ms=100.0,
+        ))
+    return {
+        "candidate": combine_evaluations(evaluations).summary(),
+        "persistence": combine_evaluations(baseline_evals).summary(),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", type=Path,
+                    default=ROOT/"configs/train_v4c2_temporal_v2.yaml")
+    ap.add_argument("--samples", type=Path,
+                    default=ROOT/"data/processed/v3/samples.jsonl")
+    ap.add_argument("--labels-dir", type=Path,
+                    default=ROOT/"data/processed/v3/labels")
+    ap.add_argument("--output-dir", type=Path, required=True)
+    ap.add_argument("--modes", nargs="+", choices=("rgb","rgb_hsv","action_only"),
+                    default=("rgb","rgb_hsv"))
+    ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--device", choices=("cpu","cuda","auto"), default="auto")
+    ap.add_argument("--cuda-memory-fraction", type=float, default=0.03,
+                    help="maximum fraction of GPU memory for PyTorch caching allocator")
+    ap.add_argument("--min-cuda-free-mib", type=int, default=2048,
+                    help="skip CUDA when nvidia-smi reports less available memory")
+    ap.add_argument("--allow-cpu-fallback", action="store_true",
+                    help="allow explicit --device cuda to fall back to CPU if busy")
+    ap.add_argument("--cpu-threads", type=int, default=4)
+    ap.add_argument("--history-corruption-prob", type=float, default=0.0,
+                    help="Training-only causal held-state replacement probability; "
+                         "0 preserves original baseline behavior")
+    ap.add_argument("--smoke", action="store_true",
+                    help="short functional test; metrics NOT comparative")
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="validate sources, split, causal labels and outputs; no decoding/GPU")
+    args = ap.parse_args()
+    if not 0.0 <= args.history_corruption_prob <= 1.0:
+        ap.error("history-corruption-prob must be in [0,1]")
+    if args.epochs < 1 or args.batch_size < 1 or args.cpu_threads < 1:
+        ap.error("epochs, batch-size and cpu-threads must be >=1")
+    if not 0.0 < args.cuda_memory_fraction <= 1.0 or args.min_cuda_free_mib < 0:
+        ap.error("invalid CUDA budget")
+    if len(set(args.modes)) != len(args.modes):
+        ap.error("duplicate modes")
+    if not args.output_dir.is_dir():
+        ap.error(f"--output-dir must already exist: {args.output_dir}")
+    prefix = "tiny_policy_smoke_" if args.smoke else "tiny_policy_"
+    for mode in args.modes:
+        for name in (f"{prefix}{mode}.pt", f"{prefix}{mode}.json"):
+            if (args.output_dir/name).exists():
+                ap.error(f"refusing to overwrite: {args.output_dir/name}")
+
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    if tuple(raw["dataset"]["prediction_horizons_ms"]) != (100,200,300):
+        ap.error("expected V4-C2 100/200/300ms source labels")
+    if int(raw["model"]["frame_stack"]) != 5:
+        ap.error("expected 5-frame V4-C2 input")
+    if not bool(raw["preprocess"]["mask_touch_area"]):
+        ap.error("touch ROI masking is required to prevent label leakage")
+    split = load_video_split(args.config)
+    all_samples = load_v3_samples(args.samples)
+    partitions = partition_samples(all_samples, split)
+    if args.smoke:
+        partitions = {
+            name: rows[:64] if name=="validation" else rows[:128]
+            for name, rows in partitions.items() if name != "test"
+        }
+    else:
+        partitions = {k:v for k,v in partitions.items() if k in ("train","validation")}
+    selected = partitions["train"] + partitions["validation"]
+    videos = {s.video for s in selected}
+    events = {video: label_events(args.labels_dir,video) for video in videos}
+    preprocess = preprocess_config_from_mapping(raw)
+    road_cfg, _, _ = load_road_config(ROOT/"configs/geometry_pseudo_labels.yaml")
+    # Validate every target and causal state before expensive decoding.
+    for sample in selected:
+        validate_sample(sample, events[sample.video])
+    print(f"preflight: train={len(partitions['train'])}, "
+          f"val={len(partitions['validation'])}, videos={len(videos)}, "
+          f"smoke={args.smoke}", flush=True)
+    if args.preflight_only:
+        print("Preflight passed: source labels, horizon and action history are consistent.")
+        return
+
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    # Establish a CUDA budget/context BEFORE decoding 13 expert videos.
+    # The CUDA caching allocator limit is not a guarantee of free GPU memory.
+    device, device_budget = select_training_device(
+        args.device, cuda_memory_fraction=args.cuda_memory_fraction,
+        min_cuda_free_mib=args.min_cuda_free_mib,
+        allow_cpu_fallback=args.allow_cpu_fallback,
+    )
+    if device.type == "cpu":
+        torch.set_num_threads(args.cpu_threads)
+    print(f"training device={device}; budget={json.dumps(device_budget)}", flush=True)
+    # A pure action-only run must not decode video, compute HSV, or allocate
+    # an image cache. Existing RGB checkpoints can be compared unchanged.
+    needs_images = any(mode != "action_only" for mode in args.modes)
+    cache = (
+        cache_required_frames(
+            selected, preprocess=preprocess, road_config=road_cfg
+        )
+        if needs_images else {}
+    )
+    if not needs_images:
+        print("Action-only ablation: video decoding bypassed", flush=True)
+    reports = []
+    robustness = HistoryCorruptionConfig(probability=args.history_corruption_prob)
+    robustness.validate()
+    for mode in args.modes:
+        # Equal initial seeds and the same cached RGB for a paired comparison.
+        torch.manual_seed(42)
+        channels = 4 if mode == "rgb_hsv" else 3
+        model = TinyTemporalPolicy(image_channels=channels)
+        try:
+            model = model.to(device)
+        except RuntimeError as exc:
+            # Co-resident vLLM may allocate more memory after the early check.
+            # Only allocation failures can trigger opt-in CPU fallback.
+            oom = any(token in str(exc).lower() for token in (
+                "out of memory", "cudaerrormemoryallocation",
+                "cuda_error_out_of_memory",
+            ))
+            if (device.type != "cuda" or not oom or
+                    not (args.device == "auto" or args.allow_cpu_fallback)):
+                raise
+            print(f"CUDA became unavailable after decoding ({exc}); "
+                  "continuing this experiment on CPU.", flush=True)
+            del model
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
+            device = torch.device("cpu")
+            device_budget = {
+                **device_budget, "reason": "cuda_model_allocation_failed_cpu_fallback",
+            }
+            torch.set_num_threads(args.cpu_threads)
+            torch.manual_seed(42)
+            model = TinyTemporalPolicy(image_channels=channels).to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=0.001, weight_decay=0.0001
+        )
+        corruption = (
+            HistoryCorruptor(robustness, seed=9242)
+            if robustness.probability > 0 else None
+        )
+        train_ds = TemporalExpertDataset(
+            partitions["train"],cache,events,mode=mode
+        )
+        val_ds = TemporalExpertDataset(
+            partitions["validation"],cache,events,mode=mode
+        )
+        sample_weights = build_sample_weights(
+            partitions["train"],load_sampling_config(args.config)
+        )
+        sampler = WeightedRandomSampler(
+            sample_weights, num_samples=len(sample_weights),
+            replacement=True, generator=torch.Generator().manual_seed(42)
+        )
+        train_loader = DataLoader(
+            train_ds,batch_size=args.batch_size,sampler=sampler,num_workers=0
+        )
+        val_loader = DataLoader(
+            val_ds,batch_size=args.batch_size,shuffle=False,num_workers=0
+        )
+        best_loss = float("inf")
+        best_state = None
+        history = []
+        for epoch in range(1, 2 if args.smoke else args.epochs+1):
+            train = run_epoch(
+                model, train_loader, device, optimizer,
+                history_corruptor=corruption,
+            )
+            validation = run_epoch(model,val_loader,device)
+            history.append({"epoch":epoch,"train":train,"validation":validation})
+            print(f"{mode} epoch={epoch} train_bce={train['bce']:.4f} "
+                  f"val_bce={validation['bce']:.4f} "
+                  f"val_acc={validation['accuracy']:.4f}",flush=True)
+            if validation["bce"] < best_loss:
+                best_loss = validation["bce"]
+                best_state = {
+                    name: tensor.detach().cpu().clone()
+                    for name,tensor in model.state_dict().items()
+                }
+        assert best_state is not None
+        model.load_state_dict(best_state)
+        sequence = evaluate_sequences(
+            model,val_ds,batch_size=args.batch_size,device=device,
+            event_map=events,
+            split_videos=(
+                [v for v in split.validation if v in videos]
+                if not args.smoke else [partitions["validation"][0].video]
+            ),
+        )
+        result = {
+            "model":"tiny_cnn_gru", "mode":mode,
+            "visual_ablation":mode == "action_only",
+            "image_channels_are_constant_zero":mode == "action_only",
+            "model_not_deployable":True, "expert_teacher_forced":True,
+            "smoke_unrepresentative":args.smoke,
+            "training_device":str(device),
+            "device_budget":dict(device_budget),
+            "batch_size":args.batch_size,
+            "cpu_threads_if_cpu":args.cpu_threads,
+            "split":split.name, "train_videos":list(split.train),
+            "validation_videos":list(split.validation),
+            "test_videos_not_evaluated":list(split.test),
+            "target":"expert_PRESS_at_t_plus_100ms",
+            "input":(
+                "five frames with prior/executed action-state features"
+                if mode != "action_only"
+                else "constant zero visual frames plus causal expert action-state features"
+            ),
+            "visual_size":[SIZE,SIZE],
+            "touch_masking":True,
+            "history_robustness": {
+                "method": "training_only_causal_constant_hold_replacement",
+                "probability": robustness.probability,
+                "seed": 9242 if corruption is not None else None,
+                "input_channels_perturbed": [0, 1],
+                "time_delta_preserved": True,
+                "expert_future_targets_unchanged": True,
+                "validation_history_untouched": True,
+                "independent_counterfactual_input_not_true_closed_loop": True,
+            },
+            "selection":"lowest validation BCE at fixed 0.5 threshold",
+            "history":history,
+            "validation_sequence":sequence,
+        }
+        torch.save(best_state,args.output_dir/f"{prefix}{mode}.pt")
+        (args.output_dir/f"{prefix}{mode}.json").write_text(
+            json.dumps(result,ensure_ascii=False,indent=2)+"\n",
+            encoding="utf-8",
+        )
+        reports.append(result)
+        print(json.dumps({
+            "mode":mode, "best_val_bce":best_loss,
+            "history_corruption_prob": robustness.probability,
+            "transition_f1":sequence["candidate"]["transition"]["all"]["f1"],
+            "persistence_transition_f1":sequence["persistence"]["transition"]["all"]["f1"],
+            "short_release_recall":sequence["candidate"]["release_segment_recall"]["short_100_300ms"]["recall"],
+        }),flush=True)
+    print("Saved only experimental checkpoints and reports to",args.output_dir)
+
+
+if __name__=="__main__":
+    main()

@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Read-only WSL ADB screenrecord -> frozen Tiny RGB + RGB/HSV CPU shadow.
+
+This module does NOT import AdbExecutor or accept an Armed flag. No touch,
+input motionevent, training, checkpoint writes, or Test-set evaluation.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+import torch
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+for folder in (ROOT / "src", ROOT / "scripts"):
+    if str(folder) not in sys.path:
+        sys.path.insert(0, str(folder))
+
+from experiment_tiny_temporal_policy import prepare_video_feature  # noqa: E402
+from inspect_geometry_pseudo_labels import load_config as load_road_config  # noqa: E402
+from karting_agent.data_flow.adb import AdbClient, AdbConfig  # noqa: E402
+from karting_agent.data_flow.input.adb_video import AdbVideoInput, AdbVideoConfig  # noqa: E402
+from karting_agent.data_flow.input.video import VideoInput  # noqa: E402
+from karting_agent.model.tiny_temporal_policy import TinyTemporalPolicy  # noqa: E402
+from karting_agent.runtime.tiny_live_shadow import TinyLiveShadow, LiveShadowConfig  # noqa: E402
+from karting_agent.train.heldout_guard import require_frozen_checkpoint  # noqa: E402
+from karting_agent.train.labels.live_touch_events import (  # noqa: E402
+    LiveTouchRecorder, choose_touch_device, decoded_frame_rows,
+)
+from karting_agent.train.trainer import load_video_split  # noqa: E402
+from karting_agent.vision.preprocess import preprocess_config_from_mapping  # noqa: E402
+
+
+def checksum(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def load_frozen_models(checkpoint_dir: Path, config_path: Path):
+    split = load_video_split(config_path)
+    models, provenance = {}, {}
+    for mode, channels in (("rgb", 3), ("rgb_hsv", 4)):
+        weights_path = checkpoint_dir / f"tiny_policy_{mode}.pt"
+        report_path = checkpoint_dir / f"tiny_policy_{mode}.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        require_frozen_checkpoint(report, mode=mode, split=split)
+        model = TinyTemporalPolicy(image_channels=channels)
+        state = torch.load(weights_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        if any(not torch.isfinite(param).all() for param in model.parameters()):
+            raise ValueError(f"nonfinite frozen weights: {mode}")
+        models[mode] = model
+        provenance[mode] = {
+            "weights_sha256": checksum(weights_path),
+            "metadata_sha256": checksum(report_path),
+            "source_training_device": report.get("training_device"),
+            "inference_device": "cpu",
+        }
+    return models, provenance
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--checkpoint-dir", type=Path, required=True)
+    ap.add_argument("--output-dir", type=Path, required=True)
+    ap.add_argument("--config", type=Path,
+                    default=ROOT/"configs/train_v4c2_temporal_v2.yaml")
+    ap.add_argument("--road-config", type=Path,
+                    default=ROOT/"configs/geometry_pseudo_labels.yaml")
+    ap.add_argument("--duration", type=float, default=20.0)
+    ap.add_argument("--cpu-threads", type=int, default=4)
+    ap.add_argument("--serial", type=str, default=None)
+    ap.add_argument("--record-debug", action="store_true",
+                    help="Save the SAME live ADB H.264 stream as a paired MP4; no second encoder")
+    ap.add_argument("--record-touch-events", action="store_true",
+                    help="Passive Android getevent diagnostics; requires --record-debug")
+    ap.add_argument("--touch-device", type=str, default=None,
+                    help="Explicit /dev/input/eventN; autodetect only when unambiguous")
+    ap.add_argument("--video", type=Path, default=None,
+                    help="Offline MP4 smoke; omit for live read-only ADB")
+    args = ap.parse_args()
+    if not 0 < args.duration <= 3600 or args.cpu_threads < 1:
+        ap.error("duration must be 0..3600 sec, threads >= 1")
+    if not args.output_dir.is_dir() or not args.checkpoint_dir.is_dir():
+        ap.error("output-dir and checkpoint-dir must already exist")
+    if args.record_debug and args.video is not None:
+        ap.error("--record-debug is available only for live ADB video input")
+    if args.record_touch_events and (args.video is not None or not args.record_debug):
+        ap.error("--record-touch-events requires live ADB and --record-debug")
+    if args.touch_device is not None and not args.record_touch_events:
+        ap.error("--touch-device requires --record-touch-events")
+    torch.set_num_threads(args.cpu_threads)
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    if (not raw["preprocess"]["mask_touch_area"] or
+            tuple(raw["dataset"]["prediction_horizons_ms"]) != (100, 200, 300) or
+            int(raw["model"]["frame_stack"]) != 5):
+        raise ValueError("frozen preprocessing/timing config mismatch")
+    preprocess = preprocess_config_from_mapping(raw)
+    road_config, _, _ = load_road_config(args.road_config)
+    models, provenance = load_frozen_models(args.checkpoint_dir, args.config)
+    for mode, model in models.items():
+        channels = 3 if mode == "rgb" else 4
+        with torch.inference_mode():
+            for _ in range(5):
+                model(torch.zeros(1, 5, channels, 96, 96), torch.zeros(1, 5, 3))
+
+    def feature_builder(frame):
+        # Exactly the same function as the frozen training/Validation dataset.
+        return prepare_video_feature(frame, preprocess=preprocess,
+                                     road_config=road_config)
+
+    source = None
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    name = f"tiny_live_shadow_{run_stamp}"
+    log_path = args.output_dir / f"{name}.jsonl"
+    summary_path = args.output_dir / f"{name}_summary.json"
+    recording_path = args.output_dir / f"{name}.mp4" if args.record_debug else None
+    frame_times_path = args.output_dir / f"{name}_frames.jsonl" if args.record_debug else None
+    touch_log_path = args.output_dir / f"{name}_touch.jsonl" if args.record_touch_events else None
+    if any(path.exists() for path in (
+        log_path, summary_path, recording_path, frame_times_path, touch_log_path,
+    )
+           if path is not None):
+        ap.error("refusing to overwrite an existing shadow run")
+    started = time.perf_counter()
+    errors, rows, shadow = None, 0, None
+    touch_recorder = None
+    frame_times_written = False
+    metrics = defaultdict(list)
+    try:
+        if args.video is None:
+            adb = AdbClient(AdbConfig(serial=args.serial))
+            adb.require_device()
+            source = AdbVideoInput(
+                adb, screen_size=adb.screen_size(),
+                config=AdbVideoConfig(decode_width=360),
+                record_path=recording_path)
+            clock = source.monotonic_now_ms
+            mode = "adb_screenrecord_read_only"
+            if args.record_touch_events:
+                device = args.touch_device
+                if device is None:
+                    listing = adb.run("shell", "getevent", "-lp").decode(
+                        "utf-8", errors="replace"
+                    )
+                    device = choose_touch_device(listing)
+                touch_recorder = LiveTouchRecorder(adb, touch_log_path, device=device)
+                touch_recorder.start()
+                print(f"Passive touch events: {device} -> {touch_log_path}", flush=True)
+        else:
+            source = VideoInput(args.video)
+            clock = None
+            mode = "file_replay_smoke_not_live_latency"
+        shadow = TinyLiveShadow(models, feature_builder, clock_ms=clock,
+                                config=LiveShadowConfig())
+        print(f"Shadow {mode}; CPU threads={args.cpu_threads}; "
+              "no ADB touch, no Armed; Ctrl+C to stop", flush=True)
+        if recording_path is not None:
+            print(f"Recording same H.264 stream to: {recording_path}", flush=True)
+        with log_path.open("x", encoding="utf-8") as stream:
+            while time.perf_counter() - started < args.duration:
+                frame = source.read()
+                if frame is None:
+                    break
+                record = shadow.ingest(frame)
+                if record is not None:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    rows += 1
+                    if record["kind"] == "prediction":
+                        for key in ("decoded_to_read_ms", "decoded_to_completion_ms",
+                                    "feature_preprocess_ms", "total_dual_model_processing_ms"):
+                            if record[key] is not None:
+                                metrics[key].append(record[key])
+                        for name in ("rgb", "rgb_hsv"):
+                            metrics[name + "_inference_ms"].append(
+                                record["models"][name]["inference_ms"])
+                            metrics[name + "_late"].append(
+                                int(record["models"][name]["late"]))
+                    if record["kind"] == "prediction" and shadow.decisions % 30 == 0:
+                        values = record["models"]
+                        print(f"t={record['observation_ms']:.0f}ms "
+                              f"rgb={values['rgb']['probability']:.3f} "
+                              f"hsv={values['rgb_hsv']['probability']:.3f} "
+                              f"steps={shadow.decisions} "
+                              f"decode_to_read={record['decoded_to_read_ms']:.1f}ms",
+                              flush=True)
+    except KeyboardInterrupt:
+        errors = "keyboard_interrupt"
+    except Exception as exc:
+        errors = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if touch_recorder is not None:
+            touch_recorder.close()
+        if source is not None:
+            source.close()
+        if isinstance(source, AdbVideoInput) and frame_times_path is not None and source.started:
+            # Frame-index sidecar records real host decoder availability,
+            # not the synthetic 60fps MP4 container time base.
+            with frame_times_path.open("x", encoding="utf-8") as out:
+                for row in decoded_frame_rows(
+                    source.decoded_frame_timestamps_ms, source.origin_perf_counter_ms
+                ):
+                    out.write(json.dumps(row) + "\n")
+            frame_times_written = True
+            print(f"Decoder frame timestamps: {frame_times_path}", flush=True)
+        if shadow is not None:
+            output = {
+                "kind": "tiny_live_shadow_read_only",
+                "source": mode,
+                "duration_wall_seconds": time.perf_counter() - started,
+                "output_log": str(log_path),
+                "log_rows": rows,
+                "status": errors,
+                "models": provenance,
+                "threshold": 0.5,
+                "forecast_horizon_ms": 100.0,
+                "virtual_not_human_control": True,
+                "no_touch_or_armed": True,
+                "capture_timestamps": "host decoded BGR time, not Android capture/encode time",
+                "touch_events": touch_recorder.summary() if touch_recorder is not None else None,
+                "summary": shadow.summary(),
+                "live_timing": {
+                    key: {"p50": float(np.percentile(values, 50)),
+                          "p95": float(np.percentile(values, 95)),
+                          "max": float(np.max(values))}
+                    for key, values in metrics.items() if values
+                },
+            }
+            if isinstance(source, AdbVideoInput):
+                output["recording"] = (
+                    {
+                        "path": str(recording_path),
+                        "format": "fragmented_mp4_h264_stream_copy",
+                        "starts_at_decoder_frame_index": 0,
+                        "timeline_join": "JSONL frame_index joins MP4 decoded-frame index",
+                        "mp4_time_base": "synthetic_60fps_not_host_wall_clock",
+                        "recorded_frames": source.recorded_frames,
+                        "recording_dropped_frames": source.recording_dropped_frames,
+                        "frame_mapping_valid": source.recording_frame_mapping_valid,
+                        "recording_error": source.recording_error,
+                        "frame_timestamps_path": str(frame_times_path)
+                        if frame_times_written else None,
+                        "frame_timestamps_kind": "host_BGR_decoder_availability_perf_counter",
+                    }
+                    if recording_path is not None else None
+                )
+                output["capture"] = {
+                    "decoded_frames": source.decoded_frames,
+                    "dropped_frames": source.dropped_frames,
+                    "startup_ms": source.startup_ms,
+                    "resolution": [source.decode_width, source.decode_height],
+                    "decoded_intervals_ms_p95": float(np.percentile(
+                        source.decode_intervals_ms, 95))
+                    if source.decode_intervals_ms else None,
+                }
+            with summary_path.open("x", encoding="utf-8") as stream:
+                json.dump(output, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            print(f"Shadow records: {log_path}\nSummary: {summary_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

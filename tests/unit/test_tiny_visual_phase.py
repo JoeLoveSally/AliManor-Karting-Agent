@@ -54,16 +54,6 @@ def test_phase_plan_uses_future_pixels_but_keeps_h100_target_and_original_stamps
 
 
 def test_nearest_frame_gap_drops_entire_record_for_every_shift():
-    data = frames()
-    data[8]["host_decoded_ms"] = 490.
-    # Other timestamps remain ordered; inject shifted-sample gap by sparse
-    # but still monotonic series.
-    data[9]["host_decoded_ms"] = 510.
-    plans, meta = subject.plan_windows(
-        [prediction()], data, shifts_ms=(0, 50),
-        start_ms=400., end_ms=600., max_skew_ms=5.,
-    ) if False else (None, None)
-    assert plans is None and meta is None
     # A valid sparse source can leave no common rows, which must fail safely.
     sparse = [{"frame_index": i, "host_decoded_ms": float(i * 100)}
               for i in range(25)]
